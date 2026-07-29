@@ -36,6 +36,32 @@ jobs:
           pip install -r requirements.txt
 
       - name: Ejecutar script de entrenamiento
+        env:
+          # --- Supabase ---
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_JWT_SECRET: ${{ secrets.SUPABASE_JWT_SECRET }}
+
+          # --- Stripe ---
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          STRIPE_PRICE_PRO: ${{ secrets.STRIPE_PRICE_PRO }}
+          STRIPE_PRICE_ULTRA: ${{ secrets.STRIPE_PRICE_ULTRA }}
+          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+          STRIPE_SUCCESS_URL: ${{ secrets.STRIPE_SUCCESS_URL }}
+          STRIPE_CANCEL_URL: ${{ secrets.STRIPE_CANCEL_URL }}
+
+          # --- Seguridad interna ---
+          API_SECRET_KEY: ${{ secrets.API_SECRET_KEY }}
+
+          # --- SMTP ---
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+
+          # --- Flags de entorno (tienen default en Settings, se fuerzan explícitos) ---
+          ENV: ${{ secrets.ENV }}
+          DEBUG: ${{ secrets.DEBUG }}
         run: python ml_engine/entrenamiento.py
 
       - name: Auto commit model artifacts
