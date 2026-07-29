@@ -1,0 +1,48 @@
+name: Entrenamiento Semanal - KodaQuant Predictive Engine
+
+on:
+  schedule:
+    - cron: '0 0 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  retrain-model:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ejecutar script de entrenamiento
+        run: python ml_engine/entrenamiento.py
+
+      - name: Auto commit model artifacts
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🤖 MLOps: Automated model retraining weights updated"
+          file_pattern: 'services/*.keras services/*.pkl'
+          commit_user_name: github-actions[bot]
+          commit_user_email: github-actions[bot]@users.noreply.github.com
+          commit_author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>

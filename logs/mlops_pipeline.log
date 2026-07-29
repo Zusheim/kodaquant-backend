@@ -1,0 +1,36 @@
+[2026-07-18 21:32:29] - [INFO] - [train_pipeline] - ==================== CICLO MLOps INICIADO ====================
+[2026-07-18 21:32:32] - [WARNING] - [train_pipeline] - Drift check: AAPL solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 21:32:33] - [WARNING] - [train_pipeline] - Drift check: MSFT solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 21:32:34] - [WARNING] - [train_pipeline] - Drift check: NVDA solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 21:32:36] - [WARNING] - [train_pipeline] - Drift check: TSLA solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 21:32:37] - [WARNING] - [train_pipeline] - Drift check: GOOGL solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 21:32:40] - [WARNING] - [train_pipeline] - Drift check: AMZN solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 21:32:41] - [WARNING] - [train_pipeline] - Drift check: META solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 21:32:44] - [WARNING] - [train_pipeline] - Drift check: SPY solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 21:32:44] - [INFO] - [train_pipeline] - No existe baseline_mae previo — se fija el MAE actual (0.017297) como baseline inicial.
+[2026-07-18 21:32:44] - [INFO] - [train_pipeline] - Chequeo de drift: Forzado vía --force-retrain (chequeo real: baseline_inicializado)
+[2026-07-18 21:32:44] - [WARNING] - [train_pipeline] - DRIFT DETECTADO — Forzado vía --force-retrain (chequeo real: baseline_inicializado). Se dispara el ciclo Challenger.
+[2026-07-18 21:34:40] - [INFO] - [train_pipeline] - ==================== CICLO MLOps FINALIZADO (status=error) ====================
+[2026-07-18 22:03:23] - [INFO] - [train_pipeline] - ==================== CICLO MLOps INICIADO ====================
+[2026-07-18 22:03:25] - [WARNING] - [train_pipeline] - Drift check: AAPL solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:03:27] - [WARNING] - [train_pipeline] - Drift check: MSFT solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:03:29] - [WARNING] - [train_pipeline] - Drift check: NVDA solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:03:30] - [WARNING] - [train_pipeline] - Drift check: TSLA solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:03:32] - [WARNING] - [train_pipeline] - Drift check: GOOGL solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:03:34] - [WARNING] - [train_pipeline] - Drift check: AMZN solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:03:36] - [WARNING] - [train_pipeline] - Drift check: META solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:03:43] - [INFO] - [train_pipeline] - ==================== CICLO MLOps FINALIZADO (status=error) ====================
+[2026-07-18 22:04:11] - [INFO] - [train_pipeline] - ==================== CICLO MLOps INICIADO ====================
+[2026-07-18 22:04:13] - [WARNING] - [train_pipeline] - Drift check: AAPL solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:04:14] - [WARNING] - [train_pipeline] - Drift check: MSFT solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:04:16] - [WARNING] - [train_pipeline] - Drift check: NVDA solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:04:17] - [WARNING] - [train_pipeline] - Drift check: TSLA solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:04:19] - [WARNING] - [train_pipeline] - Drift check: GOOGL solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:04:20] - [WARNING] - [train_pipeline] - Drift check: AMZN solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:04:22] - [WARNING] - [train_pipeline] - Drift check: META solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:04:26] - [WARNING] - [train_pipeline] - Drift check: SPY solo tiene 3 ventanas (< holdout_days=15) — se usa todo lo disponible.
+[2026-07-18 22:04:26] - [INFO] - [train_pipeline] - Chequeo de drift: Forzado vía --force-retrain (chequeo real: Sin drift — MAE actual=0.017297 dentro del threshold dinámico=0.018162 (baseline=0.017297).)
+[2026-07-18 22:04:26] - [WARNING] - [train_pipeline] - DRIFT DETECTADO — Forzado vía --force-retrain (chequeo real: Sin drift — MAE actual=0.017297 dentro del threshold dinámico=0.018162 (baseline=0.017297).). Se dispara el ciclo Challenger.
+[2026-07-18 22:07:47] - [INFO] - [train_pipeline] - Champion MAE: 0.017953 | Challenger MAE: 0.018024 | p-value: 0.3819 | Winner: CHAMPION
+[2026-07-18 22:07:47] - [WARNING] - [train_pipeline] - Degradación rechazada — Challenger NO superó estadísticamente al Champion (mae_improved=False, statistically_significant=False). El Champion se mantiene en producción.
+[2026-07-18 22:07:48] - [INFO] - [train_pipeline] - ==================== CICLO MLOps FINALIZADO (status=rejected) ====================
