@@ -17,30 +17,26 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          # 1. Crear .gitignore dinámico para basura
-          cat > .gitignore << EOF
-          node_modules/
-          venv/
-          .env
-          dist/
-          build/
-          __pycache__/
-          *.pyc
-          .DS_Store
-          EOF          
+          # 1. Crear .gitignore linea por linea sin sangrías
+          echo "node_modules/" > .gitignore
+          echo "venv/" >> .gitignore
+          echo ".env" >> .gitignore
+          echo "dist/" >> .gitignore
+          echo "build/" >> .gitignore
+          echo "__pycache__/" >> .gitignore
+          echo "*.pyc" >> .gitignore
+          echo ".DS_Store" >> .gitignore
           
-          # 2. Inyectar la llave de encendido de Hugging Face
-          cat > README.md << EOF
-          ---
-          title: KodaQuant Backend
-          emoji: 🚀
-          colorFrom: blue
-          colorTo: indigo
-          sdk: gradio
-          app_file: app.py
-          pinned: false
-          ---
-          EOF
+          # 2. Inyectar la llave de encendido (SIN espacios accidentales)
+          echo "---" > README.md
+          echo "title: KodaQuant Backend" >> README.md
+          echo "emoji: 🚀" >> README.md
+          echo "colorFrom: blue" >> README.md
+          echo "colorTo: indigo" >> README.md
+          echo "sdk: gradio" >> README.md
+          echo "app_file: app.py" >> README.md
+          echo "pinned: false" >> README.md
+          echo "---" >> README.md
 
           # 3. Borrar el historial fantasma de Git
           rm -rf .git
@@ -56,5 +52,5 @@ jobs:
           git add .
           
           # 5. Empaquetar y forzar la subida a Hugging Face
-          git commit -m "deploy: inyectar motor de Hugging Face y sincronizar backend"
+          git commit -m "deploy: inyeccion de configuracion sin espacios"
           git push --force https://Zusheim:$HF_TOKEN@huggingface.co/spaces/Zusheim/kodaquant-backend main
