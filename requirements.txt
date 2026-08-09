@@ -14,7 +14,10 @@ hyperframe==6.1.0
 anyio>=4.14.1,<5.0
 
 # --- Data validation / settings -------------------------------------------
-pydantic>=2.13.4,<3.0
+# Range narrowed to what gradio[mcp]==6.22.0 itself requires
+# (pydantic>=2.11.10,<=2.12.5) — ZeroGPU pulls in the mcp extra, whose
+# pydantic bound is tighter than gradio's own base <=3.0.
+pydantic>=2.11.10,<=2.12.5
 # pydantic_core intentionally NOT pinned here: it must match pydantic's
 # own exact internal requirement. Pinning both and then loosening only
 # pydantic re-creates the same class of conflict this file just fixed.
