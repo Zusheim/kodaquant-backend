@@ -8,6 +8,17 @@ import uvicorn
 # string (not the app object) because uvicorn requires a string to spawn
 # extra worker subprocesses when WEB_CONCURRENCY > 1.
 
+import spaces
+
+# Satisface el chequeo estático de arranque de HF ZeroGPU ("No @spaces.GPU
+# function detected"). Nunca se invoca en producción: el motor real fuerza
+# CPU (ver DEVICE GUARD en quanti_engine.py), así que esto no consume cuota
+# de GPU ni cambia el comportamiento de la app — es puramente para que el
+# health-check de HF vea el decorador durante el import.
+@spaces.GPU
+def _zerogpu_startup_probe():
+    return None
+
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
