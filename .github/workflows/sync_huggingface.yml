@@ -34,6 +34,7 @@ jobs:
           echo "colorFrom: blue" >> README.md
           echo "colorTo: indigo" >> README.md
           echo "sdk: gradio" >> README.md
+          echo "python_version: 3.12" >> README.md
           echo "app_file: app.py" >> README.md
           echo "pinned: false" >> README.md
           echo "---" >> README.md
