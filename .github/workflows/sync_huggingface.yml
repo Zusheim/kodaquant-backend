@@ -26,22 +26,16 @@ jobs:
           echo "__pycache__/" >> .gitignore
           echo "*.pyc" >> .gitignore
           echo ".DS_Store" >> .gitignore
-
-          # 2. Inyectar la llave de encendido — SDK Docker, no Gradio.
-          #    app.py/main.py son un servidor FastAPI puro; nunca importan
-          #    gradio. Declarar sdk: gradio forzaba a HF a instalar el
-          #    paquete `gradio`, que fija su propio rango de `fastapi`
-          #    (gradio requiere fastapi>=0.115.2,<1.0) — de ahí el choque
-          #    con fastapi==0.115.0 en requirements.txt. sdk: docker no
-          #    instala gradio: el Dockerfile del repo controla el 100%
-          #    del entorno de ejecución.
+          
+          # 2. Inyectar la llave de encendido de Gradio con Python 3.12
           echo "---" > README.md
           echo "title: KodaQuant Backend" >> README.md
           echo "emoji: 🚀" >> README.md
           echo "colorFrom: blue" >> README.md
           echo "colorTo: indigo" >> README.md
-          echo "sdk: docker" >> README.md
-          echo "app_port: 7860" >> README.md
+          echo "sdk: gradio" >> README.md
+          echo "python_version: 3.12" >> README.md
+          echo "app_file: app.py" >> README.md
           echo "pinned: false" >> README.md
           echo "---" >> README.md
 
@@ -51,17 +45,13 @@ jobs:
           git checkout -b main
           git config user.name "GitHub Actions KodaQuant"
           git config user.email "actions@github.com"
-
-          # 4. Rastrear los artefactos binarios de modelos que existen HOY
+          
+          # 4. Rastrear solo los archivos que existen HOY
           git lfs install
           git lfs track "*.keras"
-          git lfs track "*.h5"
           git lfs track "*.pkl"
-          git lfs track "*.joblib"
-          git lfs track "*.npy"
-          git lfs track "*.npz"
           git add .
-
+          
           # 5. Empaquetar y forzar la subida a Hugging Face
-          git commit -m "deploy: migracion a Docker SDK (fix conflicto fastapi/gradio)"
+          git commit -m "deploy: revertir a Gradio SDK para habilitar ZeroGPU y actualizar FastAPI"
           git push --force https://Zusheim:$HF_TOKEN@huggingface.co/spaces/Zusheim/kodaquant-backend main
