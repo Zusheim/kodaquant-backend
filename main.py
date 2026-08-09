@@ -1,5 +1,7 @@
 from dotenv import load_dotenv
 import asyncio
+import logging
+import time
 load_dotenv()
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,10 +25,13 @@ from services.quanti_engine import DEFAULT_FORECAST_HORIZON_DAYS
 from services.quanti_engine import generate_quanti_strategy_stream
 from services.quanti_engine import _forecast_asset
 from services.quanti_engine import _normalize_language 
+from services.quanti_engine import _derive_capital_signal
 from api.quota_test_routes import router as quota_test_router
 from api.quanti_chat import router as quanti_chat_router
 from api.support import router as support_router
 from core.config import settings
+
+logger = logging.getLogger("kodaquant.main")
 
 app = FastAPI(title="KodaQuant Terminal", version="4.0")
 app.include_router(payments_router)
@@ -147,16 +152,39 @@ async def strategy_mock(payload: StrategyRequest):
         ],
     }
 
-def _get_market_radar_data() -> dict:
-    return {
-        "volatility_index": 18.4,
-        "trend": "bullish",
-        "top_assets": [
-            {"symbol": "SPY", "risk_score": 0.32},
-            {"symbol": "QQQ", "risk_score": 0.41},
-            {"symbol": "BTC-USD", "risk_score": 0.78},
-        ],
-    }
+# FIX CRÍTICO (Alpha Seeker nunca corría): este mock estático alimentaba
+# `/api/v1/quanti/consult` con un `top_assets` FIJO donde BTC-USD siempre
+# tenía el `risk_score` más alto (0.78) — `_resolve_plan_b_ticker`
+# (quanti_engine.py) lo elegía SIEMPRE, sin importar el forecast real de
+# cada ciclo. Reemplazado por `_get_radar_data`, que llama al pipeline
+# REAL (`generate_predictions`, ver services/prediccion.py) con caché TTL.
+
+_RADAR_CACHE_TTL_SECONDS = 60.0
+_radar_cache: dict[str, tuple[float, dict]] = {}
+
+
+async def _get_radar_data(budget_usd: float) -> dict:
+    """
+    Radar real (Alpha Seeker) para `/api/v1/quanti/consult` — sustituye el
+    mock hardcodeado. Cacheado con TTL: escanea el universo completo (10
+    tickers, Keras + Monte Carlo vía `_forecast_asset`) y el resultado NO
+    depende de `budget_usd` (ese solo escala montos de display en
+    `recommendations`; el ranking real de `top_assets` es independiente),
+    así que recomputarlo en cada request dispararía ~10 inferencias Keras
+    extra por usuario concurrente sin necesidad. `generate_predictions`
+    nunca lanza excepción (Circuit Breaker propio, devuelve
+    status="error" con listas vacías) — safe de propagar tal cual.
+    """
+    now = time.monotonic()
+    cached = _radar_cache.get("global")
+    if cached is not None and (now - cached[0]) < _RADAR_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    data = await generate_predictions(budget_usd)
+    if data.get("status") != "success":
+        logger.warning("generate_predictions degradado en /consult: %s", data.get("error"))
+    _radar_cache["global"] = (now, data)
+    return data
 
 app.add_middleware(
     CORSMiddleware,
@@ -214,7 +242,13 @@ async def quanti_consult(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Error de conversión de divisa: {exc}")
 
-    radar_data = _get_market_radar_data()
+    radar_data = await _get_radar_data(budget_usd)
+    # Auto-Allocation: copia superficial — NUNCA mutar en sitio el dict que
+    # devuelve `_get_radar_data` (está cacheado con TTL y compartido entre
+    # requests concurrentes). `_derive_capital_signal` es puro/determinista
+    # sobre datos ya calculados, así que enriquecerlo acá es seguro y no
+    # requiere invalidar ni recomputar el caché del radar.
+    radar_data = {**radar_data, "signal": _derive_capital_signal(radar_data)}
 
     try:
         portfolio_allocation = await calculate_portfolio(budget_usd, radar_data)

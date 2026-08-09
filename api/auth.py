@@ -109,16 +109,22 @@ async def register_user(payload: UserRegisterRequest, request: Request) -> UserR
         HTTPException 409: Si el correo ya está registrado.
         HTTPException 422: Si la contraseña es rechazada por Supabase (débil).
         HTTPException 429: Si se excede el límite de intentos (fuerza bruta).
-        HTTPException 500: Ante cualquier error inesperado del proveedor de auth.
+        HTTPException 500: Ante cualquier error inesperado del proveedor de auth
+            o si falla la inicialización del perfil en `profiles`.
     """
     await enforce_rate_limit(request, "register")
 
     try:
+        # FIX: `full_name` va anidado bajo "options.data", no como key de nivel
+        # superior. supabase-py solo escribe en auth.users.raw_user_meta_data
+        # cuando el metadata llega dentro de "options" -- con la forma anterior
+        # ({"data": {...}} al mismo nivel que "email"/"password"), el SDK la
+        # ignora silenciosamente y raw_user_meta_data queda vacío, sin error.
         result = supabase.auth.sign_up(
             {
                 "email": payload.email,
                 "password": payload.password,
-                "data": {"full_name": payload.full_name},
+                "options": {"data": {"full_name": payload.full_name}},
             }
         )
     except Exception as exc:
@@ -164,12 +170,30 @@ async def register_user(payload: UserRegisterRequest, request: Request) -> UserR
         )
 
     token, expires_at = generate_verification_token()
-    supabase_admin.table("profiles").update({
-        "full_name": payload.full_name,
-        "is_verified": False,
-        "verification_token": _hash_token(token),
-        "verification_token_expires_at": expires_at.isoformat(),
-    }).eq("id", user.id).execute()
+
+    # FIX (root cause del 500 / PGRST204): requiere que exista
+    # public.profiles.full_name (ver migración SQL adjunta). Además, esta
+    # escritura ahora está aislada en su propio try/except: para este punto
+    # el usuario YA existe en Auth (sign_up ya se ejecutó con éxito), así que
+    # un fallo acá NO debe propagarse como un AttributeError/KeyError crudo --
+    # se loguea con detalle y se responde un 500 explícito y accionable, en
+    # vez de dejar a la cuenta en un estado a medio inicializar sin avisar.
+    try:
+        supabase_admin.table("profiles").update({
+            "full_name": payload.full_name,
+            "is_verified": False,
+            "verification_token": _hash_token(token),
+            "verification_token_expires_at": expires_at.isoformat(),
+        }).eq("id", user.id).execute()
+    except Exception as exc:
+        print(f"[ERROR] No se pudo inicializar el perfil en 'profiles' (user_id={user.id}): {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Tu cuenta se creó pero hubo un problema al configurar tu perfil. "
+                "Contacta a soporte antes de intentar registrarte de nuevo."
+            ),
+        ) from exc
 
     try:
         await send_verification_email(payload.email, token)

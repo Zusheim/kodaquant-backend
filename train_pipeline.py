@@ -1,49 +1,70 @@
 #!/usr/bin/env python3
 """
-train_pipeline.py — KodaQuant Terminal MLOps
-==============================================
-Demonio/cronjob de reentrenamiento incremental con validación estricta
-"Champion vs. Challenger" para el modelo global Attention-BiLSTM
-(`attention_bilstm_global.keras` + `scalers.pkl`) que consume
-`services/quanti_engine.py` en producción.
+train_pipeline.py — KodaQuant V5 MLOps: Reentrenamiento Incremental por Régimen
+=================================================================================
+Demonio/cronjob de fine-tuning incremental con validación estricta
+"Champion vs. Challenger", **exclusivo para la arquitectura V5** (dos
+especialistas independientes por régimen — `equity_specialist` /
+`crypto_specialist` — bajo `services/kodaquant_models/<regimen>/`).
+
+DEPRECACIÓN EXPLÍCITA: esta reescritura abandona por completo el modelo
+GLOBAL V3/V4 (`attention_bilstm_global.keras`, 14 features, sin
+NEWS_SENTIMENT_SCORE) y su dependencia de `services/quanti_engine.py`. Ese
+modelo y ese pipeline de features quedaron huérfanos desde que
+`train_kodaquant_v5.py` introdujo el enrutamiento por régimen; este script
+ya no los referencia en absoluto.
 
 DISEÑO — DECISIONES CRÍTICAS
 -----------------------------
-1. CERO reimplementación paralela del feature engineering. Se importan
-   `_compute_rsi` / `_compute_macd` / `BahdanauAttention` DIRECTAMENTE
-   desde `services.quanti_engine` — el mismo código que usa el motor de
-   inferencia en vivo. Esto hace estructuralmente imposible que el
-   preprocesamiento de entrenamiento diverja del de inferencia (la causa
-   #1 de "training/serving skew" en sistemas de ML reales).
+1. CERO reimplementación paralela del feature engineering. `engineer_asset`,
+   `TECH_COLS`, `N_FEATURES`, `REGIMES`, `MACRO_TICKERS`, `LOOKBACK` y la
+   arquitectura/pérdida (`BahdanauAttention`, `DirectionalHuberLoss`,
+   `directional_accuracy_metric`) se importan DIRECTAMENTE desde
+   `train_kodaquant_v5.py` — el mismo módulo que ejecuta el full-retrain.
+   `engineer_asset` a su vez invoca `data_pipeline.get_daily_news_sentiment`
+   internamente, así que las 17 features (PRICE + 11 técnicos incl.
+   NEWS_SENTIMENT_SCORE/ADX_14/STOCH_K_14 + 5 macro) llegan sin
+   reimplementar nada y sin riesgo de "training/fine-tuning skew".
 
-2. Los `feature_scalers` / `target_scalers` NUNCA se re-ajustan (`.fit`)
-   aquí — solo `.transform()` / `.inverse_transform()`. El fine-tuning es
-   incremental sobre el mismo espacio de escalado con el que el Champion
-   fue entrenado originalmente en Colab. Si algún día cambia el esquema
-   de escalado, el reentrenamiento completo sigue siendo responsabilidad
-   del notebook de Colab, no de este script.
+2. Los `feature_scalers` / `target_scalers` de cada especialista NUNCA se
+   re-ajustan (`.fit`) aquí — solo `.transform()` / `.inverse_transform()`.
+   El fine-tuning es incremental sobre el mismo espacio de escalado con el
+   que `run_regime_pipeline()` entrenó el especialista. Si el esquema de
+   features cambia, el retrain completo sigue siendo responsabilidad de
+   `train_kodaquant_v5.py`, no de este script.
 
-3. El modelo es GLOBAL (un único grafo, embedding `asset_id` por ticker),
-   no un modelo por ticker. El drift se mide por ticker y se agrega; el
-   fine-tuning combina TODOS los tickers del universo en un solo dataset.
+3. DOS modelos INDEPENDIENTES. El ciclo drift -> fine-tune -> promote corre
+   de forma AISLADA por régimen: jamás se mezclan datasets, scalers,
+   embeddings de asset_id ni estado `baseline_mae` entre `equity_specialist`
+   y `crypto_specialist`. Cada régimen tiene su propio `mlops_state.json` y
+   su propio directorio de backups bajo su carpeta en `kodaquant_models/`.
 
-4. `attention_bilstm_global.keras` tiene un nodo `dropout_regularizer`
-   horneado con `training=False` (ver docstring de
-   `quanti_engine._build_mc_dropout_bridge`) — ese mismo bug de
-   congelamiento afecta también a `.fit()`, no solo a la inferencia. Este
-   script reconstruye el tramo final del grafo con `training=None`
-   (simbólico, NO hardcodeado a True como el bridge de inferencia) para
-   que Keras propague el modo real automáticamente: dropout activo
-   durante `.fit()`, apagado durante `.evaluate()`/`.predict()`.
+4. RUTEO DINÁMICO equity <-> crypto (Requerimiento 3). `_resolve_regime()`
+   determina a qué especialista pertenece un ticker: primero contra el
+   mapeo real ya entrenado (`REGIMES`), con fallback heurístico por sufijo
+   estilo Yahoo Finance (`-USD`, `-USDT`, ...) para tickers que aún no
+   pasaron por un full retrain. Un ticker fuera del `asset_to_id` ya
+   entrenado del especialista NO puede fine-tunearse (el embedding no tiene
+   fila para él) — se omite con un aviso explícito pidiendo un full retrain.
 
-Requisitos locales (macOS, Python 3.12): mismos que `quanti_engine.py`
-(`keras`, `tensorflow`, `pandas`, `numpy`, `yfinance`, `scikit-learn`) más
-`scipy` para el test estadístico Champion vs. Challenger.
+5. Ningún workaround de "dropout congelado" (`_make_trainable_graph` de la
+   versión V3/V4). Ese parche existía únicamente en el *bridge* de
+   inferencia de `quanti_engine.py` (MC-Dropout con `training=True`
+   horneado para simulación de paths) — el artefacto crudo `model_v5.keras`
+   que guarda `run_regime_pipeline()` NO tiene ese bridge, así que
+   `Dropout` se comporta de forma estándar: activo en `.fit()`, apagado en
+   `.evaluate()`/`.predict()`, sin reconstrucción de grafo necesaria.
+
+Requisitos: mismos que `train_kodaquant_v5.py` (`keras`, `tensorflow`,
+`pandas`, `numpy`, `yfinance`, `scikit-learn`, `nltk` para `data_pipeline`)
+más `scipy` para el test estadístico Champion vs. Challenger. Debe vivir en
+el mismo directorio que `train_kodaquant_v5.py` y `data_pipeline.py`.
 
 Uso:
-    python train_pipeline.py                     # ciclo normal (respeta drift)
-    python train_pipeline.py --force-retrain      # ignora el chequeo de drift
-    python train_pipeline.py --months 18 --lr 5e-6
+    python train_pipeline.py                            # ambos regímenes, respeta drift
+    python train_pipeline.py --force-retrain             # fuerza fine-tuning en ambos regímenes
+    python train_pipeline.py --regimes crypto_specialist --months 12 --lr 5e-6
+    python train_pipeline.py --tickers TSLA,BTC-USD       # rutea dinámicamente y corre solo esos especialistas
 """
 
 from __future__ import annotations
@@ -61,6 +82,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import keras
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -75,31 +97,76 @@ except ImportError as exc:  # noqa: BLE001
     ) from exc
 
 # ---------------------------------------------------------------------------
-# Bootstrap de path — hace visible el paquete `services/` sin importar desde
-# qué cwd dispare el cron (`* * * * * cd /ruta && python train_pipeline.py`
-# vs `python /ruta/train_pipeline.py` desde otro directorio).
+# Bootstrap de path — hace visible `train_kodaquant_v5.py` / `data_pipeline.py`
+# sin importar desde qué cwd dispare el cron.
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 try:
-    from services.quanti_engine import (  # noqa: E402
+    from train_kodaquant_v5 import (  # noqa: E402
         BahdanauAttention,
-        ML_MODEL_PATH,
-        ML_SCALERS_PATH,
-        _MC_DROPOUT_DOWNSTREAM_LAYERS,
-        _MC_DROPOUT_LAYER_NAME,
-        _compute_macd,
-        _compute_rsi,
-        keras,
+        DirectionalHuberLoss,
+        GAMMA_MAX,
+        GRAD_CLIPNORM,
+        HUBER_DELTA,
+        MACRO_TICKERS,
+        MODELS_ROOT,
+        N_FEATURES,
+        REGIMES,
+        TECH_COLS,
+        VARIANCE_CAP,
+        VARIANCE_LAMBDA,
+        directional_accuracy_metric,
+        engineer_asset,
     )
 except ImportError as exc:  # noqa: BLE001
     raise ImportError(
-        "No se pudo importar services.quanti_engine. train_pipeline.py debe "
-        "vivir en la raíz del backend (mismo nivel que la carpeta `services/`) "
-        f"y requiere que Keras 3 cargue correctamente ahí. Detalle: {exc!r}"
+        "No se pudo importar train_kodaquant_v5.py. train_pipeline.py debe "
+        "vivir en el mismo directorio que train_kodaquant_v5.py y "
+        f"data_pipeline.py, con Keras 3 disponible ahí. Detalle: {exc!r}"
     ) from exc
+
+# Requerimiento 1 — integración 100% explícita con el pipeline NLP de
+# sentimiento. No se llama directamente en este módulo (ya la invoca
+# `engineer_asset` internamente), pero el import se deja EXPLÍCITO y a nivel
+# de módulo para que un `data_pipeline.py` roto (nltk/VADER faltante, etc.)
+# falle aquí, de inmediato, en vez de a mitad de una descarga yfinance de
+# varios minutos dentro del ciclo de fine-tuning.
+try:
+    from data_pipeline import get_daily_news_sentiment  # noqa: F401,E402
+except ImportError as exc:  # noqa: BLE001
+    raise ImportError(
+        "No se pudo importar data_pipeline.py (requerido por engineer_asset "
+        f"para NEWS_SENTIMENT_SCORE). Detalle: {exc!r}"
+    ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Ruteo dinámico de régimen (Requerimiento 3)
+# ---------------------------------------------------------------------------
+TICKER_TO_REGIME: dict[str, str] = {
+    ticker.upper(): regime_name
+    for regime_name, cfg in REGIMES.items()
+    for ticker in cfg["tickers"]
+}
+_CRYPTO_SUFFIXES = ("-USD", "-USDT", "-USDC", "-BTC", "-ETH")
+
+
+def _resolve_regime(ticker: str) -> str:
+    """
+    Decide a qué especialista V5 pertenece un ticker. Prioriza el universo
+    REAL ya entrenado (`REGIMES`); si el ticker es nuevo (aún no pasó por un
+    full retrain de `train_kodaquant_v5.py`), cae a una heurística de sufijo
+    estilo Yahoo Finance para pares cripto (`BTC-USD`, `SOL-USDT`, ...).
+    """
+    ticker_upper = ticker.upper()
+    if ticker_upper in TICKER_TO_REGIME:
+        return TICKER_TO_REGIME[ticker_upper]
+    if ticker_upper.endswith(_CRYPTO_SUFFIXES) and "crypto_specialist" in REGIMES:
+        return "crypto_specialist"
+    return "equity_specialist" if "equity_specialist" in REGIMES else next(iter(REGIMES))
 
 
 # ---------------------------------------------------------------------------
@@ -108,13 +175,9 @@ except ImportError as exc:  # noqa: BLE001
 
 @dataclass(frozen=True)
 class MLOpsConfig:
-    """Parámetros del ciclo MLOps. Todos con default institucional razonable."""
+    """Parámetros del ciclo MLOps V5. Todos con default institucional razonable."""
 
-    model_path: Path = Path(ML_MODEL_PATH)
-    scalers_path: Path = Path(ML_SCALERS_PATH)
-    state_path: Path = Path(ML_MODEL_PATH).parent / "mlops_state.json"
-    backup_dir: Path = Path(ML_MODEL_PATH).parent / "mlops_backups"
-    log_dir: Path = _THIS_DIR / "logs"
+    log_dir: Path = MODELS_ROOT / "logs"
 
     # Data ingestion
     training_history_months: int = 24
@@ -144,7 +207,7 @@ class MLOpsConfig:
 
 def _configure_logging(log_dir: Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("kodaquant.mlops")
+    logger = logging.getLogger("kodaquant.mlops_v5")
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
@@ -153,7 +216,7 @@ def _configure_logging(log_dir: Path) -> logging.Logger:
             fmt="[%(asctime)s] - [%(levelname)s] - [%(module)s] - %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-        file_handler = logging.FileHandler(log_dir / "mlops_pipeline.log", encoding="utf-8")
+        file_handler = logging.FileHandler(log_dir / "mlops_pipeline_v5.log", encoding="utf-8")
         file_handler.setFormatter(fmt)
         logger.addHandler(file_handler)
 
@@ -165,264 +228,276 @@ def _configure_logging(log_dir: Path) -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
-# KodaQuantMLOps
+# KodaQuantV5MLOps
 # ---------------------------------------------------------------------------
 
-class KodaQuantMLOps:
+class KodaQuantV5MLOps:
     """
-    Orquestador del ciclo de vida del modelo Bi-LSTM: ingestión, detección
-    de drift, fine-tuning incremental, comparación estadística Champion vs.
-    Challenger y promoción atómica a producción.
+    Orquestador del ciclo de vida de los especialistas V5: ingestión (OHLCV +
+    NEWS_SENTIMENT_SCORE vía `data_pipeline`), detección de drift, fine-tuning
+    incremental, comparación estadística Champion vs. Challenger y promoción
+    atómica — todo AISLADO por régimen (`equity_specialist`/`crypto_specialist`).
     """
 
     def __init__(self, config: MLOpsConfig | None = None) -> None:
         self.config = config or MLOpsConfig()
         self.logger = _configure_logging(self.config.log_dir)
-        self.scalers: dict[str, Any] | None = None
-        self.state: dict[str, Any] = {}
         np.random.seed(self.config.random_seed)
 
     # ------------------------------------------------------------------ #
-    # Estado persistente (baseline de MAE entre corridas)
+    # Estado persistente (baseline de MAE entre corridas) — POR RÉGIMEN
     # ------------------------------------------------------------------ #
 
-    def _load_state(self) -> dict[str, Any]:
-        if self.config.state_path.exists():
+    def _state_path(self, regime_name: str) -> Path:
+        return MODELS_ROOT / regime_name / "mlops_state.json"
+
+    def _load_state(self, regime_name: str) -> dict[str, Any]:
+        state_path = self._state_path(regime_name)
+        if state_path.exists():
             try:
-                with open(self.config.state_path, "r", encoding="utf-8") as fh:
+                with open(state_path, "r", encoding="utf-8") as fh:
                     return json.load(fh)
             except (json.JSONDecodeError, OSError) as exc:
                 self.logger.warning(
-                    "No se pudo leer %s (%s) — se reinicia el estado del pipeline.",
-                    self.config.state_path, exc,
+                    "[%s] No se pudo leer %s (%s) — se reinicia el estado.",
+                    regime_name, state_path, exc,
                 )
         return {"baseline_mae": {}, "last_run": None, "history": []}
 
-    def _save_state(self) -> None:
-        self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.config.state_path.with_suffix(".tmp.json")
+    def _save_state(self, regime_name: str, state: dict[str, Any]) -> None:
+        state_path = self._state_path(regime_name)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = state_path.with_suffix(".tmp.json")
         with open(tmp_path, "w", encoding="utf-8") as fh:
-            json.dump(self.state, fh, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, self.config.state_path)
+            json.dump(state, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, state_path)
 
     # ------------------------------------------------------------------ #
-    # Carga de artefactos de producción
+    # Carga de artefactos de producción del especialista V5 — POR RÉGIMEN
     # ------------------------------------------------------------------ #
 
-    def _load_scalers(self) -> dict[str, Any]:
-        if not self.config.scalers_path.exists():
-            raise FileNotFoundError(f"No se encontró scalers.pkl en {self.config.scalers_path}")
-        with open(self.config.scalers_path, "rb") as fh:
-            return pickle.load(fh)
+    def _load_scalers(self, regime_name: str) -> dict[str, Any]:
+        scalers_path = MODELS_ROOT / regime_name / "scalers_dict.pkl"
+        if not scalers_path.exists():
+            raise FileNotFoundError(
+                f"No se encontró scalers_dict.pkl para '{regime_name}' en {scalers_path}. "
+                "Ejecuta primero train_kodaquant_v5.py (full retrain) para generar el especialista."
+            )
+        with open(scalers_path, "rb") as fh:
+            scalers = pickle.load(fh)
 
-    def _load_champion_raw(self):
-        """Carga el grafo Champion TAL CUAL vive en producción (sin bridge)."""
-        if not self.config.model_path.exists():
-            raise FileNotFoundError(f"No se encontró el modelo Champion en {self.config.model_path}")
+        # Validación defensiva V5 (mismo espíritu que quanti_engine._get_scalers
+        # en V3): si el bundle viene de un TECH_COLS distinto al vigente, el
+        # feature_scaler.transform() desplazaría cada columna EN SILENCIO.
+        saved_tech_cols = scalers.get("tech_cols")
+        if saved_tech_cols is not None and list(saved_tech_cols) != TECH_COLS:
+            raise ValueError(
+                f"[{regime_name}] Desalineación de TECH_COLS: scalers_dict.pkl tiene "
+                f"{list(saved_tech_cols)} pero train_kodaquant_v5.py define {TECH_COLS} "
+                "vigente. Regenera el especialista con un full retrain antes de fine-tunear."
+            )
+        return scalers
+
+    def _load_champion(self, regime_name: str):
+        model_path = MODELS_ROOT / regime_name / "model_v5.keras"
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"No se encontró el modelo Champion V5 de '{regime_name}' en {model_path}. "
+                "Ejecuta primero train_kodaquant_v5.py."
+            )
         return keras.models.load_model(
-            str(self.config.model_path),
-            custom_objects={"BahdanauAttention": BahdanauAttention},
+            str(model_path),
+            custom_objects={
+                "BahdanauAttention": BahdanauAttention,
+                "DirectionalHuberLoss": DirectionalHuberLoss,
+                "directional_accuracy_metric": directional_accuracy_metric,
+            },
             compile=False,
         )
 
-    def _make_trainable_graph(self, model):
-        """
-        Repara el nodo `dropout_regularizer` congelado en `training=False`
-        para que sea entrenable: reconstruye únicamente el tramo final del
-        grafo (`dropout_regularizer -> post_fusion_dense -> return_head`),
-        reutilizando los MISMOS objetos de capa (mismos pesos, cero
-        duplicación), con un nodo NUEVO donde `training=None` — a
-        diferencia del bridge de inferencia de `quanti_engine.py` (que lo
-        hornea en `True` para siempre), aquí se deja simbólico para que
-        `.fit()` y `.evaluate()`/`.predict()` reciban el modo correcto
-        automáticamente. Si el layer no existe en el grafo (arquitectura
-        futura sin ese nodo congelado), se devuelve el modelo intacto.
-        """
-        try:
-            dropout_layer = model.get_layer(_MC_DROPOUT_LAYER_NAME)
-        except ValueError:
-            return model
-
-        try:
-            fusion_tensor = dropout_layer.input
-        except AttributeError:
-            return model
-
-        x = dropout_layer(fusion_tensor, training=None)
-        for layer_name in _MC_DROPOUT_DOWNSTREAM_LAYERS:
-            x = model.get_layer(layer_name)(x)
-
-        return keras.Model(inputs=model.input, outputs=x, name=f"{model.name}_trainable")
-
     # ------------------------------------------------------------------ #
-    # 1. DATA INGESTION & PREPROCESSING — replica exacta de quanti_engine
+    # 1. DATA INGESTION & FEATURE ENGINEERING — reuso 100% de V5
     # ------------------------------------------------------------------ #
 
-    def _download_history(self, tickers: list[str], months: int) -> pd.DataFrame:
+    def _download_regime_history(
+        self, tickers: list[str], macro_tickers: list[str], months: int
+    ) -> pd.DataFrame:
+        """
+        Descarga OHLCV fresca (SIN cache — a diferencia de `download_all` de
+        train_kodaquant_v5.py, un ciclo incremental necesita el dato del día,
+        nunca un parquet potencialmente viejo) para todos los tickers del
+        régimen + macro factores, en UNA sola llamada `yf.download`.
+        """
         end_date = datetime.now(timezone.utc)
         start_date = end_date - pd.DateOffset(months=months)
+        all_symbols = list(dict.fromkeys(tickers + macro_tickers))
+        fields = ["Open", "High", "Low", "Close", "Volume"]
+
         raw = yf.download(
-            tickers,
+            all_symbols,
             start=start_date.strftime("%Y-%m-%d"),
             end=end_date.strftime("%Y-%m-%d"),
             auto_adjust=True,
             progress=False,
         )
-        close = raw["Close"][tickers].ffill().dropna()
-        if close.empty:
+        if raw is None or raw.empty:
             raise RuntimeError(
-                f"yfinance no devolvió datos utilizables para {tickers} "
-                f"(desde {start_date.date()} hasta {end_date.date()})."
+                f"yfinance no devolvió datos para {all_symbols} "
+                f"({start_date.date()} -> {end_date.date()})."
             )
-        return close
 
-    def _engineer_features(
-        self, close: pd.DataFrame, ticker: str, macro_tickers: list[str]
-    ) -> pd.DataFrame:
+        flat = pd.DataFrame(index=raw.index)
+        if isinstance(raw.columns, pd.MultiIndex):
+            available_fields = set(raw.columns.get_level_values(0))
+            for field in fields:
+                if field not in available_fields:
+                    continue
+                sub = raw[field]
+                for sym in all_symbols:
+                    if sym in sub.columns:
+                        flat[f"{sym}_{field}"] = sub[sym]
+        else:
+            # Edge case defensivo: no debería ocurrir aquí (all_symbols
+            # siempre incluye >= 1 macro ticker además del activo), pero se
+            # cubre por honestidad ante cualquier cambio de yfinance.
+            sym = all_symbols[0]
+            for field in fields:
+                if field in raw.columns:
+                    flat[f"{sym}_{field}"] = raw[field]
+
+        required = {f"{t}_{f}" for t in tickers for f in ("Close", "High", "Low", "Volume")}
+        required |= {f"{m}_Close" for m in macro_tickers}
+        missing = required - set(flat.columns)
+        if missing:
+            raise RuntimeError(f"Faltan columnas tras la descarga: {sorted(missing)}")
+
+        return flat.ffill().dropna(how="all")
+
+    def _build_windows_existing_scalers(
+        self,
+        df: pd.DataFrame,
+        ticker: str,
+        lookback: int,
+        feature_scaler,
+        target_scaler,
+        asset_id: int,
+        feature_cols: list[str],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DatetimeIndex]:
         """
-        Bit a bit igual a `_fetch_feature_window` de quanti_engine.py:
-        mismas funciones (`_compute_rsi`, `_compute_macd` IMPORTADAS, no
-        reimplementadas), mismas columnas, mismo orden — condición
-        necesaria para que `feature_scaler.transform()` reciba las
-        columnas en la posición con la que fue entrenado.
+        Ventanas 3D `(samples, lookback, N_FEATURES)` — misma indexación
+        EXACTA que `build_asset_dataset` de train_kodaquant_v5.py (ventana
+        `[t-lookback:t]` -> target `log_returns[t-1]`, fecha `df.index[t]`),
+        pero aplicando SOLO `.transform()` sobre los scalers ya fit por el
+        último full retrain — jamás se re-ajustan aquí.
         """
-        df = close.copy()
-        df["RSI_14"] = _compute_rsi(df[ticker])
-        df["EMA_20"] = df[ticker].ewm(span=20, adjust=False).mean()
-        macd_line, signal_line = _compute_macd(df[ticker])
-        df["MACD"] = macd_line
-        df["MACD_SIGNAL"] = signal_line
-        df = df.ffill().dropna()
+        # V6: `engineer_asset()` ya no expone "PRICE" (nivel absoluto) — el
+        # bookkeeping de precio crudo vive en RAW_CLOSE (excluida de
+        # `feature_cols`/del tensor, ver train_kodaquant_v5.py). Usar la
+        # columna vieja aquí desalinearía el target de log-return en
+        # silencio (KeyError en el mejor caso, ya que "PRICE" no existe más).
+        prices = df["RAW_CLOSE"].values
+        features = df[feature_cols].values
+        log_returns = np.diff(np.log(prices))
+        features_scaled = feature_scaler.transform(features)
 
-        feature_cols = [ticker, "RSI_14", "EMA_20", "MACD", "MACD_SIGNAL"] + macro_tickers
-        return df[feature_cols]
-
-    def _build_windows(
-        self, feature_df: pd.DataFrame, ticker: str, lookback: int
-    ) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
-        """
-        Ventanas deslizantes 3D `(samples, lookback, features)`. El target
-        de la ventana que TERMINA en el índice `i` es el log-return real
-        `día i -> día i+1` — exactamente la magnitud que predice el modelo
-        en producción (ver docstring de `_forecast_asset`).
-        """
-        values = feature_df.values.astype(np.float64)
-        close_prices = feature_df[ticker].to_numpy(dtype=np.float64)
-        log_returns = np.diff(np.log(close_prices))  # len = n - 1
-
-        n = values.shape[0]
-        X: list[np.ndarray] = []
-        y: list[float] = []
-        dates: list[Any] = []
-
-        for i in range(lookback - 1, n - 1):
-            X.append(values[i - lookback + 1: i + 1])
-            y.append(log_returns[i])
-            dates.append(feature_df.index[i + 1])
+        n = len(df)
+        X, y_raw, dates = [], [], []
+        for t in range(lookback, n):
+            X.append(features_scaled[t - lookback: t])
+            y_raw.append(log_returns[t - 1])
+            dates.append(df.index[t])
 
         if not X:
-            return (
-                np.empty((0, lookback, values.shape[1])),
-                np.empty((0,)),
-                pd.DatetimeIndex([]),
-            )
+            empty = np.empty((0, lookback, len(feature_cols)), dtype=np.float32)
+            return empty, np.empty((0, 1), dtype=np.float32), np.empty((0,), dtype=np.int32), pd.DatetimeIndex([])
 
-        return np.stack(X), np.asarray(y, dtype=np.float64), pd.DatetimeIndex(dates)
+        X = np.array(X, dtype=np.float32)
+        assert X.shape[-1] == N_FEATURES, (
+            f"[{ticker}] Desalineación de features: la ventana tiene {X.shape[-1]} "
+            f"columnas pero N_FEATURES={N_FEATURES} (TECH_COLS={TECH_COLS})."
+        )
+
+        y_raw = np.array(y_raw, dtype=np.float32).reshape(-1, 1)
+        y_scaled = target_scaler.transform(y_raw).astype(np.float32)
+        asset_ids = np.full((len(X),), asset_id, dtype=np.int32)
+        return X, y_scaled, asset_ids, pd.DatetimeIndex(dates)
 
     def _prepare_ticker_dataset(
-        self, ticker: str, macro_tickers: list[str], lookback: int, months: int
-    ) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
-        symbols = list(dict.fromkeys([ticker] + macro_tickers))
-        close = self._download_history(symbols, months)
-        feature_df = self._engineer_features(close, ticker, macro_tickers)
-        return self._build_windows(feature_df, ticker, lookback)
-
-    def _scale_dataset(
-        self, X_raw: np.ndarray, y_raw: np.ndarray, ticker: str
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """SOLO `.transform()` — jamás se reajustan los scalers de producción."""
-        feature_scaler = self.scalers["feature_scalers"][ticker]
-        target_scaler = self.scalers["target_scalers"][ticker]
-        n_samples, lookback, n_features = X_raw.shape
-
-        X_scaled = (
-            feature_scaler.transform(X_raw.reshape(-1, n_features))
-            .reshape(n_samples, lookback, n_features)
-            .astype(np.float32)
+        self,
+        all_market_data: pd.DataFrame,
+        ticker: str,
+        macro_tickers: list[str],
+        lookback: int,
+        feature_scaler,
+        target_scaler,
+        asset_id: int,
+    ):
+        """Bit a bit `engineer_asset()` de train_kodaquant_v5.py (incl. NEWS_SENTIMENT_SCORE)."""
+        df_asset = engineer_asset(all_market_data, ticker, macro_tickers)
+        feature_cols = ["LOG_RETURN_1D"] + TECH_COLS + macro_tickers
+        return self._build_windows_existing_scalers(
+            df_asset, ticker, lookback, feature_scaler, target_scaler, asset_id, feature_cols
         )
-        y_scaled = target_scaler.transform(y_raw.reshape(-1, 1)).reshape(-1).astype(np.float32)
-        return X_scaled, y_scaled
-
-    def _inverse_transform_targets(self, y_scaled: np.ndarray, asset_ids: np.ndarray) -> np.ndarray:
-        """Inverse-transform por fila respetando el `target_scaler` propio de cada ticker."""
-        id_to_ticker = {v: k for k, v in self.scalers["asset_to_id"].items()}
-        flat_ids = asset_ids.reshape(-1)
-        y_real = np.empty(flat_ids.shape[0], dtype=np.float64)
-
-        for asset_id in np.unique(flat_ids):
-            ticker = id_to_ticker[int(asset_id)]
-            mask = flat_ids == asset_id
-            scaler = self.scalers["target_scalers"][ticker]
-            y_real[mask] = scaler.inverse_transform(
-                y_scaled.reshape(-1)[mask].reshape(-1, 1)
-            ).reshape(-1)
-
-        return y_real
 
     # ------------------------------------------------------------------ #
-    # 2. STATISTICAL DRIFT DETECTION — el vigilante
+    # 2. STATISTICAL DRIFT DETECTION — el vigilante, aislado por régimen
     # ------------------------------------------------------------------ #
 
-    def evaluate_champion_drift(self, champion_raw) -> dict[str, dict[str, float]]:
+    def evaluate_champion_drift(
+        self, regime_name: str, champion, scalers: dict[str, Any]
+    ) -> dict[str, dict[str, float]]:
         """
-        Evalúa el Champion (determinista, `training=False` vía `.predict()`)
-        sobre los últimos `holdout_days` reales de CADA ticker del universo
-        entrenado. Devuelve MAE/MSE en escala REAL de log-return
-        (post `inverse_transform`) por ticker, más un agregado `__global__`
-        ponderado por número de muestras (no promedio simple de promedios).
+        Evalúa el Champion del régimen sobre los últimos `holdout_days`
+        reales de CADA ticker de SU universo (`scalers["asset_to_id"]`).
+        Devuelve MAE/MSE en escala REAL de log-return por ticker, más un
+        agregado `__global__` ponderado por número de muestras — SOLO de
+        este régimen, nunca mezclado con el otro especialista.
         """
-        lookback = self.scalers["lookback"]
-        macro_tickers = self.scalers["macro_tickers"]
-        asset_to_id = self.scalers["asset_to_id"]
+        lookback = scalers["lookback"]
+        macro_tickers = scalers["macro_tickers"]
+        asset_to_id = scalers["asset_to_id"]
+        tickers = list(asset_to_id.keys())
+
+        drift_check_months = max(3, self.config.training_history_months // 4)
+        all_market_data = self._download_regime_history(tickers, macro_tickers, drift_check_months)
 
         results: dict[str, dict[str, float]] = {}
         pooled_abs_err: list[np.ndarray] = []
-        drift_check_months = max(3, self.config.training_history_months // 4)
 
-        for ticker in asset_to_id:
+        for ticker in tickers:
             try:
-                X_raw, y_raw, _dates = self._prepare_ticker_dataset(
-                    ticker, macro_tickers, lookback, months=drift_check_months
+                X, y_scaled, asset_ids, _dates = self._prepare_ticker_dataset(
+                    all_market_data, ticker, macro_tickers, lookback,
+                    scalers["feature_scalers"][ticker], scalers["target_scalers"][ticker],
+                    asset_to_id[ticker],
                 )
-            except Exception as exc:  # noqa: BLE001 — un ticker caído no debe tumbar el chequeo global
-                self.logger.warning("Drift check omitido para %s: %s", ticker, exc)
+            except Exception as exc:  # noqa: BLE001 — un ticker caído no debe tumbar el chequeo del régimen
+                self.logger.warning("[%s] Drift check omitido para %s: %r", regime_name, ticker, exc)
                 continue
 
-            if len(X_raw) == 0:
+            if len(X) == 0:
                 continue
-            if len(X_raw) < self.config.holdout_days:
+            if len(X) < self.config.holdout_days:
                 self.logger.warning(
-                    "Drift check: %s solo tiene %d ventanas (< holdout_days=%d) — se usa todo lo disponible.",
-                    ticker, len(X_raw), self.config.holdout_days,
+                    "[%s] Drift check: %s solo tiene %d ventanas (< holdout_days=%d) — se usa todo lo disponible.",
+                    regime_name, ticker, len(X), self.config.holdout_days,
                 )
 
-            X_recent = X_raw[-self.config.holdout_days:]
-            y_recent = y_raw[-self.config.holdout_days:]
-
-            X_scaled, _y_scaled = self._scale_dataset(X_recent, y_recent, ticker)
-            asset_id = asset_to_id[ticker]
-            asset_tensor = np.full((len(X_scaled), 1), asset_id, dtype=np.int32)
+            X_recent = X[-self.config.holdout_days:]
+            y_recent_scaled = y_scaled[-self.config.holdout_days:]
+            asset_recent = asset_ids[-self.config.holdout_days:].reshape(-1, 1)
 
             y_pred_scaled = np.asarray(
-                champion_raw.predict([X_scaled, asset_tensor], verbose=0)
+                champion.predict([X_recent, asset_recent], verbose=0)
             ).reshape(-1, 1)
-            target_scaler = self.scalers["target_scalers"][ticker]
+            target_scaler = scalers["target_scalers"][ticker]
             y_pred_real = target_scaler.inverse_transform(y_pred_scaled).reshape(-1)
+            y_true_real = target_scaler.inverse_transform(y_recent_scaled).reshape(-1)
 
-            mae = float(mean_absolute_error(y_recent, y_pred_real))
-            mse = float(mean_squared_error(y_recent, y_pred_real))
-            results[ticker] = {"mae": mae, "mse": mse, "n_samples": float(len(y_recent))}
-            pooled_abs_err.append(np.abs(y_recent - y_pred_real))
+            mae = float(mean_absolute_error(y_true_real, y_pred_real))
+            mse = float(mean_squared_error(y_true_real, y_pred_real))
+            results[ticker] = {"mae": mae, "mse": mse, "n_samples": float(len(y_true_real))}
+            pooled_abs_err.append(np.abs(y_true_real - y_pred_real))
 
         if pooled_abs_err:
             pooled = np.concatenate(pooled_abs_err)
@@ -434,19 +509,21 @@ class KodaQuantMLOps:
 
         return results
 
-    def detect_drift(self, drift_metrics: dict[str, dict[str, float]]) -> tuple[bool, str]:
+    def detect_drift(
+        self, state: dict[str, Any], drift_metrics: dict[str, dict[str, float]]
+    ) -> tuple[bool, str]:
         """
-        No reentrena por defecto. Solo dispara si el MAE global actual
-        supera el threshold DINÁMICO (`baseline * (1 + drift_relative_threshold)`)
+        No reentrena por defecto. Solo dispara si el MAE global actual del
+        régimen supera el threshold DINÁMICO (`baseline * (1 + threshold)`)
         o el límite duro opcional. Sin baseline previo, se inicializa y NO
-        se dispara en la primera corrida (nada con qué comparar todavía).
+        se dispara en la primera corrida de ese régimen.
         """
         global_metrics = drift_metrics.get("__global__")
         if not global_metrics:
             return False, "Sin datos suficientes de ningún ticker — se omite el ciclo."
 
         current_mae = global_metrics["mae"]
-        baseline_mae = self.state.get("baseline_mae", {}).get("__global__")
+        baseline_mae = state.get("baseline_mae", {}).get("__global__")
 
         if baseline_mae is None:
             self.logger.info(
@@ -475,56 +552,73 @@ class KodaQuantMLOps:
         )
 
     # ------------------------------------------------------------------ #
-    # 3. INCREMENTAL TRAINING — el challenger
+    # 3. INCREMENTAL TRAINING — el challenger, aislado por régimen
     # ------------------------------------------------------------------ #
 
-    def build_finetune_dataset(self) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    def build_finetune_dataset(
+        self, regime_name: str, scalers: dict[str, Any]
+    ) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """
-        Dataset GLOBAL de fine-tuning: combina TODOS los tickers del
-        universo (mismo esquema que el modelo en producción). Split
+        Dataset de fine-tuning combinando TODOS los tickers de ESTE régimen
+        (mismo universo con el que el especialista fue entrenado). Split
         CRONOLÓGICO (no aleatorio, por ser serie de tiempo):
             [ ---------- train ---------- ][ val ][ holdout Champion/Challenger ]
         """
-        lookback = self.scalers["lookback"]
-        macro_tickers = self.scalers["macro_tickers"]
-        asset_to_id = self.scalers["asset_to_id"]
+        lookback = scalers["lookback"]
+        macro_tickers = scalers["macro_tickers"]
+        asset_to_id = scalers["asset_to_id"]
+        tickers = list(asset_to_id.keys())
+
+        all_market_data = self._download_regime_history(
+            tickers, macro_tickers, self.config.training_history_months
+        )
 
         X_parts, y_parts, asset_parts, date_parts = [], [], [], []
-
-        for ticker, asset_id in asset_to_id.items():
-            X_raw, y_raw, dates = self._prepare_ticker_dataset(
-                ticker, macro_tickers, lookback, months=self.config.training_history_months
+        for ticker in tickers:
+            X, y_scaled, asset_ids, dates = self._prepare_ticker_dataset(
+                all_market_data, ticker, macro_tickers, lookback,
+                scalers["feature_scalers"][ticker], scalers["target_scalers"][ticker],
+                asset_to_id[ticker],
             )
-            if len(X_raw) == 0:
-                self.logger.warning("Sin ventanas utilizables para %s — se omite del fine-tuning.", ticker)
+            if len(X) == 0:
+                self.logger.warning(
+                    "[%s] Sin ventanas utilizables para %s — se omite del fine-tuning.",
+                    regime_name, ticker,
+                )
                 continue
-
-            X_scaled, y_scaled = self._scale_dataset(X_raw, y_raw, ticker)
-            X_parts.append(X_scaled)
+            X_parts.append(X)
             y_parts.append(y_scaled)
-            asset_parts.append(np.full(len(X_scaled), asset_id, dtype=np.int32))
+            asset_parts.append(asset_ids.reshape(-1, 1))
             date_parts.append(dates)
 
         if not X_parts:
-            raise RuntimeError("No se pudo construir el dataset de fine-tuning: 0 tickers con datos válidos.")
+            raise RuntimeError(
+                f"[{regime_name}] No se pudo construir el dataset de fine-tuning: "
+                "0 tickers con datos válidos."
+            )
 
         X = np.concatenate(X_parts, axis=0)
         y = np.concatenate(y_parts, axis=0)
-        asset_ids = np.concatenate(asset_parts, axis=0).reshape(-1, 1)
+        asset_ids = np.concatenate(asset_parts, axis=0)
         dates = pd.DatetimeIndex(np.concatenate([d.values for d in date_parts]))
+
+        assert X.shape[-1] == N_FEATURES, (
+            f"[{regime_name}] Desalineación de features: X tiene {X.shape[-1]} columnas "
+            f"pero N_FEATURES={N_FEATURES} (TECH_COLS={TECH_COLS})."
+        )
 
         order = np.argsort(dates.values)
         X, y, asset_ids = X[order], y[order], asset_ids[order]
 
         n = len(X)
-        n_tickers = len(asset_to_id)
+        n_tickers = len(tickers)
         n_holdout = max(1, min(self.config.holdout_days * n_tickers, n // 5))
         n_val = max(1, min(self.config.validation_split_days * n_tickers, (n - n_holdout) // 5))
 
         if n - n_holdout - n_val <= 0:
             raise RuntimeError(
-                f"Dataset insuficiente para separar train/val/holdout (n={n}, holdout={n_holdout}, "
-                f"val={n_val}). Aumenta `training_history_months` en MLOpsConfig."
+                f"[{regime_name}] Dataset insuficiente para separar train/val/holdout "
+                f"(n={n}, holdout={n_holdout}, val={n_val}). Aumenta training_history_months."
             )
 
         holdout_slice = slice(n - n_holdout, n)
@@ -537,23 +631,32 @@ class KodaQuantMLOps:
             "holdout": (X[holdout_slice], y[holdout_slice], asset_ids[holdout_slice]),
         }
 
-    def build_challenger(self, champion_raw):
+    def build_challenger(self, champion):
         """
         Clona arquitectura Y pesos del Champion (`clone_model` + `set_weights`
-        — objetos completamente independientes en memoria, nunca referencias
-        compartidas) y repara el nodo de dropout congelado para hacerlo
-        entrenable. LR ultra-bajo (`1e-5` default) para Fine-Tuning
-        conservador que evite Catastrophic Forgetting de la estructura
-        macro histórica aprendida en Colab.
+        — objetos completamente independientes en memoria) y recompila con
+        LR ultra-bajo (`1e-5` default) para fine-tuning conservador. Usa la
+        MISMA `DirectionalHuberLoss` con la que el especialista fue
+        entrenado, con `gamma` fijo en `GAMMA_MAX` (curriculum ya completo
+        — no se re-arranca el warmup en un fine-tuning incremental).
         """
-        challenger = keras.models.clone_model(champion_raw)
-        challenger.set_weights(champion_raw.get_weights())
-        challenger = self._make_trainable_graph(challenger)
+        challenger = keras.models.clone_model(champion)
+        challenger.set_weights(champion.get_weights())
 
+        gamma_variable = keras.Variable(
+            GAMMA_MAX, trainable=False, dtype="float32", name="directional_gamma_finetune"
+        )
         challenger.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=self.config.finetune_learning_rate),
-            loss="mse",
-            metrics=["mae"],
+            optimizer=keras.optimizers.AdamW(
+                learning_rate=self.config.finetune_learning_rate,
+                weight_decay=1e-4,
+                clipnorm=GRAD_CLIPNORM,
+            ),
+            loss=DirectionalHuberLoss(
+                delta=HUBER_DELTA, gamma=gamma_variable,
+                variance_lambda=VARIANCE_LAMBDA, variance_cap=VARIANCE_CAP,
+            ),
+            metrics=["mae", directional_accuracy_metric],
         )
         return challenger
 
@@ -580,17 +683,26 @@ class KodaQuantMLOps:
         )
 
     # ------------------------------------------------------------------ #
-    # 4. CHAMPION VS. CHALLENGER — A/B testing matemático
+    # 4. CHAMPION VS. CHALLENGER — A/B testing matemático, por régimen
     # ------------------------------------------------------------------ #
 
     def evaluate_holdout(
-        self, model, holdout_data: tuple[np.ndarray, np.ndarray, np.ndarray]
+        self, model, holdout_data: tuple[np.ndarray, np.ndarray, np.ndarray], scalers: dict[str, Any]
     ) -> tuple[np.ndarray, dict[str, float]]:
         X_hold, y_hold_scaled, asset_hold = holdout_data
+        id_to_ticker = {v: k for k, v in scalers["asset_to_id"].items()}
+        flat_ids = asset_hold.reshape(-1)
 
-        y_pred_scaled = np.asarray(model.predict([X_hold, asset_hold], verbose=0)).reshape(-1)
-        y_true_real = self._inverse_transform_targets(y_hold_scaled, asset_hold)
-        y_pred_real = self._inverse_transform_targets(y_pred_scaled, asset_hold)
+        y_pred_scaled = np.asarray(model.predict([X_hold, asset_hold], verbose=0)).reshape(-1, 1)
+
+        y_true_real = np.empty(flat_ids.shape[0], dtype=np.float64)
+        y_pred_real = np.empty(flat_ids.shape[0], dtype=np.float64)
+        for asset_id in np.unique(flat_ids):
+            ticker = id_to_ticker[int(asset_id)]
+            mask = flat_ids == asset_id
+            scaler = scalers["target_scalers"][ticker]
+            y_true_real[mask] = scaler.inverse_transform(y_hold_scaled[mask].reshape(-1, 1)).reshape(-1)
+            y_pred_real[mask] = scaler.inverse_transform(y_pred_scaled[mask].reshape(-1, 1)).reshape(-1)
 
         abs_err = np.abs(y_true_real - y_pred_real)
         metrics = {
@@ -601,17 +713,18 @@ class KodaQuantMLOps:
         return abs_err, metrics
 
     def compare_champion_challenger(
-        self, champion_raw, challenger, holdout_data: tuple[np.ndarray, np.ndarray, np.ndarray]
+        self, champion, challenger,
+        holdout_data: tuple[np.ndarray, np.ndarray, np.ndarray],
+        scalers: dict[str, Any],
     ) -> dict[str, Any]:
         """
         REGLA DE NEGOCIO INQUEBRANTABLE: el Challenger solo gana si su MAE
         en Holdout es MENOR **y** esa diferencia es estadísticamente
-        significativa — test t pareado (mismas observaciones Holdout para
-        ambos modelos) sobre el error absoluto por muestra, en escala REAL
-        de log-return (post inverse_transform, por ticker).
+        significativa — test t pareado sobre el error absoluto por muestra,
+        en escala REAL de log-return, dentro del universo de ESTE régimen.
         """
-        champion_err, champion_metrics = self.evaluate_holdout(champion_raw, holdout_data)
-        challenger_err, challenger_metrics = self.evaluate_holdout(challenger, holdout_data)
+        champion_err, champion_metrics = self.evaluate_holdout(champion, holdout_data, scalers)
+        challenger_err, challenger_metrics = self.evaluate_holdout(challenger, holdout_data, scalers)
 
         try:
             t_stat, p_value = stats.ttest_rel(challenger_err, champion_err)
@@ -636,37 +749,41 @@ class KodaQuantMLOps:
             "promote": promote,
         }
 
-    def promote_challenger(self, challenger) -> None:
-        """Overwrite atómico (`os.replace`) del `.keras` de producción, con backup previo."""
-        self.config.backup_dir.mkdir(parents=True, exist_ok=True)
+    def promote_challenger(self, regime_name: str, challenger, scalers: dict[str, Any]) -> None:
+        """Overwrite atómico (`os.replace`) del `.keras`/scalers del especialista, con backup previo."""
+        regime_dir = MODELS_ROOT / regime_name
+        backup_dir = regime_dir / "mlops_backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-        if self.config.model_path.exists():
-            shutil.copy2(self.config.model_path, self.config.backup_dir / f"champion_{stamp}.keras")
-        if self.config.scalers_path.exists():
-            shutil.copy2(self.config.scalers_path, self.config.backup_dir / f"scalers_{stamp}.pkl")
+        model_path = regime_dir / "model_v5.keras"
+        scalers_path = regime_dir / "scalers_dict.pkl"
 
-        tmp_model_path = self.config.model_path.with_suffix(".tmp.keras")
+        if model_path.exists():
+            shutil.copy2(model_path, backup_dir / f"model_v5_{stamp}.keras")
+        if scalers_path.exists():
+            shutil.copy2(scalers_path, backup_dir / f"scalers_dict_{stamp}.pkl")
+
+        tmp_model_path = model_path.with_suffix(".tmp.keras")
         challenger.save(str(tmp_model_path))
-        os.replace(tmp_model_path, self.config.model_path)
+        os.replace(tmp_model_path, model_path)
 
         # Los scalers no cambian en un fine-tuning incremental (se reutilizan
-        # los mismos, fit solo en el train histórico original en Colab) — se
-        # re-escriben tal cual para dejar el par modelo/scalers consistente
-        # y con backup en el mismo timestamp de despliegue.
-        tmp_scalers_path = self.config.scalers_path.with_suffix(".tmp.pkl")
+        # los mismos, fit solo en el train histórico del último full retrain)
+        # — se re-escriben tal cual para dejar el par modelo/scalers
+        # consistente y con backup en el mismo timestamp de despliegue.
+        tmp_scalers_path = scalers_path.with_suffix(".tmp.pkl")
         with open(tmp_scalers_path, "wb") as fh:
-            pickle.dump(self.scalers, fh)
-        os.replace(tmp_scalers_path, self.config.scalers_path)
+            pickle.dump(scalers, fh)
+        os.replace(tmp_scalers_path, scalers_path)
 
-        self.logger.info("PROMOCIÓN: Challenger sobrescribió al Champion en producción (backup en %s).", self.config.backup_dir)
         self.logger.info(
-            "IMPORTANTE: quanti_engine._get_keras_model()/_get_scalers() cachean vía @lru_cache — "
-            "reinicia el proceso del backend FastAPI para que el nuevo Champion entre en producción."
+            "[%s] PROMOCIÓN: Challenger sobrescribió al Champion en producción (backup en %s).",
+            regime_name, backup_dir,
         )
 
     # ------------------------------------------------------------------ #
-    # 5. MEMORY LEAK PREVENTION — macOS strict
+    # 5. MEMORY LEAK PREVENTION
     # ------------------------------------------------------------------ #
 
     def _release_memory(self, *objs: Any) -> None:
@@ -680,46 +797,47 @@ class KodaQuantMLOps:
         gc.collect()
 
     # ------------------------------------------------------------------ #
-    # Orquestador principal
+    # Orquestador — UN régimen
     # ------------------------------------------------------------------ #
 
-    def run_cycle(self, force_retrain: bool = False) -> dict[str, Any]:
+    def run_cycle_for_regime(self, regime_name: str, force_retrain: bool = False) -> dict[str, Any]:
         cycle_start = datetime.now(timezone.utc)
-        self.logger.info("==================== CICLO MLOps INICIADO ====================")
-        self.state = self._load_state()
+        self.logger.info("==== [%s] CICLO MLOps V5 INICIADO ====", regime_name)
+        state = self._load_state(regime_name)
 
         result: dict[str, Any] = {"status": "error", "reason": "ciclo no completado"}
-        champion_raw = None
+        champion = None
         challenger = None
         dataset = None
 
         try:
-            self.scalers = self._load_scalers()
-            champion_raw = self._load_champion_raw()
+            scalers = self._load_scalers(regime_name)
+            champion = self._load_champion(regime_name)
 
-            drift_metrics = self.evaluate_champion_drift(champion_raw)
-            drift_detected, drift_reason = self.detect_drift(drift_metrics)
+            drift_metrics = self.evaluate_champion_drift(regime_name, champion, scalers)
+            drift_detected, drift_reason = self.detect_drift(state, drift_metrics)
             if force_retrain:
                 drift_detected, drift_reason = True, f"Forzado vía --force-retrain (chequeo real: {drift_reason})"
-            self.logger.info("Chequeo de drift: %s", drift_reason)
+            self.logger.info("[%s] Chequeo de drift: %s", regime_name, drift_reason)
 
             global_metrics = drift_metrics.get("__global__")
             if global_metrics is not None:
-                self.state.setdefault("baseline_mae", {}).setdefault("__global__", global_metrics["mae"])
+                state.setdefault("baseline_mae", {}).setdefault("__global__", global_metrics["mae"])
 
             if not drift_detected:
                 result = {"status": "no_drift", "reason": drift_reason, "drift_metrics": drift_metrics}
                 return result
 
-            self.logger.warning("DRIFT DETECTADO — %s. Se dispara el ciclo Challenger.", drift_reason)
+            self.logger.warning("[%s] DRIFT DETECTADO — %s. Se dispara el ciclo Challenger.", regime_name, drift_reason)
 
-            dataset = self.build_finetune_dataset()
-            challenger = self.build_challenger(champion_raw)
+            dataset = self.build_finetune_dataset(regime_name, scalers)
+            challenger = self.build_challenger(champion)
             self.fine_tune(challenger, dataset)
 
-            comparison = self.compare_champion_challenger(champion_raw, challenger, dataset["holdout"])
+            comparison = self.compare_champion_challenger(champion, challenger, dataset["holdout"], scalers)
             self.logger.info(
-                "Champion MAE: %.6f | Challenger MAE: %.6f | p-value: %s | Winner: %s",
+                "[%s] Champion MAE: %.6f | Challenger MAE: %.6f | p-value: %s | Winner: %s",
+                regime_name,
                 comparison["champion"]["mae"],
                 comparison["challenger"]["mae"],
                 f"{comparison['p_value']:.4f}" if comparison["p_value"] is not None else "N/A",
@@ -727,35 +845,101 @@ class KodaQuantMLOps:
             )
 
             if comparison["promote"]:
-                self.promote_challenger(challenger)
-                self.state.setdefault("baseline_mae", {})["__global__"] = comparison["challenger"]["mae"]
+                self.promote_challenger(regime_name, challenger, scalers)
+                state.setdefault("baseline_mae", {})["__global__"] = comparison["challenger"]["mae"]
                 result = {"status": "promoted", "comparison": comparison, "drift_metrics": drift_metrics}
             else:
                 self.logger.warning(
-                    "Degradación rechazada — Challenger NO superó estadísticamente al Champion "
+                    "[%s] Degradación rechazada — Challenger NO superó estadísticamente al Champion "
                     "(mae_improved=%s, statistically_significant=%s). El Champion se mantiene en producción.",
-                    comparison["mae_improved"], comparison["statistically_significant"],
+                    regime_name, comparison["mae_improved"], comparison["statistically_significant"],
                 )
                 result = {"status": "rejected", "comparison": comparison, "drift_metrics": drift_metrics}
 
         except Exception as exc:  # noqa: BLE001 — el demonio nunca debe morir sin loggear
-            self.logger.exception("Fallo no controlado durante el ciclo MLOps: %s", exc)
+            self.logger.exception("[%s] Fallo no controlado durante el ciclo MLOps: %s", regime_name, exc)
             result = {"status": "error", "error": str(exc)}
 
         finally:
-            self.state["last_run"] = cycle_start.isoformat()
-            self.state.setdefault("history", []).append(
+            state["last_run"] = cycle_start.isoformat()
+            state.setdefault("history", []).append(
                 {"timestamp": cycle_start.isoformat(), "status": result.get("status")}
             )
-            self.state["history"] = self.state["history"][-50:]
-            self._save_state()
-            self._release_memory(champion_raw, challenger, dataset)
+            state["history"] = state["history"][-50:]
+            self._save_state(regime_name, state)
+            self._release_memory(champion, challenger, dataset)
             self.logger.info(
-                "==================== CICLO MLOps FINALIZADO (status=%s) ====================",
-                result.get("status"),
+                "==== [%s] CICLO MLOps V5 FINALIZADO (status=%s) ====",
+                regime_name, result.get("status"),
             )
 
         return result
+
+    # ------------------------------------------------------------------ #
+    # Orquestador — TODOS los regímenes solicitados + ruteo dinámico
+    # ------------------------------------------------------------------ #
+
+    def run_cycle(
+        self,
+        regimes: list[str] | None = None,
+        tickers: list[str] | None = None,
+        force_retrain: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Si `tickers` viene dado, cada ticker se rutea dinámicamente a su
+        especialista (`_resolve_regime`) y se valida contra el
+        `asset_to_id` YA entrenado de ese régimen — un ticker nuevo no puede
+        fine-tunearse (el embedding no tiene fila para él) y se omite con un
+        aviso pidiendo un full retrain. El fine-tuning sigue operando sobre
+        el universo COMPLETO del régimen resuelto (el embedding y el
+        backbone son compartidos; no tiene sentido fine-tunear con una
+        fracción del universo entrenado). Sin `tickers`, corre TODOS los
+        regímenes de `REGIMES` (o el subconjunto de `regimes`).
+        """
+        if tickers:
+            grouped: dict[str, list[str]] = {}
+            for raw_ticker in tickers:
+                ticker = raw_ticker.strip().upper()
+                if not ticker:
+                    continue
+                regime_name = _resolve_regime(ticker)
+                try:
+                    scalers = self._load_scalers(regime_name)
+                except (FileNotFoundError, ValueError) as exc:
+                    self.logger.error("No se puede rutear %s -> '%s': %s", ticker, regime_name, exc)
+                    continue
+                if ticker not in scalers["asset_to_id"]:
+                    self.logger.warning(
+                        "%s no existe en el universo entrenado de '%s' (asset_to_id=%s). El "
+                        "fine-tuning incremental NO puede añadir activos nuevos al embedding "
+                        "— ejecuta train_kodaquant_v5.py (full retrain) para incorporarlo. Se omite.",
+                        ticker, regime_name, list(scalers["asset_to_id"].keys()),
+                    )
+                    continue
+                grouped.setdefault(regime_name, []).append(ticker)
+
+            if not grouped:
+                self.logger.error("Ningún ticker solicitado es procesable — abortando ciclo.")
+                return {}
+
+            for regime_name, matched in grouped.items():
+                self.logger.info("Ruteo dinámico: %s -> especialista '%s'.", matched, regime_name)
+            target_regimes = list(grouped.keys())
+        else:
+            target_regimes = regimes or list(REGIMES.keys())
+
+        summary: dict[str, dict[str, Any]] = {}
+        for regime_name in target_regimes:
+            if regime_name not in REGIMES:
+                self.logger.warning(
+                    "Régimen desconocido '%s' — se omite (no existe en REGIMES de train_kodaquant_v5.py).",
+                    regime_name,
+                )
+                summary[regime_name] = {"status": "error", "error": f"régimen desconocido: {regime_name}"}
+                continue
+            summary[regime_name] = self.run_cycle_for_regime(regime_name, force_retrain=force_retrain)
+
+        return summary
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +948,8 @@ class KodaQuantMLOps:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="KodaQuant MLOps — reentrenamiento incremental disparado por drift (Champion vs. Challenger).",
+        description="KodaQuant V5 MLOps — reentrenamiento incremental por régimen, "
+                     "disparado por drift (Champion vs. Challenger).",
     )
     parser.add_argument("--months", type=int, default=None, help="Meses de histórico para fine-tuning.")
     parser.add_argument("--holdout-days", type=int, default=None, help="Días de holdout Champion vs. Challenger.")
@@ -772,6 +957,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hard-mae-limit", type=float, default=None, help="Límite duro de MAE (escala log-return).")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate del fine-tuning del Challenger.")
     parser.add_argument("--force-retrain", action="store_true", help="Ignora el chequeo de drift y fuerza el ciclo Challenger.")
+    parser.add_argument(
+        "--regimes", type=str, default=None,
+        help="Lista separada por comas de regímenes a procesar (default: todos en REGIMES). Ej: equity_specialist",
+    )
+    parser.add_argument(
+        "--tickers", type=str, default=None,
+        help="Lista separada por comas de tickers a rutear dinámicamente hacia su especialista. Ej: TSLA,BTC-USD",
+    )
     return parser.parse_args()
 
 
@@ -790,10 +983,15 @@ def main() -> None:
     if args.lr is not None:
         overrides["finetune_learning_rate"] = args.lr
 
-    pipeline = KodaQuantMLOps(MLOpsConfig(**overrides))
-    result = pipeline.run_cycle(force_retrain=args.force_retrain)
+    regimes = [r.strip() for r in args.regimes.split(",") if r.strip()] if args.regimes else None
+    tickers = [t.strip() for t in args.tickers.split(",") if t.strip()] if args.tickers else None
 
-    sys.exit(0 if result.get("status") in {"no_drift", "promoted", "rejected"} else 1)
+    pipeline = KodaQuantV5MLOps(MLOpsConfig(**overrides))
+    summary = pipeline.run_cycle(regimes=regimes, tickers=tickers, force_retrain=args.force_retrain)
+
+    ok_statuses = {"no_drift", "promoted", "rejected"}
+    success = bool(summary) and all(r.get("status") in ok_statuses for r in summary.values())
+    sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":

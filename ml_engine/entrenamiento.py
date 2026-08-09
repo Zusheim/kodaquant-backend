@@ -2,14 +2,13 @@
 #!pip install yfinance -q
 
 """
-Pipeline Predictivo GLOBAL Multi-Activo: Attention-BiLSTM (Log-Returns) — V3
+Pipeline Predictivo GLOBAL Multi-Activo: Attention-BiLSTM (Log-Returns) — V4
 =============================================================================
-Arquitectura (heredada de la V2, SIN cambios estructurales — ver sección 9
-más abajo, los cambios de la V3 son de entrenamiento/loss/regularización,
-no de topología): BiLSTM(256) -> LayerNorm -> [MultiHeadAttention + Residual]
-                 -> LayerNorm -> [BahdanauAttention || BiLSTM(128)+LayerNorm]
-                 -> Concat + Embedding(asset_id) -> Dropout(0.45)
-                 -> [Dense(64)+L2 + Residual(proyección+L2)] -> LayerNorm -> Dense(1)+L2
+Arquitectura (V4 — PODADA respecto a V1-V3, ver sección 10 más abajo):
+                 BiLSTM(64) -> LayerNorm -> [MultiHeadAttention + Residual]
+                 -> LayerNorm -> BahdanauAttention (pooling de contexto)
+                 -> Concat(context, Embedding(asset_id)) -> Dropout(0.45)
+                 -> [Dense(32)+L2 + Residual(proyección+L2)] -> LayerNorm -> Dense(1)+L2
 Entorno objetivo: local (VSCode / macOS), TensorFlow/Keras 3.x
 
 CAMBIOS RESPECTO A LA V1 (single-asset, precio absoluto):
@@ -127,6 +126,74 @@ CAMBIOS V3 (este archivo) — FIX DEL COLAPSO "COBARDE":
      fuerza a esas capas a apoyarse en pesos más pequeños y distribuidos,
      en vez de memorizar combinaciones específicas de features ruidosas
      del set de entrenamiento.
+
+CAMBIOS V4 (este archivo) — REFACTOR ESTADÍSTICO/ARQUITECTÓNICO INSTITUCIONAL:
+
+10) DIAGNÓSTICO V3: pese al curriculum de gamma, el modelo seguía
+    convergiendo a ŷ≈0 en gran parte de las muestras (directional_accuracy
+    < 40%, peor que el 50% de una moneda justa). Causas identificadas:
+    (a) los factores macro entraban al feature_scaler como NIVEL crudo
+    (no-estacionario), (b) la red seguía sobre-parametrizada para 14
+    features, y (c) minimizar Huber puro bajo ruido sigue premiando
+    ŷ≈0 aunque gamma sea 0 al inicio del curriculum. Los 4 cambios de abajo
+    atacan cada causa; el curriculum de gamma (9.1-9.3) y el resto de la
+    V3 se MANTIENEN sin cambios salvo donde se indica explícitamente.
+
+10.1) ESTACIONARIEDAD ESTRICTA (Fase A). `engineer_asset` transforma TODOS
+      los factores macro (^GSPC, ^TNX, ^VIX, GC=F, DX-Y.NYB) a log-return
+      ANTES de que `build_asset_dataset` los pase al feature_scaler —
+      exactamente el mismo tratamiento que ya recibía el target:
+          r_macro_t = log(P_macro_t / P_macro_{t-1})
+      Nunca se pasa un nivel/precio macro crudo al scaler. Sin esto, un
+      MinMaxScaler ajustado en el tramo de train de ^TNX/^VIX/etc. queda
+      "descalibrado" en cuanto el nivel deriva fuera del rango de
+      entrenamiento (el mismo problema de raíz unitaria que motivó predecir
+      log-return en vez de precio para el target).
+
+10.2) SENTIMENT_SCORE VÍA CORRELACIÓN CRUZADA. `compute_sentiment_score`
+      deja de ser un Z-score de momentum propio del activo (V1-V3) y pasa a
+      ser la correlación de Pearson MÓVIL (ventana SENTIMENT_LOOKBACK=20)
+      entre el log-return del activo y el log-return de un factor macro de
+      referencia (SENTIMENT_MACRO_PROXY="^VIX" por defecto, con fallback al
+      primer macro_ticker si no está presente en MACRO_TICKERS):
+          rho_t = Corr_{k=t-20..t}( r_asset_k , r_VIX_k )
+      Una caída/inversión abrupta de esa correlación respecto a su nivel
+      histórico es la firma matemática de un shock IDIOSINCRÁTICO del
+      activo (noticia específica) que rompe su co-movimiento habitual con
+      el miedo/mercado agregado — una señal mucho más específica que "qué
+      tan extremo fue el retorno de hoy frente a su propia distribución".
+
+10.3) TOPOLOGÍA DE OCKHAM (Fase B). `BiLSTM(256)->BiLSTM(128)` se poda a
+      una ÚNICA `BiLSTM(64)`. El bloque de MultiHeadAttention (con
+      residual) y el pooling de BahdanauAttention se MANTIENEN intactos.
+      Al desaparecer la segunda rama recurrente, la fusión pasa de
+      [context_vector, bilstm_2, asset_embed] a [context_vector,
+      asset_embed], y la cabeza densa (post_fusion_dense +
+      fused_projection_skip) se poda de 64 a 32 unidades — un modelo con
+      muchos menos parámetros para 14 features de entrada, que fuerza
+      representaciones generalizadas en vez de memorización de ruido.
+
+10.4) PENALIZACIÓN DE VARIANZA — LA CURA DE LA "COBARDÍA". Se extiende
+      `DirectionalHuberLoss` con un término que RESTA de la loss la
+      varianza (saturada en VARIANCE_CAP) de las predicciones del batch:
+          Total_Loss = mean(Huber_δ(y,ŷ)·(1+γ·1[sign≠]))
+                       - λ · min(Var_batch(ŷ), VARIANCE_CAP)
+      Si el modelo colapsa a predicciones casi-constantes, Var_batch(ŷ)->0
+      y el término de recompensa desaparece — deja de ser "gratis" predecir
+      ŷ≈0. `variance_lambda` (VARIANCE_LAMBDA, ajustable) es el único
+      hiperparámetro nuevo a tunear: demasiado alto y el modelo aprende a
+      "gritar" (varianza alta, dirección aleatoria) en vez de acertar;
+      demasiado bajo y no rompe el colapso. `VARIANCE_CAP` evita que el
+      término, al no tener mínimo interior, incentive varianza sin límite.
+
+10.5) LR ADAPTATIVO + EARLY STOPPING (Fase C). `CosineDecayRestarts`
+      (LearningRateSchedule estático inyectado en el optimizador) se
+      reemplaza por `ReduceLROnPlateau` (monitorea val_loss, señal
+      continua) + `EarlyStopping` (monitorea val_directional_accuracy_metric
+      en modo "max", la métrica que realmente importa, con
+      start_from_epoch=EARLY_STOPPING_START_EPOCH para no contar el
+      plateau esperable durante el warmup de gamma). Ya no se gastan las
+      100 épocas completas si el modelo se estanca ~época 40.
 """
 
 import pickle
@@ -162,7 +229,8 @@ TRAIN_RATIO = 0.8
 SEED = 42
 ASSET_EMBED_DIM = 8
 
-SENTIMENT_LOOKBACK = 20  # ventana del Z-score de momentum (proxy de "noticias")
+SENTIMENT_LOOKBACK = 20  # ventana de la correlación móvil activo<->macro (proxy de "noticias", V4)
+SENTIMENT_MACRO_PROXY = "^VIX"  # factor macro de referencia para la correlación; fallback: MACRO_TICKERS[0]
 
 # TECH_COLS es la ÚNICA fuente de verdad de qué técnicos entran al tensor —
 # agregar/quitar un nombre aquí basta para que N_FEATURES y feature_cols
@@ -198,16 +266,21 @@ GAMMA_SIGMOID_STEEPNESS = 10.0  # mayor = transición más abrupta en el punto m
 DROPOUT_RATE = 0.45          # antes 0.4 -> refuerzo anti-overfitting del bloque de fusión
 DENSE_L2_REG = 1e-5          # L2 leve en las cabezas densas (post-fusión + salida)
 
-LR_INITIAL = 1e-3
-LR_ALPHA = 1e-2             # piso del LR en cada valle, como fracción del inicial
-LR_T_MUL = 2.0              # cada ciclo de reinicio dura 2x el anterior
-LR_M_MUL = 0.85             # cada reinicio arranca en 0.85x el LR pico anterior
-# V3: de 10 -> 8. Reinicios más frecuentes agitan la superficie de pérdida con
-# más regularidad (útil contra el colapso "cobarde"); no se baja a 5 para no
-# superponer dos fuentes de inestabilidad (reinicio de LR + rampa de gamma)
-# dentro de la misma ventana de épocas -> ver sección 9.3 del docstring.
-LR_RESTART_PERIOD_EPOCHS = 8
-GRAD_CLIPNORM = 1.0          # V3: clipping explícito -> evita explosión de gradiente en los reinicios de LR
+LR_INITIAL = 1e-3             # V4: LR FIJO al arrancar el optimizador — ya no hay
+                               # LearningRateSchedule inyectado; ReduceLROnPlateau (callback,
+                               # ver train_model) es quien lo muta en tiempo real según val_loss.
+GRAD_CLIPNORM = 1.0           # se mantiene: red de seguridad contra picos de gradiente
+
+# --- V4: LR ADAPTATIVO + EARLY STOPPING (reemplaza CosineDecayRestarts, sección 10.5) ---
+REDUCE_LR_FACTOR = 0.5          # cada plateau de val_loss -> LR se parte a la mitad
+REDUCE_LR_PATIENCE = 5          # épocas sin mejora de val_loss antes de reducir el LR
+REDUCE_LR_MIN_LR = 1e-6         # piso absoluto del LR
+EARLY_STOPPING_PATIENCE = 12    # épocas sin mejora de val_directional_accuracy_metric antes de detener
+EARLY_STOPPING_START_EPOCH = 15 # no cuenta el plateau antes de esta época (deja rodar el warmup de gamma)
+
+# --- V4: PENALIZACIÓN DE VARIANZA — cura de la "cobardía" (sección 10.4) ---
+VARIANCE_LAMBDA = 0.15       # peso de -lambda*min(var(y_pred), cap) en la loss; ajustable
+VARIANCE_CAP = 4.0           # techo de var(y_pred) que se premia (evita varianza sin límite)
 
 keras.utils.set_random_seed(SEED)  # fija numpy/python/backend de forma consistente (Keras 3)
 
@@ -314,26 +387,35 @@ def compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int 
     return macd_line, signal_line
 
 
-def compute_sentiment_score(price_series: pd.Series, window: int = SENTIMENT_LOOKBACK) -> pd.Series:
+def compute_sentiment_score(asset_log_return: pd.Series, macro_log_return: pd.Series,
+                             window: int = SENTIMENT_LOOKBACK) -> pd.Series:
     """
-    SENTIMENT_SCORE — proxy de noticias vía Z-score de MOMENTUM histórico.
-    No hay feed de noticias real: se aproxima el "shock" de sentimiento del
-    día como cuán extremo fue el log-return de ESE día frente a su propia
-    distribución reciente (media/std móviles de `window` sesiones). Un
-    Z-score fuertemente positivo/negativo se interpreta como un movimiento
-    "noticioso" (sorpresa), mientras que valores cerca de 0 son ruido normal
-    del régimen de volatilidad vigente del activo.
+    SENTIMENT_SCORE (V4) — proxy de shock IDIOSINCRÁTICO vía correlación de
+    Pearson MÓVIL (ventana de `window` sesiones) entre el log-return del
+    activo y el log-return de un factor macro de referencia (VIX por
+    defecto, ver SENTIMENT_MACRO_PROXY):
 
-        z_t = (r_t - mean(r_{t-window:t})) / std(r_{t-window:t})
+        rho_t = Corr_{k=t-window..t}( r_asset_k , r_macro_k )
 
-    donde r_t = log(P_t / P_{t-1}). `std==0` (activo sin movimiento en la
-    ventana) se guarda contra división por cero -> NaN -> fillna(0.0).
+    En régimen normal, un activo mantiene una relación relativamente
+    estable con el miedo/mercado agregado (rho_t con signo y magnitud
+    consistentes en el tiempo). Una caída o inversión abrupta de esa
+    correlación respecto a su nivel histórico es la firma matemática de un
+    shock ESPECÍFICO del activo (earnings, guidance, oferta/demanda
+    puntual) que rompe temporalmente su co-movimiento habitual con el
+    macro — una noticia. Esto reemplaza al Z-score de momentum propio de
+    la V1-V3 (que solo medía "qué tan extremo fue el retorno de HOY frente
+    a su propia distribución reciente", sin distinguir un movimiento
+    sistémico -todo el mercado se mueve junto- de uno idiosincrático).
+
+    `asset_log_return`/`macro_log_return` deben venir YA en log-return
+    (nunca precio/nivel crudo) y compartir índice. Las primeras `window`
+    observaciones no tienen ventana completa -> `rolling().corr()` produce
+    NaN ahí -> se rellena con 0.0 (lectura neutra: "sin shock detectado"),
+    consistente con el resto de los indicadores técnicos del pipeline.
     """
-    log_returns = np.log(price_series / price_series.shift(1))
-    rolling_mean = log_returns.rolling(window=window, min_periods=window).mean()
-    rolling_std = log_returns.rolling(window=window, min_periods=window).std()
-    z_score = (log_returns - rolling_mean) / rolling_std.replace(0.0, np.nan)
-    return z_score.fillna(0.0)
+    rho = asset_log_return.rolling(window=window, min_periods=window).corr(macro_log_return)
+    return rho.fillna(0.0)
 
 
 def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
@@ -379,7 +461,15 @@ def compute_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
 
 
 def engineer_asset(all_data: pd.DataFrame, ticker: str, macro_tickers: list) -> pd.DataFrame:
-    """Construye el frame de features de UN activo: OHLCV propio + técnicos + macro (solo Close)."""
+    """
+    Construye el frame de features de UN activo: OHLCV propio + técnicos +
+    macro. V4 — ESTACIONARIEDAD ESTRICTA (Fase A, sección 10.1): los
+    factores macro llegan a `all_data` como NIVEL/PRECIO crudo
+    (no-estacionario) -> se transforman a log-return AQUÍ, antes de que
+    `build_asset_dataset` los pase al feature_scaler, igual que el target:
+        r_macro_t = log(P_macro_t / P_macro_{t-1})
+    Nunca se pasa un nivel/precio macro crudo al scaler.
+    """
     close_col = f"{ticker}_Close"
     high_col = f"{ticker}_High"
     low_col = f"{ticker}_Low"
@@ -391,12 +481,25 @@ def engineer_asset(all_data: pd.DataFrame, ticker: str, macro_tickers: list) -> 
 
     close, high, low, volume = df[close_col], df[high_col], df[low_col], df[vol_col]
 
+    # --- Fase A (V4): factores macro -> log-return, NUNCA nivel crudo al scaler ---
+    for macro_close_col in macro_close_cols:
+        macro_price = df[macro_close_col]
+        df[macro_close_col] = np.log(macro_price / macro_price.shift(1))
+
     df["RSI_14"] = compute_rsi(close)
     df["EMA_20"] = close.ewm(span=20, adjust=False).mean()
     macd_line, signal_line = compute_macd(close)
     df["MACD"] = macd_line
     df["MACD_SIGNAL"] = signal_line
-    df["SENTIMENT_SCORE"] = compute_sentiment_score(close)
+
+    # --- SENTIMENT_SCORE (V4, sección 10.2): correlación móvil activo<->macro.
+    # proxy_log_return reutiliza la columna macro YA transformada arriba
+    # (no se recalcula desde precio crudo).
+    asset_log_return = np.log(close / close.shift(1))
+    proxy_ticker = SENTIMENT_MACRO_PROXY if SENTIMENT_MACRO_PROXY in macro_tickers else macro_tickers[0]
+    proxy_log_return = df[f"{proxy_ticker}_Close"]
+    df["SENTIMENT_SCORE"] = compute_sentiment_score(asset_log_return, proxy_log_return, SENTIMENT_LOOKBACK)
+
     df["ATR_14"] = compute_atr(high, low, close)
     df["BB_WIDTH_20"] = compute_bb_width(close)
     df["OBV"] = compute_obv(close, volume)
@@ -421,6 +524,9 @@ def build_asset_dataset(df: pd.DataFrame, ticker: str, lookback: int, train_rati
     que rompería silenciosamente la semántica de DirectionalHuberLoss. Dividir
     solo por una constante positiva (sigma) preserva el signo exactamente.
     """
+    # V4 (sección 10.1): las columnas de MACRO_TICKERS ya llegan en LOG-RETURN
+    # (ver engineer_asset, Fase A) -> el MinMaxScaler de abajo nunca ve un
+    # nivel/precio macro no-estacionario.
     feature_cols = ["PRICE"] + TECH_COLS + MACRO_TICKERS
     prices = df["PRICE"].values
     features = df[feature_cols].values
@@ -529,9 +635,26 @@ class DirectionalHuberLoss(keras.losses.Loss):
     pass, el nuevo valor se refleja automáticamente sin recompilar el
     modelo. Ver sección 9.1 del docstring del módulo para el fundamento
     matemático completo.
+
+    V4 — PENALIZACIÓN DE VARIANZA ("cura de la cobardía", sección 10.4):
+    aun con el curriculum de gamma, minimizar Huber puro bajo ruido sigue
+    premiando ŷ≈0 ∀ muestras. Se agrega un término que RESTA de la loss la
+    varianza (saturada en `variance_cap`) de las predicciones del batch:
+
+        L_total = mean( Huber_δ(y,ŷ)·(1+γ·1[sign(y)≠sign(ŷ)]) )
+                  - variance_lambda · min(Var_batch(ŷ), variance_cap)
+
+    Si el modelo colapsa a predicciones casi-constantes, Var_batch(ŷ)->0 y
+    el término de recompensa desaparece -> deja de ser "gratis" predecir
+    ŷ≈0, lo que reactiva el gradiente de magnitud/dirección. `variance_cap`
+    evita el riesgo simétrico: sin techo, -variance_lambda·Var(ŷ) no tiene
+    mínimo interior (el modelo podría maximizar varianza saturando ŷ hacia
+    ±∞ en vez de aprender señal real); al saturar en `variance_cap`, más
+    allá de ese punto el único gradiente que queda es el de Huber/dirección.
     """
 
     def __init__(self, delta: float = 1.0, gamma=1.5,
+                 variance_lambda: float = 0.0, variance_cap: float = None,
                  name: str = "directional_huber", **kwargs):
         super().__init__(name=name, **kwargs)
         self.delta = delta
@@ -544,6 +667,8 @@ class DirectionalHuberLoss(keras.losses.Loss):
         self.gamma = gamma if isinstance(gamma, keras.Variable) else keras.Variable(
             gamma, trainable=False, dtype="float32", name=f"{name}_gamma"
         )
+        self.variance_lambda = float(variance_lambda)
+        self.variance_cap = None if variance_cap is None else float(variance_cap)
 
     def call(self, y_true, y_pred):
         y_true = keras.ops.cast(y_true, "float32")
@@ -563,7 +688,21 @@ class DirectionalHuberLoss(keras.losses.Loss):
         # forward pass. DynamicGammaCallback la actualiza al inicio de cada
         # época, así que este término crece época a época sin recompilar.
         penalty = 1.0 + self.gamma * mismatch
-        return keras.ops.mean(huber * penalty, axis=-1)
+        directional_huber = keras.ops.mean(huber * penalty, axis=-1)  # (batch,)
+
+        # V4 (sección 10.4): batch_variance es un ÚNICO escalar por batch (no
+        # por muestra). keras.losses.Loss espera que call() devuelva un
+        # vector (batch,), así que se resta el mismo escalar a cada
+        # elemento; la reducción posterior (mean sobre el batch, default de
+        # Loss) queda matemáticamente idéntica a
+        # "mean(directional_huber) - variance_lambda*min(Var(ŷ), cap)".
+        if self.variance_lambda > 0.0:
+            batch_variance = keras.ops.var(y_pred)
+            if self.variance_cap is not None:
+                batch_variance = keras.ops.minimum(batch_variance, self.variance_cap)
+            directional_huber = directional_huber - self.variance_lambda * batch_variance
+
+        return directional_huber
 
     def get_config(self):
         config = super().get_config()
@@ -575,6 +714,8 @@ class DirectionalHuberLoss(keras.losses.Loss):
             # para inferencia; para REANUDAR el curriculum tras una carga
             # habría que re-envolverlo a mano en una Variable nueva.
             "gamma": float(keras.ops.convert_to_numpy(self.gamma)),
+            "variance_lambda": self.variance_lambda,
+            "variance_cap": self.variance_cap,
         })
         return config
 
@@ -646,65 +787,68 @@ class DynamicGammaCallback(keras.callbacks.Callback):
 
 
 def build_model(n_timesteps: int, n_features: int, n_assets: int,
-                 embed_dim: int = ASSET_EMBED_DIM, attention_units: int = 64,
+                 embed_dim: int = ASSET_EMBED_DIM, attention_units: int = 32,
                  mha_heads: int = MHA_HEADS, mha_key_dim: int = MHA_KEY_DIM,
-                 steps_per_epoch: int = 100,
                  huber_delta: float = HUBER_DELTA,
                  gamma_initial: float = GAMMA_INITIAL,
+                 variance_lambda: float = VARIANCE_LAMBDA,
+                 variance_cap: float = VARIANCE_CAP,
                  dropout_rate: float = DROPOUT_RATE,
                  dense_l2_reg: float = DENSE_L2_REG) -> tuple:
+    """
+    V4 — Fase B: TOPOLOGÍA DE OCKHAM (sección 10.3). Con 14 features de
+    entrada, `BiLSTM(256)->BiLSTM(128)` (V1-V3) está masivamente
+    sobre-parametrizada y memoriza ruido en vez de generalizar -> se poda a
+    una ÚNICA `BiLSTM(64)`. El bloque de auto-atención multi-cabeza (con
+    residual) y el pooling de Bahdanau se MANTIENEN sin cambios. Al
+    desaparecer la segunda rama recurrente, la fusión pasa de
+    [context_vector, bilstm_2, asset_embed] a [context_vector, asset_embed],
+    y la cabeza densa (post_fusion_dense / fused_projection_skip) se poda
+    de 64 a 32 unidades, coherente con la reducción de capacidad aguas
+    arriba.
+    """
     # `n_features` NUNCA se hardcodea acá — llega calculado desde
-    # N_FEATURES = 1 + len(TECH_COLS) + len(MACRO_TICKERS). Con ATR/BB/OBV
-    # agregados a TECH_COLS, `n_features` pasa de 11 a 14 y `input_sequence`
-    # se redimensiona solo, sin tocar la arquitectura.
+    # N_FEATURES = 1 + len(TECH_COLS) + len(MACRO_TICKERS).
     seq_input = keras.Input(shape=(n_timesteps, n_features), name="input_sequence")
     asset_input = keras.Input(shape=(1,), dtype="int32", name="input_asset_id")
 
-    bilstm_1 = layers.Bidirectional(
-        layers.LSTM(256, return_sequences=True), name="bilstm_256"
+    bilstm = layers.Bidirectional(
+        layers.LSTM(64, return_sequences=True), name="bilstm_64"
     )(seq_input)
-    bilstm_1 = layers.LayerNormalization(name="ln_post_bilstm_256")(bilstm_1)
+    bilstm = layers.LayerNormalization(name="ln_post_bilstm_64")(bilstm)
 
     # Bloque auto-atencional multi-cabeza (estilo encoder de Transformer) con
-    # conexión residual: cada posición temporal puede atender a TODA la
-    # secuencia (no solo al promedio, como hace Bahdanau) antes de que
-    # Bahdanau haga el pooling final de contexto. La suma residual +
-    # LayerNormalization evita que el bloque MHA degrade el gradiente que
-    # fluye desde la BiLSTM (identidad como piso, nunca peor que sin MHA).
+    # conexión residual: se mantiene IDÉNTICO a V1-V3 (directiva Fase B:
+    # "Keep the Multi-Head Attention and Bahdanau context"). Cada posición
+    # temporal puede atender a TODA la secuencia antes de que Bahdanau haga
+    # el pooling final de contexto; la suma residual + LayerNormalization
+    # evita que el bloque MHA degrade el gradiente que fluye desde la BiLSTM.
     mha_out = layers.MultiHeadAttention(
         num_heads=mha_heads, key_dim=mha_key_dim, name="multi_head_self_attention"
-    )(query=bilstm_1, value=bilstm_1, key=bilstm_1)
-    attn_block = layers.Add(name="mha_residual_add")([bilstm_1, mha_out])
+    )(query=bilstm, value=bilstm, key=bilstm)
+    attn_block = layers.Add(name="mha_residual_add")([bilstm, mha_out])
     attn_block = layers.LayerNormalization(name="ln_post_mha_residual")(attn_block)
 
     context_vector, attention_weights = BahdanauAttention(
         attention_units, name="bahdanau_attention"
     )(attn_block)
 
-    bilstm_2 = layers.Bidirectional(
-        layers.LSTM(128, return_sequences=False), name="bilstm_128"
-    )(attn_block)
-    bilstm_2 = layers.LayerNormalization(name="ln_post_bilstm_128")(bilstm_2)
-
     asset_embed = layers.Embedding(n_assets, embed_dim, name="asset_embedding")(asset_input)
     asset_embed = layers.Flatten(name="asset_embedding_flat")(asset_embed)
 
-    fused = layers.Concatenate(name="fusion_attn_bilstm_asset")([context_vector, bilstm_2, asset_embed])
-    # V3: dropout_rate sube de 0.4 a 0.45 por defecto (ver sección 9.4 del
-    # docstring del módulo) -> parametrizado, ya no hardcodeado.
+    # V4: sin segunda rama BiLSTM(128) -> la fusión pasa de 3 a 2 entradas.
+    fused = layers.Concatenate(name="fusion_attn_asset")([context_vector, asset_embed])
     fused = layers.Dropout(dropout_rate, name="dropout_regularizer")(fused)
 
     # Bloque denso con conexión residual: `fused_projection_skip` proyecta el
-    # vector de fusión (776-d) a 64-d para poder sumarlo con `post_fusion_dense`
-    # (necesario porque las dimensiones no coinciden — proyección lineal, no
-    # una identidad pura, siguiendo el patrón de "projection shortcut" de ResNet).
-    # V3: las 3 capas Dense de la cabeza llevan L2 leve (dense_l2_reg) ->
-    # fuerza pesos más pequeños/distribuidos en vez de memorizar combinaciones
-    # específicas de features ruidosas (ver sección 9.4 del docstring).
+    # vector de fusión a 32-d para poder sumarlo con `post_fusion_dense`
+    # (proyección lineal, no una identidad pura, patrón "projection shortcut"
+    # de ResNet). V4: cabeza podada de 64 a 32 unidades (sección 10.3); las
+    # 3 capas Dense siguen llevando L2 leve (dense_l2_reg).
     l2 = keras.regularizers.l2(dense_l2_reg)
-    dense_hidden = layers.Dense(64, activation="relu", name="post_fusion_dense",
+    dense_hidden = layers.Dense(32, activation="relu", name="post_fusion_dense",
                                  kernel_regularizer=l2)(fused)
-    fused_projection = layers.Dense(64, name="fused_projection_skip",
+    fused_projection = layers.Dense(32, name="fused_projection_skip",
                                      kernel_regularizer=l2)(fused)
     dense_block = layers.Add(name="dense_residual_add")([dense_hidden, fused_projection])
     dense_block = layers.LayerNormalization(name="ln_post_dense_residual")(dense_block)
@@ -712,41 +856,33 @@ def build_model(n_timesteps: int, n_features: int, n_assets: int,
     output = layers.Dense(1, name="return_head", kernel_regularizer=l2)(dense_block)
 
     model = keras.Model(inputs=[seq_input, asset_input], outputs=output,
-                         name="Global_Attention_BiLSTM_Returns_V3")
+                         name="Global_Attention_BiLSTM_Returns_V4")
 
-    # CosineDecayRestarts: LearningRateSchedule inyectado DIRECTO en el
-    # optimizador (no es un callback) — cada `first_decay_steps` el LR baja
-    # de LR_INITIAL a LR_ALPHA*LR_INITIAL en coseno y luego "reinicia" a un
-    # pico más alto, forzando al optimizador a re-explorar la vecindad de un
-    # mínimo en vez de estancarse en el primero que encuentra. Los ciclos se
-    # alargan (LR_T_MUL=2.0) y el pico decae levemente en cada reinicio
-    # (LR_M_MUL=0.85) para converger hacia el final del entrenamiento.
-    lr_schedule = keras.optimizers.schedules.CosineDecayRestarts(
-        initial_learning_rate=LR_INITIAL,
-        first_decay_steps=max(1, steps_per_epoch * LR_RESTART_PERIOD_EPOCHS),
-        t_mul=LR_T_MUL,
-        m_mul=LR_M_MUL,
-        alpha=LR_ALPHA,
-    )
-    # V3: clipnorm=GRAD_CLIPNORM recorta la norma global del gradiente antes
-    # de cada update -> red de seguridad contra explosiones de peso justo
-    # tras un reinicio de LR (ver sección 9.2 del docstring del módulo).
+    # V4 — Fase C (sección 10.5): LR FIJO al compilar. Ya no hay
+    # LearningRateSchedule inyectado en el optimizador (CosineDecayRestarts
+    # queda retirado) -> ReduceLROnPlateau (callback, ver train_model) es
+    # quien muta el LR en tiempo real según val_loss, algo que un schedule
+    # estático no puede hacer al no leer métricas de validación. clipnorm
+    # se mantiene como red de seguridad contra picos de gradiente.
     optimizer = keras.optimizers.AdamW(
-        learning_rate=lr_schedule, weight_decay=1e-4, clipnorm=GRAD_CLIPNORM
+        learning_rate=LR_INITIAL, weight_decay=1e-4, clipnorm=GRAD_CLIPNORM
     )
 
-    # V3 — CURRICULUM LEARNING: gamma deja de ser el float estático de la V2
-    # y pasa a ser un keras.Variable NO entrenable (no es un peso del
-    # modelo: es un hiperparámetro mutable). DynamicGammaCallback la
-    # reescribe en `on_epoch_begin`; como DirectionalHuberLoss.call() lee
-    # `self.gamma` en cada forward pass, el nuevo valor se refleja solo,
-    # sin recompilar el modelo. Ver sección 9.1 del docstring del módulo.
+    # V3 — CURRICULUM LEARNING (se mantiene en V4): gamma es un
+    # keras.Variable NO entrenable (no es un peso del modelo: es un
+    # hiperparámetro mutable). DynamicGammaCallback la reescribe en
+    # `on_epoch_begin`; como DirectionalHuberLoss.call() lee `self.gamma` en
+    # cada forward pass, el nuevo valor se refleja solo, sin recompilar el
+    # modelo. Ver sección 9.1 del docstring del módulo.
     gamma_variable = keras.Variable(
         gamma_initial, trainable=False, dtype="float32", name="directional_gamma"
     )
     model.compile(
         optimizer=optimizer,
-        loss=DirectionalHuberLoss(delta=huber_delta, gamma=gamma_variable),
+        loss=DirectionalHuberLoss(
+            delta=huber_delta, gamma=gamma_variable,
+            variance_lambda=variance_lambda, variance_cap=variance_cap,
+        ),
         metrics=["mae", directional_accuracy_metric],
     )
     # NO se guarda `gamma_variable` como atributo de `model` (ej.
@@ -776,16 +912,35 @@ def train_model(model: keras.Model, X_train, asset_id_train, y_train,
                  gamma_schedule: str = GAMMA_SCHEDULE,
                  gamma_sigmoid_steepness: float = GAMMA_SIGMOID_STEEPNESS):
     """
-    Sin EarlyStopping: CosineDecayRestarts ya fuerza reinicios periódicos del
-    LR (el mecanismo que normalmente cubriría un EarlyStopping por plateau),
-    así que se deja correr el ciclo completo de `epochs`. ModelCheckpoint
-    sigue siendo indispensable — sin él, el modelo resultante sería el de la
-    ÚLTIMA época, que justo después de un reinicio de LR puede tener peor
-    val_loss que un punto intermedio. Tras fit(), se recarga el checkpoint de
-    mejor val_loss, replicando el efecto de `restore_best_weights=True`.
-    TerminateOnNaN() es una red de seguridad barata: un schedule más agresivo
-    (picos de LR más altos en cada reinicio) tiene más riesgo de un salto que
-    haga explotar el loss en algún batch.
+    V4 — Fase C (sección 10.5): `ReduceLROnPlateau` + `EarlyStopping`
+    reemplazan a `CosineDecayRestarts` como mecanismo de control del
+    LR/duración del entrenamiento (V1-V3 dependía de reinicios periódicos
+    de LR inyectados en el optimizador y dejaba correr las `epochs`
+    completas sin criterio de parada).
+
+    - `ReduceLROnPlateau(monitor="val_loss")`: parte el LR a la mitad
+      (REDUCE_LR_FACTOR) cada vez que val_loss no mejora durante
+      REDUCE_LR_PATIENCE épocas, con piso REDUCE_LR_MIN_LR. val_loss (no la
+      accuracy direccional) es la señal correcta para ESTA decisión: es
+      continua, mientras que directional_accuracy es una métrica de conteo
+      (0/1 por muestra) demasiado ruidosa época a época para gobernar el LR.
+    - `EarlyStopping(monitor="val_directional_accuracy_metric", mode="max")`:
+      detiene el entrenamiento si la métrica que REALMENTE importa (no la
+      loss compuesta, que mezcla magnitud + dirección + varianza) no mejora
+      durante EARLY_STOPPING_PATIENCE épocas, con `restore_best_weights=True`
+      como red de seguridad adicional. `start_from_epoch=
+      EARLY_STOPPING_START_EPOCH` evita que la paciencia empiece a contar
+      mientras el curriculum de gamma sigue en rampa (las primeras épocas
+      son de exploración de magnitud, no de precisión direccional -> un
+      plateau ahí es esperado, no señal de estancamiento real). Así se evita
+      gastar epochs completos si el modelo se estanca ~época 40.
+    - `ModelCheckpoint(save_best_only=True, monitor="val_loss")` sigue
+      siendo la fuente de verdad FINAL de los pesos (se recarga tras
+      `fit()`, igual que en V1-V3): puede diferir levemente de los pesos
+      que deja `restore_best_weights` de EarlyStopping (que optimiza por
+      accuracy direccional) — es una elección deliberada, val_loss sigue
+      siendo el objetivo de entrenamiento primario.
+    - `TerminateOnNaN()` se mantiene sin cambios como red de seguridad barata.
 
     V3 — nota sobre `gamma_variable`: si `save_best_only=True` guarda el
     checkpoint en una época donde el curriculum aún no llegó a gamma_max (un
@@ -800,6 +955,18 @@ def train_model(model: keras.Model, X_train, asset_id_train, y_train,
             checkpoint_path, monitor="val_loss", save_best_only=True, verbose=1
         ),
         keras.callbacks.TerminateOnNaN(),
+        # V4 (sección 10.5): LR adaptativo sobre plateau de val_loss.
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=REDUCE_LR_FACTOR, patience=REDUCE_LR_PATIENCE,
+            min_lr=REDUCE_LR_MIN_LR, verbose=1,
+        ),
+        # V4 (sección 10.5): parada temprana agresiva sobre la métrica que
+        # de verdad importa, no sobre la loss compuesta.
+        keras.callbacks.EarlyStopping(
+            monitor="val_directional_accuracy_metric", mode="max",
+            patience=EARLY_STOPPING_PATIENCE, start_from_epoch=EARLY_STOPPING_START_EPOCH,
+            restore_best_weights=True, verbose=1,
+        ),
     ]
     if gamma_variable is not None:
         # V3: registra el callback de curriculum learning SOLO si se pasó una
@@ -909,25 +1076,25 @@ assert X_train.shape[-1] == N_FEATURES, (
     f"pero N_FEATURES={N_FEATURES} (TECH_COLS={TECH_COLS}). Revisa "
     "engineer_asset()/build_asset_dataset()."
 )
-print(f"      n_features dinámico = {N_FEATURES} (PRICE + {len(TECH_COLS)} técnicos incl. ATR/BB/OBV + {len(MACRO_TICKERS)} macro)")
+print(f"      n_features dinámico = {N_FEATURES} (PRICE + {len(TECH_COLS)} técnicos incl. ATR/BB/OBV/SENTIMENT[corr] + {len(MACRO_TICKERS)} macro log-return)")
 
-# steps_per_epoch estimado sobre el tramo EFECTIVO de entrenamiento (90% de
-# X_train, ya que model.fit reserva VALIDATION_SPLIT=10% para validación) —
-# necesario para calibrar `first_decay_steps` de CosineDecayRestarts en
-# términos de ÉPOCAS y no de steps crudos.
-n_train_effective = int(X_train.shape[0] * (1 - VALIDATION_SPLIT))
-steps_per_epoch = max(1, n_train_effective // BATCH_SIZE)
-
+# V4: ya no se necesita steps_per_epoch -> CosineDecayRestarts (que lo
+# consumía para calibrar first_decay_steps) se retiró en favor de
+# ReduceLROnPlateau/EarlyStopping (operan por ÉPOCA, no por step; ver
+# sección 10.5 del docstring del módulo).
 model, gamma_variable = build_model(
     n_timesteps=LOOKBACK, n_features=N_FEATURES, n_assets=len(TICKERS),
-    mha_heads=MHA_HEADS, mha_key_dim=MHA_KEY_DIM, steps_per_epoch=steps_per_epoch,
+    mha_heads=MHA_HEADS, mha_key_dim=MHA_KEY_DIM,
     huber_delta=HUBER_DELTA, gamma_initial=GAMMA_INITIAL,
+    variance_lambda=VARIANCE_LAMBDA, variance_cap=VARIANCE_CAP,
     dropout_rate=DROPOUT_RATE, dense_l2_reg=DENSE_L2_REG,
 )
 model.summary()
-print(f"      [V3] Curriculum gamma: {GAMMA_INITIAL} -> {GAMMA_MAX} en {GAMMA_WARMUP_EPOCHS} "
+print(f"      [V4] Curriculum gamma: {GAMMA_INITIAL} -> {GAMMA_MAX} en {GAMMA_WARMUP_EPOCHS} "
       f"épocas (schedule={GAMMA_SCHEDULE})  |  clipnorm={GRAD_CLIPNORM}  |  "
-      f"LR_RESTART_PERIOD_EPOCHS={LR_RESTART_PERIOD_EPOCHS}")
+      f"variance_lambda={VARIANCE_LAMBDA} (cap={VARIANCE_CAP})  |  "
+      f"ReduceLROnPlateau(factor={REDUCE_LR_FACTOR}, patience={REDUCE_LR_PATIENCE})  |  "
+      f"EarlyStopping(patience={EARLY_STOPPING_PATIENCE}, start_from_epoch={EARLY_STOPPING_START_EPOCH})")
 history, model = train_model(
     model, X_train, asset_id_train, y_train,
     epochs=EPOCHS, batch_size=BATCH_SIZE, validation_split=VALIDATION_SPLIT,
