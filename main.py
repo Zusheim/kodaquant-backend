@@ -218,6 +218,17 @@ with gr.Blocks() as _zerogpu_demo:
 
 app = gr.mount_gradio_app(app, _zerogpu_demo, path="/zerogpu-probe")
 
+@app.on_event("startup")
+async def _log_asgi_startup() -> None:
+    # Uvicorn solo loguea el genérico "Application startup complete.". Este
+    # marcador con timestamp deja explícito en los logs del Space cuánto
+    # tardó el cold start real (imports de TensorFlow/Keras + montaje de
+    # gradio) — clave para diferenciar "todo bien, algo externo mandó
+    # SIGTERM" de "el arranque fue tan lento que algo lo mató por timeout".
+    # Ver app.py: el launcher ahora sobrevive a cualquiera de los dos casos,
+    # pero esta línea ayuda a confirmar cuál está pasando si vuelve a fallar.
+    logger.info("KodaQuant ASGI startup complete — rutas + probe de ZeroGPU montados.")
+
 @app.get("/")
 async def root():
     return {"status": "online", "system": "KodaQuant Terminal", "version": "4.0"}

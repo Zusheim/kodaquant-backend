@@ -76,7 +76,11 @@ multitasking==0.0.13
 # --- LLM / search --------------------------------------------------------
 groq>=0.31.0,<2.0.0
 ddgs>=9.0.0
-spaces>=0.30.0,<1.0
+# `spaces` ya está pineado arriba (== 0.51.1, sección ZeroGPU probe) — estaba
+# declarado dos veces en este archivo con constraints distintas
+# (==0.51.1 vs >=0.30.0,<1.0). No generaban conflicto real porque 0.51.1
+# satisface el rango, pero es una trampa: el día que alguien actualice solo
+# una de las dos líneas, sí lo generaría.
 
 # --- Parsing / scraping ---------------------------------------------------
 beautifulsoup4==4.15.0
