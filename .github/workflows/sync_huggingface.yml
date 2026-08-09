@@ -17,7 +17,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          # 1. Crear .gitignore dinámico para excluir basura y evitar el 429
+          # 1. Crear .gitignore dinámico para basura
           cat > .gitignore << EOF
           node_modules/
           venv/
@@ -29,19 +29,32 @@ jobs:
           .DS_Store
           EOF          
           
-          # 2. Borrar el historial fantasma de Git solo dentro del puente
+          # 2. Inyectar la llave de encendido de Hugging Face
+          cat > README.md << EOF
+          ---
+          title: KodaQuant Backend
+          emoji: 🚀
+          colorFrom: blue
+          colorTo: indigo
+          sdk: gradio
+          app_file: app.py
+          pinned: false
+          ---
+          EOF
+
+          # 3. Borrar el historial fantasma de Git
           rm -rf .git
           git init
           git checkout -b main
           git config user.name "GitHub Actions KodaQuant"
           git config user.email "actions@github.com"
           
-          # 3. Rastrear solo los archivos que existen HOY
+          # 4. Rastrear solo los archivos que existen HOY
           git lfs install
           git lfs track "*.keras"
           git lfs track "*.pkl"
           git add .
           
-          # 4. Empaquetar y forzar la subida a Hugging Face como un inicio en blanco
-          git commit -m "deploy: actualización automática limpia"
+          # 5. Empaquetar y forzar la subida a Hugging Face
+          git commit -m "deploy: inyectar motor de Hugging Face y sincronizar backend"
           git push --force https://Zusheim:$HF_TOKEN@huggingface.co/spaces/Zusheim/kodaquant-backend main
