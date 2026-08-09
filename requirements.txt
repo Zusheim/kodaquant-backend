@@ -1,6 +1,6 @@
 # --- Web framework -------------------------------------------------------
 fastapi>=0.115.2
-starlette==0.38.6
+starlette>=1.0.1
 uvicorn==0.32.0
 uvloop==0.22.1
 httptools==0.8.0
