@@ -66,3 +66,4 @@ keras==3.13.2
 aiosmtplib>=3.0.0
 groq>=0.31.0,<2.0.0
 ddgs>=9.0.0
+tensorflow>=2.16.1
