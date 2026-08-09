@@ -1,7 +1,8 @@
-# --- Web framework -------------------------------------------------------
-fastapi>=0.115.2
-starlette>=1.0.1
-uvicorn==0.32.0
+# --- Web framework (bounds mirror what gradio==6.22.0 itself requires,
+# since HF's Gradio SDK auto-installs it alongside this file) -------------
+fastapi>=0.115.2,<1.0
+starlette>=1.0.1,<2.0
+uvicorn>=0.32.0,<1.0
 uvloop==0.22.1
 httptools==0.8.0
 watchfiles==1.2.0
@@ -10,19 +11,21 @@ h11==0.16.0
 h2==4.3.0
 hpack==4.2.0
 hyperframe==6.1.0
-anyio==4.14.1
+anyio>=4.14.1,<5.0
 
 # --- Data validation / settings -------------------------------------------
-pydantic==2.13.4
-pydantic_core==2.46.4
+pydantic>=2.13.4,<3.0
+# pydantic_core intentionally NOT pinned here: it must match pydantic's
+# own exact internal requirement. Pinning both and then loosening only
+# pydantic re-creates the same class of conflict this file just fixed.
 pydantic-settings==2.14.2
 annotated-types==0.7.0
 typing-inspection==0.4.2
-typing_extensions==4.16.0
+typing_extensions>=4.16.0,<5.0
 email-validator==2.3.0
 
 # --- HTTP / networking -----------------------------------------------------
-httpx==0.28.1
+httpx>=0.28.1,<1.0
 httpcore==1.0.9
 requests==2.34.2
 urllib3==2.7.0
@@ -50,13 +53,12 @@ realtime==2.31.0
 storage3==2.31.0
 peewee==4.1.1
 
-# --- Data / ML / forecasting ----------------------------------------------
+# --- Data / ML / forecasting (fixed — critical for the predictive models,
+# not touched by the Gradio conflict) ---------------------------------
 numpy==2.5.1
 pandas==3.0.3
 scikit-learn==1.6.1
 keras==3.13.2
-# Bounded on purpose, not left fully open: an unpinned future TF
-# major/minor could ship a Keras build incompatible with keras==3.13.2.
 tensorflow>=2.16.1,<2.21
 yfinance==0.2.44
 multitasking==0.0.13
@@ -79,7 +81,7 @@ aiosmtplib>=3.0.0
 python-dotenv==1.2.2
 python-dateutil==2.9.0.post0
 pytz==2026.2
-PyYAML==6.0.3
+PyYAML>=6.0.3,<7.0
 click==8.4.2
 deprecation==2.1.0
 packaging==26.2
