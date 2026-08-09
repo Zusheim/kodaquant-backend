@@ -11,11 +11,25 @@ jobs:
     steps:
       - uses: actions/checkout@v3
         with:
-          fetch-depth: 0
           lfs: true
-      - name: Empujar código a Hugging Face
+
+      - name: Empujar estado limpio a Hugging Face
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git config lfs.allowincompletepush true
+          # 1. Borrar el historial fantasma de Git solo dentro del puente
+          rm -rf .git
+          git init
+          git checkout -b main
+          git config user.name "GitHub Actions KodaQuant"
+          git config user.email "actions@github.com"
+          
+          # 2. Rastrear solo los archivos que existen HOY
+          git lfs install
+          git lfs track "*.keras"
+          git lfs track "*.pkl"
+          git add .
+          
+          # 3. Empaquetar y forzar la subida a Hugging Face como un inicio en blanco
+          git commit -m "deploy: actualización automática de KodaQuant"
           git push --force https://Zusheim:$HF_TOKEN@huggingface.co/spaces/Zusheim/kodaquant-backend main
