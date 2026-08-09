@@ -50,6 +50,10 @@ pycparser==3.0
 # --- Pagos ---------------------------------------------------------------
 stripe>=15.0,<16.0
 
+# --- ZeroGPU probe (mount Gradio invisible para satisfacer HF) -----------
+gradio[oauth,mcp]==6.22.0
+spaces==0.51.1
+
 # --- Database / Supabase -------------------------------------------------
 supabase==2.31.0
 supabase-auth==2.31.0

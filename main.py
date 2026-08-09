@@ -198,6 +198,26 @@ app.add_middleware(
     expose_headers=["Content-Type", "Cache-Control"],
 )
 
+# --- ZeroGPU probe -----------------------------------------------------
+# HF ZeroGPU necesita al menos una función @spaces.GPU referenciada por un
+# componente Gradio real (no basta con decorarla suelta) para que su
+# empaquetador la detecte durante el build. Este Blocks queda montado en
+# /zerogpu-probe, invisible, sin tocar ninguna ruta de la API. Localmente
+# (fuera de un Space) el decorador @spaces.GPU es un no-op inofensivo.
+import gradio as gr
+import spaces
+
+@spaces.GPU()
+def _zerogpu_probe():
+    return "ok"
+
+with gr.Blocks() as _zerogpu_demo:
+    _probe_btn = gr.Button(visible=False)
+    _probe_out = gr.Textbox(visible=False)
+    _probe_btn.click(_zerogpu_probe, None, _probe_out)
+
+app = gr.mount_gradio_app(app, _zerogpu_demo, path="/zerogpu-probe")
+
 @app.get("/")
 async def root():
     return {"status": "online", "system": "KodaQuant Terminal", "version": "4.0"}
