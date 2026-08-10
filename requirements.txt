@@ -50,9 +50,13 @@ pycparser==3.0
 # --- Pagos ---------------------------------------------------------------
 stripe>=15.0,<16.0
 
-# --- ZeroGPU probe (mount Gradio invisible para satisfacer HF) -----------
+# --- ZeroGPU probe (gradio.Server nativo, ver main.py) -------------------
+# `spaces` NO se pinea acá a propósito: la plataforma de HF Spaces ya lo
+# fuerza a su propia versión en el build (ver el log de build: agrega
+# "spaces==X.Y.Z" al pip install además de este archivo). Pinearlo de
+# nuevo acá es un conflicto latente esperando pasar — ver la nota vieja
+# más abajo, que documentaba el mismo riesgo sin eliminarlo.
 gradio[oauth,mcp]==6.22.0
-spaces==0.51.1
 
 # --- Database / Supabase -------------------------------------------------
 supabase==2.31.0
@@ -76,11 +80,6 @@ multitasking==0.0.13
 # --- LLM / search --------------------------------------------------------
 groq>=0.31.0,<2.0.0
 ddgs>=9.0.0
-# `spaces` ya está pineado arriba (== 0.51.1, sección ZeroGPU probe) — estaba
-# declarado dos veces en este archivo con constraints distintas
-# (==0.51.1 vs >=0.30.0,<1.0). No generaban conflicto real porque 0.51.1
-# satisface el rango, pero es una trampa: el día que alguien actualice solo
-# una de las dos líneas, sí lo generaría.
 
 # --- Parsing / scraping ---------------------------------------------------
 beautifulsoup4==4.15.0

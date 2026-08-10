@@ -3,7 +3,9 @@ import asyncio
 import logging
 import time
 load_dotenv()
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import Depends, HTTPException
+from gradio import Server
+import spaces
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from services.currency_engine import convert_to_usd
@@ -33,7 +35,7 @@ from core.config import settings
 
 logger = logging.getLogger("kodaquant.main")
 
-app = FastAPI(title="KodaQuant Terminal", version="4.0")
+app = Server(title="KodaQuant Terminal", version="4.0")
 app.include_router(payments_router)
 app.include_router(auth_router, prefix="/api/v1/auth")
 app.include_router(online_learning_router)
@@ -199,24 +201,32 @@ app.add_middleware(
 )
 
 # --- ZeroGPU probe -----------------------------------------------------
-# HF ZeroGPU necesita al menos una función @spaces.GPU referenciada por un
-# componente Gradio real (no basta con decorarla suelta) para que su
-# empaquetador la detecte durante el build. Este Blocks queda montado en
-# /zerogpu-probe, invisible, sin tocar ninguna ruta de la API. Localmente
-# (fuera de un Space) el decorador @spaces.GPU es un no-op inofensivo.
-import gradio as gr
-import spaces
-
+# ROUND 3 — causa raíz real del "No @spaces.GPU function detected during
+# startup": `gr.mount_gradio_app(fastapi_app, blocks, path=...)` devuelve
+# la instancia FastAPI de ENTRADA (fastapi_app), mutada in place — nunca
+# un gr.Blocks/Interface. El hypervisor de ZeroGPU necesita reconocer el
+# objeto `app` exportado como demo Gradio nativo; al recibir un FastAPI
+# puro con Gradio montado como sub-app en un path escondido, no lo
+# reconoce como tal — pase lo que pase adentro de esa sub-app (Blocks con
+# GPU function real por .load() o .click(), no importa), y mata el
+# proceso. Esto es válido tanto para el mount en app.py (ronda 2) como
+# para este mismo patrón acá en main.py (bug preexistente, mismo defecto).
+#
+# Fix: `gradio.Server` (gradio>=6.22, ver
+# https://gradio.app/main/guides/server-mode) es un FastAPI real —
+# `app.add_middleware`, `app.include_router`, rutas @app.get/@app.post,
+# todo lo que ya usa este archivo sigue funcionando sin tocarlo — pero ES
+# el tipo de objeto que Gradio/ZeroGPU reconocen nativamente como servidor
+# Gradio. `@app.api()` registra la función en la tabla de endpoints de
+# Gradio (mismo registro que el hypervisor inspecciona), sin necesidad de
+# gr.Blocks ni de mount_gradio_app. Nunca se llama desde el frontend — solo
+# necesita existir registrada para que el hypervisor la detecte al
+# build/startup. KodaQuant sigue forzando toda la inferencia Keras real a
+# CPU (ver DEVICE GUARD arriba); este endpoint no hace inferencia real.
+@app.api(name="zerogpu_probe")
 @spaces.GPU()
-def _zerogpu_probe():
+def _zerogpu_probe() -> str:
     return "ok"
-
-with gr.Blocks() as _zerogpu_demo:
-    _probe_btn = gr.Button(visible=False)
-    _probe_out = gr.Textbox(visible=False)
-    _probe_btn.click(_zerogpu_probe, None, _probe_out)
-
-app = gr.mount_gradio_app(app, _zerogpu_demo, path="/zerogpu-probe")
 
 @app.on_event("startup")
 async def _log_asgi_startup() -> None:
