@@ -175,6 +175,19 @@ def _extract_first_cookie_pair(cookies) -> "tuple[str, str] | None":
     return None
 
 
+# `YfData` es Singleton de proceso ("one session one cookie shared by all
+# threads", docstring real de la clase en 0.2.44) y `_get_cookie_and_crumb()`
+# no serializa el tramo de bootstrap -- bajo el escaneo paralelo del radar
+# (prediccion.py: asyncio.gather + run_in_executor sobre ~10-15 tickers a la
+# vez) cada hilo que llegue con self._cookie is None ANTES de que el primero
+# termine dispara SU PROPIA request a fc.yahoo.com en paralelo (rebaño de N
+# requests idénticas al arrancar el proceso, fuera del alcance de
+# _YF_CONCURRENCY que solo protege las llamadas de datos, no el bootstrap
+# interno de cookie de yfinance). Mismo patrón de double-checked locking que
+# _model_load_locks/_scalers_load_locks más abajo en este archivo.
+_COOKIE_BOOTSTRAP_LOCK = threading.Lock()
+
+
 def _patched_get_cookie_basic(self, proxy=None, timeout=30):
     if self._cookie is not None and hasattr(self._cookie, "name"):
         utils.get_yf_logger().debug("reusing cookie")
@@ -189,31 +202,94 @@ def _patched_get_cookie_basic(self, proxy=None, timeout=30):
         # previa al parche -- se descarta y se re-fetchea en vivo abajo.
         utils.get_yf_logger().debug("cookie cacheada inválida (pre-parche) -- descartando")
 
-    response = self._session.get(
-        url="https://fc.yahoo.com",
-        headers=self.user_agent_headers,
-        proxies=proxy,
-        timeout=timeout,
-        allow_redirects=True,
-    )
-    if not response.cookies:
-        utils.get_yf_logger().debug("response.cookies = None")
-        return None
+    with _COOKIE_BOOTSTRAP_LOCK:
+        # Doble chequeo: otro hilo pudo haber completado el fetch (memoria O
+        # disco) mientras este esperaba el lock -- evita una segunda request
+        # de red redundante a fc.yahoo.com.
+        if self._cookie is not None and hasattr(self._cookie, "name"):
+            utils.get_yf_logger().debug("reusing cookie (post-lock)")
+            return self._cookie
+        loaded = self._load_cookie_basic()
+        if loaded is not None and hasattr(loaded, "name"):
+            self._cookie = loaded
+            return self._cookie
 
-    pair = _extract_first_cookie_pair(response.cookies)
-    if pair is None or not pair[0]:
-        utils.get_yf_logger().debug("no se pudo extraer ningún par (name, value) de response.cookies")
-        return None
+        response = self._session.get(
+            url="https://fc.yahoo.com",
+            headers=self.user_agent_headers,
+            proxies=proxy,
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if not response.cookies:
+            utils.get_yf_logger().debug("response.cookies = None")
+            return None
 
-    self._cookie = SimpleNamespace(name=pair[0], value=pair[1])
-    self._save_cookie_basic(self._cookie)
-    utils.get_yf_logger().debug(f"fetched basic cookie = {self._cookie.name}")
-    return self._cookie
+        pair = _extract_first_cookie_pair(response.cookies)
+        if pair is None or not pair[0]:
+            utils.get_yf_logger().debug("no se pudo extraer ningún par (name, value) de response.cookies")
+            return None
+
+        self._cookie = SimpleNamespace(name=pair[0], value=pair[1])
+        self._save_cookie_basic(self._cookie)
+        utils.get_yf_logger().debug(f"fetched basic cookie = {self._cookie.name}")
+        return self._cookie
 
 
 from yfinance import utils  # noqa: E402 -- usado por el parche de arriba (mismo logger que data.py)
+from yfinance import cache as _yf_cookie_cache  # noqa: E402 -- purga de arranque, ver _purge_poisoned_cookie_cache_at_startup
 from yfinance.data import YfData as _YfData  # noqa: E402
 _YfData._get_cookie_basic = _patched_get_cookie_basic
+
+
+def _purge_poisoned_cookie_cache_at_startup() -> None:
+    """
+    Autocuración EAGER, al importar el módulo (directriz explícita, además
+    del self-heal LAZY ya cubierto al 100%% por `_patched_get_cookie_basic`
+    en el primer acceso de cualquier hilo): purga la fila 'basic' de la
+    caché peewee/sqlite de yfinance (`cache.get_cookie_cache()`, verificado
+    contra el wheel real 0.2.44 -- misma tabla que `_save_cookie_basic`/
+    `_load_cookie_basic` usan arriba) si contiene una cookie pre-parche
+    (string plano, sin `.name`) de una corrida anterior al fix. Reutiliza
+    EXACTAMENTE el mismo criterio de validez (`hasattr(cookie, "name")`)
+    que el parche de arriba para no divergir la lógica en dos lugares.
+
+    Nunca lanza: un fallo de disco/permisos acá (ej. filesystem read-only
+    en cierto punto del ciclo de vida de un Space de HF) no debe tumbar el
+    boot del motor -- el self-heal lazy sigue cubriendo el caso igual en el
+    peor escenario, esto es puro refuerzo "cero intervención manual".
+    """
+    try:
+        cookie_cache = _yf_cookie_cache.get_cookie_cache()
+        cached = cookie_cache.lookup("basic")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Purga de arranque: caché de cookies yfinance no disponible (%r) -- se omite.", exc)
+        return
+
+    if cached is None:
+        return
+
+    stored_cookie = cached.get("cookie")
+    if stored_cookie is None or hasattr(stored_cookie, "name"):
+        return  # vacía o ya sana -- nada que purgar
+
+    try:
+        cookie_cache.store("basic", None)  # delete-then-no-insert, ver cache.py _CookieCache.store
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Purga de arranque: no se pudo eliminar la cookie 'basic' envenenada en disco (%r) -- "
+            "el self-heal lazy en _patched_get_cookie_basic sigue cubriendo este caso en el primer acceso.",
+            exc,
+        )
+    else:
+        logger.warning(
+            "Purga de arranque: cookie 'basic' envenenada (tipo %s, pre-parche) eliminada de la "
+            "caché en disco de yfinance -- autocuración sin intervención manual.",
+            type(stored_cookie).__name__,
+        )
+
+
+_purge_poisoned_cookie_cache_at_startup()
 # ---------------------------------------------------------------------------
 
 # --- FIX BLOQUEO YAHOO (HF Spaces / IPs de datacenter) --------------------
@@ -286,6 +362,24 @@ def _build_yf_session(profile_index: int = 0):
 # posteriores rotan a un perfil nuevo vía `_build_yf_session`, ver
 # `_yf_call_with_retry`.
 _YF_SESSION = _build_yf_session(0)
+
+# --- ASIGNACIÓN GLOBAL E INFALIBLE de la sesión a `YfData` ----------------
+# `YfData` es Singleton de proceso; `_set_session(session)` es no-op cuando
+# `session is None` (verificado contra el wheel real 0.2.44), así que
+# CUALQUIER llamada yfinance SIN `session=` explícito (ej.
+# `data_pipeline.py::_fetch_headlines_yfinance` -> `yf.Ticker(ticker).news`,
+# que nunca pasa `session=`) simplemente hereda lo que el Singleton ya tenga
+# bindeado -- pero solo DESPUÉS de que la primera llamada CON sesión
+# explícita haya corrido. Sin este bind eager, si esa llamada sin sesión es
+# la PRIMERA en ejecutarse en el proceso (perfectamente posible: es la misma
+# carrera de `asyncio.gather` que motiva `_COOKIE_BOOTSTRAP_LOCK` arriba,
+# aplicada esta vez al propio objeto sesión), el Singleton arrancaría con un
+# `requests.Session()` plano (`_set_session(session or requests.Session())`
+# en `YfData.__init__`) -- exactamente la huella TLS/JA3 bloqueable que todo
+# el bloque `curl_cffi`/`_IMPERSONATE_PROFILES` de arriba existe para evitar.
+# Instanciar el Singleton acá, ANTES de que ningún otro módulo (data_pipeline.py
+# u otro) pueda ganar esa carrera, cierra el hueco de forma determinista.
+_YfData(session=_YF_SESSION)
 
 # FIX #2 (sigue vigente con o sin curl_cffi): Yahoo rate-limitea por IP de
 # origen cuando ~15 tickers disparan yf.download/yf.Ticker EN SIMULTÁNEO --
