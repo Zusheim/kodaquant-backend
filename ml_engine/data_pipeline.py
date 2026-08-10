@@ -451,9 +451,16 @@ def get_daily_news_sentiment(
     else:
         target_dates = target_dt.normalize()
 
-    frame = pd.DataFrame({"target_date": target_dates})
+    # FIX: pandas 3.x ya no fuerza datetime64[ns] en todos lados -- conserva
+    # la resolución de origen de cada Serie (target_index puede venir en
+    # [us] de yfinance, "date" en [s] desde el parseo de published_at).
+    # merge_asof exige que ambas claves compartan EXACTAMENTE el mismo
+    # dtype, si no: "incompatible merge keys ... must be the same type".
+    # Se normalizan ambas a [ns] explícitamente antes de mergear.
+    frame = pd.DataFrame({"target_date": target_dates.astype("datetime64[ns]")})
     frame["orig_pos"] = range(len(frame))
     frame_sorted = frame.sort_values("target_date", kind="stable")
+    daily["date"] = daily["date"].astype("datetime64[ns]")
 
     merged = pd.merge_asof(
         frame_sorted,

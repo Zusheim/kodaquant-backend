@@ -81,6 +81,14 @@ multitasking==0.0.13
 groq>=0.31.0,<2.0.0
 ddgs>=9.0.0
 
+# --- NLP sentiment (FinBERT, ver services/data_pipeline.py) --------------
+# CPU-only a propósito (ver DEVICE GUARD en quanti_engine.py -- todo el
+# runtime de este Space corre en CPU) -- el índice extra evita bajar los
+# builds CUDA de torch, que son mucho más pesados y no se usan acá.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.4.0,<3.0
+transformers>=4.44.0,<5.0
+
 # --- Parsing / scraping ---------------------------------------------------
 beautifulsoup4==4.15.0
 lxml==6.1.1

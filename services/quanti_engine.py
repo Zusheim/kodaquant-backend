@@ -115,7 +115,21 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import numpy as np
 import pandas as pd
+import requests as _requests
 import yfinance as yf
+
+# FIX: el radar dispara ~10-15 tickers en paralelo (ThreadPoolExecutor), y
+# cada uno hace 2 llamadas yf.download() (_build_features) + 1 yf.Ticker()
+# (sentiment) -- 20-30+ requests concurrentes a query2.finance.yahoo.com.
+# El pool por-host default de urllib3 es 10 conexiones: al superarlo se
+# descartaban conexiones ("Connection pool is full, discarding connection")
+# y Yahoo empezaba a devolver respuestas vacías/JSON inválido bajo esa
+# carga, tumbando el radar entero. Una sesión compartida con pool más
+# grande, pasada a TODAS las llamadas yfinance, resuelve ambos síntomas.
+_YF_SESSION = _requests.Session()
+_yf_adapter = _requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
+_YF_SESSION.mount("https://", _yf_adapter)
+_YF_SESSION.mount("http://", _yf_adapter)
 from groq import (
     AsyncGroq,
     APIConnectionError as GroqAPIConnectionError,
@@ -1576,7 +1590,7 @@ def _fetch_feature_window(
     devolverlo. `close` (para todo lo demás) permanece intacto.
     """
     all_symbols = list(dict.fromkeys([ticker] + macro_tickers))
-    raw = yf.download(all_symbols, period="2y", auto_adjust=True, progress=False)
+    raw = yf.download(all_symbols, period="2y", auto_adjust=True, progress=False, session=_YF_SESSION)
 
     # V3: bundle OHLCV COMPLETO solo para el ticker objetivo — ATR_14
     # necesita High/Low, OBV necesita Volume. Los macro tickers permanecen
@@ -1640,7 +1654,7 @@ def _fetch_feature_window(
     # del activo. Ver uso en `historical` dentro de `_forecast_asset`.
     display_col = f"{ticker}__DISPLAY_CLOSE"
     try:
-        raw_display = yf.download(ticker, period="2y", auto_adjust=False, progress=False)
+        raw_display = yf.download(ticker, period="2y", auto_adjust=False, progress=False, session=_YF_SESSION)
         display_close = raw_display["Close"] if not raw_display.empty else None
         if isinstance(display_close, pd.DataFrame):  # MultiIndex de 1 solo símbolo, según versión de yfinance
             display_close = display_close[ticker] if ticker in display_close.columns else display_close.iloc[:, 0]
@@ -3032,7 +3046,7 @@ async def get_market_sentiment(symbol: str) -> dict[str, float | str]:
             loop = asyncio.get_running_loop()
 
             def _sync_momentum() -> float:
-                hist = yf.Ticker(symbol).history(
+                hist = yf.Ticker(symbol, session=_YF_SESSION).history(
                     period=f"{SENTIMENT_MOMENTUM_LOOKBACK_DAYS + 5}d"
                 )
                 closes = hist["Close"].dropna()
