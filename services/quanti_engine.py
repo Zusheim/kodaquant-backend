@@ -115,6 +115,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import io
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -132,6 +133,88 @@ except ImportError:  # extra faltante -- degrada a requests plano, nunca tumba e
         "requests.Session estándar (huella TLS de Python, bloqueable por "
         "Cloudflare/Yahoo). `pip install curl_cffi` para impersonation real."
     )
+
+# --- PARCHE BUG CONFIRMADO yfinance==0.2.44 + sesión no-requests ----------
+# `YfData._get_cookie_basic()` (yfinance/data.py L171, verificado línea a
+# línea contra el wheel pineado en requirements.txt) hace
+# `self._cookie = list(response.cookies)[0]` asumiendo que iterar
+# `response.cookies` (un `requests.cookies.RequestsCookieJar`) devuelve
+# objetos `Cookie` con `.name`/`.value`. Con `curl_cffi` (o cualquier sesión
+# no-requests) `response.cookies` es un objeto tipo `curl_cffi.requests.Cookies`
+# cuya iteración devuelve STRINGS (los nombres) -- `self._cookie` termina
+# siendo un string plano, y `_get_crumb_basic()` (L192) revienta al pedirle
+# `.name` -- exactamente `AttributeError: 'str' object has no attribute
+# 'name'`, reproducible y documentado en yfinance#2470/#2429/#2461/#2494/#2684
+# (upstream, closed as not planned -- no hay fix oficial en ninguna versión
+# probada). Ese string además queda cacheado en disco (peewee/sqlite, ver
+# `_save_cookie_basic`) -- una vez envenenado, CADA request posterior lo
+# reutiliza y falla IDÉNTICO (coincide con el log: 100% de los tickers
+# fallando igual, todo el proceso). Se reemplaza el método completo por una
+# versión que reconstruye el par (name, value) de forma robusta sea cual sea
+# el tipo de `response.cookies`, y que además invalida/reconstruye cualquier
+# cookie ya envenenada que viniera de la caché en disco de una corrida
+# previa al parche -- autocurativo, no requiere borrar caché a mano.
+def _extract_first_cookie_pair(cookies) -> "tuple[str, str] | None":
+    get_dict = getattr(cookies, "get_dict", None)
+    if callable(get_dict):
+        try:
+            d = get_dict()
+            if d:
+                return next(iter(d.items()))
+        except Exception:  # noqa: BLE001 -- se prueban las otras estrategias
+            pass
+    try:
+        d = dict(cookies)
+        if d and all(isinstance(v, str) for v in d.values()):
+            return next(iter(d.items()))
+    except (TypeError, ValueError):
+        pass
+    for item in cookies:
+        if hasattr(item, "name") and hasattr(item, "value"):
+            return item.name, item.value
+    return None
+
+
+def _patched_get_cookie_basic(self, proxy=None, timeout=30):
+    if self._cookie is not None and hasattr(self._cookie, "name"):
+        utils.get_yf_logger().debug("reusing cookie")
+        return self._cookie
+
+    loaded = self._load_cookie_basic()
+    if loaded is not None:
+        if hasattr(loaded, "name"):
+            self._cookie = loaded
+            return self._cookie
+        # Cookie envenenada (string plano) cacheada en disco por una corrida
+        # previa al parche -- se descarta y se re-fetchea en vivo abajo.
+        utils.get_yf_logger().debug("cookie cacheada inválida (pre-parche) -- descartando")
+
+    response = self._session.get(
+        url="https://fc.yahoo.com",
+        headers=self.user_agent_headers,
+        proxies=proxy,
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    if not response.cookies:
+        utils.get_yf_logger().debug("response.cookies = None")
+        return None
+
+    pair = _extract_first_cookie_pair(response.cookies)
+    if pair is None or not pair[0]:
+        utils.get_yf_logger().debug("no se pudo extraer ningún par (name, value) de response.cookies")
+        return None
+
+    self._cookie = SimpleNamespace(name=pair[0], value=pair[1])
+    self._save_cookie_basic(self._cookie)
+    utils.get_yf_logger().debug(f"fetched basic cookie = {self._cookie.name}")
+    return self._cookie
+
+
+from yfinance import utils  # noqa: E402 -- usado por el parche de arriba (mismo logger que data.py)
+from yfinance.data import YfData as _YfData  # noqa: E402
+_YfData._get_cookie_basic = _patched_get_cookie_basic
+# ---------------------------------------------------------------------------
 
 # --- FIX BLOQUEO YAHOO (HF Spaces / IPs de datacenter) --------------------
 # Yahoo Finance identifica tráfico no-navegador PRINCIPALMENTE por la huella
