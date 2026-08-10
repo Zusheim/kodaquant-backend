@@ -2,105 +2,103 @@ import logging
 import os
 import time
 
+import gradio as gr
+import spaces
 import uvicorn
 
-# Bridge between the local dev command:
-#   uvicorn main:app --reload --reload-exclude "venv*" --port 8080 --loop asyncio
-# and the Docker/HF Spaces container. "main:app" is passed as an import
-# string (not the app object) because uvicorn requires a string to spawn
-# extra worker subprocesses when WEB_CONCURRENCY > 1.
+from main import app as _fastapi_app
+
+# --- Por qué este archivo cambió (ronda 2) ---------------------------------
+#
+# Error 1: "No @spaces.GPU function detected during startup"
+#   El validador de ZeroGPU escanea el AST de `app_file` (app.py, según
+#   `app_file: app.py` en el README) buscando un @spaces.GPU conectado a un
+#   componente Gradio a nivel raíz de ESE archivo. El probe vivía en
+#   main.py; acá solo se lo referenciaba como el string runtime "main:app",
+#   invisible para ese scan estático. Fix: el probe pasa a vivir
+#   directamente en app.py (ver `_zerogpu_startup_probe` más abajo). El
+#   probe original en main.py (`/zerogpu-probe`) queda intacto — no hace
+#   daño, no se tocó main.py.
+#
+# Error 2: Errno 98 (address already in use) en el puerto 7860
+#   No es HF pre-bindeando el puerto por su cuenta: una app FastAPI montada
+#   (`gr.mount_gradio_app`) no tiene ningún ".launch()" propio, alguien
+#   tiene que abrir el socket con un servidor ASGI real — de ahí que se
+#   siga necesitando uvicorn acá abajo. La causa real de la colisión fue el
+#   supervisor `while True` de la ronda anterior: relanzaba uvicorn
+#   INSTANTÁNEAMENTE ante CUALQUIER salida de uvicorn.run(), incluida una
+#   limpia (sin excepción). Si el pase de detección de ZeroGPU efectivamente
+#   termina este proceso y HF arranca por su cuenta una invocación NUEVA de
+#   app.py para "el arranque real" (tal como ya sospechaba el comentario
+#   original de este archivo), ese relanzamiento instantáneo competía por
+#   el puerto contra la invocación nueva. Fix: se vuelve al comportamiento
+#   original — reintentar SOLO ante OSError de bind (TIME_WAIT transitorio,
+#   típico de un redeploy), y si el proceso termina limpio, se lo deja
+#   terminar sin pelear por el puerto.
 
 logger = logging.getLogger("kodaquant.launcher")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "info").upper())
 
-# --- Por qué este archivo cambió (CrashLoopBackOff) -----------------------
-# Los logs mostraban: "Uvicorn running..." -> "Shutting down" ->
-# "Finished server process [1]" — SIN traceback. Esa secuencia es el
-# shutdown *graceful* normal de uvicorn tras recibir SIGTERM DESPUÉS de que
-# el ASGI startup terminó con éxito. No es una excepción de nuestro código;
-# es una señal externa (muy probablemente la propia HF: ZeroGPU necesita
-# inspeccionar el Blocks montado en main.py — ver `_zerogpu_probe` — para
-# detectar el uso de @spaces.GPU antes de confirmar el tier de hardware, y
-# eso implica levantar y volver a bajar el proceso).
-#
-# El bug real estaba acá: el loop anterior solo reintentaba ante OSError
-# (bind de puerto). Un `uvicorn.run()` que retorna limpio por SIGTERM caía
-# en el `break` y el script terminaba (exit 0) — el contenedor se quedaba
-# sin servidor, HF lo reiniciaba desde cero, y volvía a pisar la misma
-# señal: CrashLoopBackOff, aunque nuestro código nunca "crasheó".
-#
-# Fix: este proceso jamás debe terminar por su cuenta. CUALQUIER salida de
-# uvicorn.run() — limpia o por excepción — relanza el servidor. El backoff
-# solo crece si el proceso muere rápido y seguido (bug real persistente);
-# si llegó a servir tráfico un rato, se resetea, para no perder tiempo en
-# el caso normal de "una señal aislada y listo".
+
+@spaces.GPU()
+def _zerogpu_startup_probe() -> str:
+    """
+    Dummy conectada a un evento de Gradio a nivel raíz de app.py (app_file)
+    para que el escaneo AST de ZeroGPU la detecte durante el build y
+    reserve el tier de GPU. KodaQuant (FastAPI, montado abajo) es quien
+    realmente la usa en las peticiones reales — este probe no hace
+    inferencia, solo existe para que el hipervisor la encuentre.
+    """
+    return "ok"
 
 
-def _run_forever() -> None:
+with gr.Blocks() as _zerogpu_demo:
+    _status = gr.Textbox(value="pending", visible=False)
+    # `.load()` dispara sola al inicializarse el Blocks — no depende de que
+    # un usuario haga click (a diferencia del probe con botón en main.py).
+    _zerogpu_demo.load(_zerogpu_startup_probe, None, _status)
+
+# Nombre final `app`: tanto el hipervisor de HF como el import string
+# "app:app" de más abajo necesitan encontrar exactamente esta variable acá.
+# Ruta distinta a la de main.py ("/zerogpu-probe") para no pisarla.
+app = gr.mount_gradio_app(_fastapi_app, _zerogpu_demo, path="/zerogpu-launch-probe")
+
+
+def _run() -> None:
     port = int(os.getenv("PORT", "7860"))
     workers = int(os.getenv("WEB_CONCURRENCY", "1"))
     log_level = os.getenv("LOG_LEVEL", "info")
 
-    attempt = 0
-    consecutive_fast_exits = 0
-    while True:
-        attempt += 1
-        started_at = time.monotonic()
+    _last_exc: OSError | None = None
+    for attempt in range(1, 6):
         try:
-            logger.info("Lanzando uvicorn (intento %d) en 0.0.0.0:%d", attempt, port)
+            logger.info("Lanzando uvicorn (intento %d/5) en 0.0.0.0:%d", attempt, port)
             uvicorn.run(
-                "main:app",
+                "app:app",
                 host="0.0.0.0",
-                # HF Spaces Docker routes traffic to the port declared as
-                # app_port in the README frontmatter (7860). PORT is honored
-                # too so the same image runs unmodified on platforms that
-                # inject it (Render, Railway, etc.).
                 port=port,
-                # Kept identical to the local dev command on purpose — do not
-                # switch to uvloop without re-validating the TensorFlow/Keras
-                # inference path under it first.
                 loop="asyncio",
-                # Defaults to 1 on purpose: main.py's `_radar_cache` is an
-                # in-memory, process-local TTL cache, and ZeroGPU's context
-                # handling assumes a single worker. Raising WEB_CONCURRENCY
-                # above 1 gives each worker its own cache (correct but
-                # wasteful) until that cache moves to a shared store.
                 workers=workers,
                 log_level=log_level,
             )
-            uptime = time.monotonic() - started_at
-            logger.warning(
-                "uvicorn.run() volvió limpio tras %.1fs sin excepción "
-                "(señal externa, ej. probe de ZeroGPU o un redeploy). "
-                "Relanzando.",
-                uptime,
-            )
+            # Salida limpia (sin excepción): probablemente el pase de
+            # detección de ZeroGPU u otro ciclo de vida legítimo del
+            # hipervisor de HF. No competimos por el puerto de nuevo — se
+            # deja terminar; si corresponde un relanzamiento real, que lo
+            # dispare HF (o un redeploy), no una segunda instancia nuestra
+            # peleando por el mismo bind.
+            logger.info("uvicorn.run() terminó sin excepción — cerrando sin reintentar.")
+            return
         except OSError as exc:
-            uptime = time.monotonic() - started_at
+            _last_exc = exc
             logger.warning(
-                "uvicorn.run() lanzó OSError tras %.1fs (%s) — el puerto %d "
-                "probablemente sigue en TIME_WAIT de la instancia anterior.",
-                uptime, exc, port,
+                "OSError bindeando el puerto %d (%s) — probable TIME_WAIT de "
+                "una instancia previa. Reintentando en 3s.", port, exc,
             )
-        except Exception:
-            uptime = time.monotonic() - started_at
-            logger.exception(
-                "uvicorn.run() falló de forma inesperada tras %.1fs — relanzando.",
-                uptime,
-            )
-
-        # Solo penalizamos con backoff creciente las salidas RÁPIDAS y
-        # seguidas (indicio de un bug real de arranque). Si el proceso
-        # llegó a estar arriba un rato sirviendo tráfico, no hay motivo
-        # para frenar el próximo intento.
-        if uptime < 10:
-            consecutive_fast_exits += 1
-        else:
-            consecutive_fast_exits = 0
-        delay = min(3 * consecutive_fast_exits, 30) or 1
-        logger.info("Reintentando en %ds...", delay)
-        time.sleep(delay)
+            time.sleep(3)
+    if _last_exc is not None:
+        raise _last_exc
 
 
 if __name__ == "__main__":
-    _run_forever()
+    _run()
