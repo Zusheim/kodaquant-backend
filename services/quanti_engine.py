@@ -130,6 +130,33 @@ _YF_SESSION = _requests.Session()
 _yf_adapter = _requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
 _YF_SESSION.mount("https://", _yf_adapter)
 _YF_SESSION.mount("http://", _yf_adapter)
+
+# FIX #2: el pool más grande no alcanzó -- Yahoo sigue devolviendo cuerpo
+# vacío ("Expecting value: line 1 column 1") cuando ~15 tickers disparan
+# yf.download/yf.Ticker EN SIMULTÁNEO (rate-limit del lado de Yahoo, no de
+# nuestro pool). _YF_CONCURRENCY acota cuántas llamadas a Yahoo corren
+# REALMENTE al mismo tiempo (el resto espera, en vez de dispararse todas
+# juntas); el retry con backoff absorbe los rechazos transitorios que
+# igual ocurran dentro de ese límite.
+_YF_CONCURRENCY = threading.BoundedSemaphore(4)
+
+
+def _yf_call_with_retry(fn, *, attempts: int = 3, backoff_s: float = 0.8):
+    """Ejecuta `fn` (una llamada yfinance) bajo el semáforo de concurrencia,
+    con reintentos ante respuesta vacía/error transitorio de Yahoo."""
+    with _YF_CONCURRENCY:
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                result = fn()
+                if result is None or (hasattr(result, "empty") and result.empty):
+                    raise ValueError("yfinance devolvió una respuesta vacía")
+                return result
+            except Exception as exc:  # noqa: BLE001 -- reintentamos cualquier fallo transitorio
+                last_exc = exc
+                if attempt < attempts - 1:
+                    time.sleep(backoff_s * (attempt + 1))
+        raise last_exc
 from groq import (
     AsyncGroq,
     APIConnectionError as GroqAPIConnectionError,
@@ -1590,7 +1617,9 @@ def _fetch_feature_window(
     devolverlo. `close` (para todo lo demás) permanece intacto.
     """
     all_symbols = list(dict.fromkeys([ticker] + macro_tickers))
-    raw = yf.download(all_symbols, period="2y", auto_adjust=True, progress=False, session=_YF_SESSION)
+    raw = _yf_call_with_retry(
+        lambda: yf.download(all_symbols, period="2y", auto_adjust=True, progress=False, session=_YF_SESSION)
+    )
 
     # V3: bundle OHLCV COMPLETO solo para el ticker objetivo — ATR_14
     # necesita High/Low, OBV necesita Volume. Los macro tickers permanecen
@@ -1654,7 +1683,9 @@ def _fetch_feature_window(
     # del activo. Ver uso en `historical` dentro de `_forecast_asset`.
     display_col = f"{ticker}__DISPLAY_CLOSE"
     try:
-        raw_display = yf.download(ticker, period="2y", auto_adjust=False, progress=False, session=_YF_SESSION)
+        raw_display = _yf_call_with_retry(
+            lambda: yf.download(ticker, period="2y", auto_adjust=False, progress=False, session=_YF_SESSION)
+        )
         display_close = raw_display["Close"] if not raw_display.empty else None
         if isinstance(display_close, pd.DataFrame):  # MultiIndex de 1 solo símbolo, según versión de yfinance
             display_close = display_close[ticker] if ticker in display_close.columns else display_close.iloc[:, 0]
@@ -3046,8 +3077,10 @@ async def get_market_sentiment(symbol: str) -> dict[str, float | str]:
             loop = asyncio.get_running_loop()
 
             def _sync_momentum() -> float:
-                hist = yf.Ticker(symbol, session=_YF_SESSION).history(
-                    period=f"{SENTIMENT_MOMENTUM_LOOKBACK_DAYS + 5}d"
+                hist = _yf_call_with_retry(
+                    lambda: yf.Ticker(symbol, session=_YF_SESSION).history(
+                        period=f"{SENTIMENT_MOMENTUM_LOOKBACK_DAYS + 5}d"
+                    )
                 )
                 closes = hist["Close"].dropna()
                 if len(closes) < 2:
