@@ -10,9 +10,11 @@ import aiosmtplib
 from email.message import EmailMessage
 from core.config import settings
 from datetime import datetime, timedelta, timezone
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 from core.supabase_client import supabase, supabase_admin
 
 # --- CORS: lista cerrada de orígenes de producción ---
@@ -67,6 +69,71 @@ def get_allowed_origins() -> list[str]:
         origins |= _DEV_ORIGINS
 
     return sorted(origins)
+
+
+# ---------------------------------------------------------------------------
+# FIX CRÍTICO — CORS bypass real en producción vía gradio.Server
+# ---------------------------------------------------------------------------
+# ROOT CAUSE (confirmado leyendo gradio/route_utils.py::CustomCORSMiddleware
+# en gradio==6.22.0 y reproducido en vivo, no es una hipótesis):
+#
+#   Server.launch() -> Blocks.launch() -> App.create_app() SIEMPRE ejecuta
+#       app.add_middleware(CustomCORSMiddleware, strict_cors=strict_cors)
+#
+#   ...DESPUÉS de que main.py ya agregó nuestro CORSMiddleware. En Starlette,
+#   add_middleware() inserta al frente de la pila (`user_middleware.insert(0,
+#   ...)`), así que el middleware de Gradio, agregado más tarde (en
+#   .launch()), termina SIEMPRE por FUERA del nuestro -- procesa cada
+#   request antes que el nuestro y puede reescribir la respuesta después.
+#
+#   Su lógica interna (is_valid_origin) SOLO restringe origenes cuando el
+#   Host de la request es localhost/127.0.0.1/0.0.0.0 (para proteger demos
+#   corriendo en la laptop del dev). En cualquier deploy real -- este caso,
+#   *.hf.space -- esa condición nunca aplica, así que Gradio termina
+#   agregando `Access-Control-Allow-Origin: <origin que sea>` +
+#   `Access-Control-Allow-Credentials: true` a CUALQUIER origen, y además
+#   contesta TODO el preflight (OPTIONS) él mismo -- nuestro CORSMiddleware
+#   (con su ALLOWED_METHODS/ALLOWED_HEADERS restringido) nunca llega a
+#   correr para el preflight. `PRODUCTION_ORIGINS` de arriba queda
+#   decorativo en producción. Verificado en vivo: una request con
+#   `Origin: https://evil-attacker.com` contra un server con Host no-local
+#   recibe `Access-Control-Allow-Origin: https://evil-attacker.com` de
+#   vuelta.
+#
+#   No hay manera de "ganarle" la posición a Gradio en la pila de
+#   middleware -- SIEMPRE se agrega después, en .launch(), sin importar el
+#   orden en main.py. La única defensa real es no depender de qué headers
+#   CORS termine poniendo esa capa, y en cambio RECHAZAR nosotros mismos,
+#   a nivel aplicación, cualquier request de un Origin no reconocido --
+#   esto SÍ es efectivo pase lo que pase después en la respuesta, porque el
+#   request nunca llega al router si lo cortamos acá.
+#
+#   Nota de alcance: como este backend NO usa cookies para auth (el JWT de
+#   Supabase viaja en el header Authorization, nunca en una cookie), esto
+#   no es un CSRF clásico explotable por un sitio malicioso ajeno -- pero
+#   sí anula la protección que el equipo cree tener, y cualquier
+#   dependencia futura en cookies o en "Origin como control de acceso"
+#   quedaría rota. Corregir de todos modos.
+class StrictOriginMiddleware(BaseHTTPMiddleware):
+    """
+    Rechaza (403) cualquier request con un header Origin presente que NO
+    esté en la lista cerrada de `get_allowed_origins()`. Se evalúa en cada
+    request (no cachea la lista), así que respeta el mismo ENV en runtime
+    que ve `get_allowed_origins()`.
+
+    Requests SIN header Origin (curl, llamadas server-to-server, health
+    checks del propio hosting) pasan de largo -- Origin solo lo manda un
+    navegador haciendo fetch/XHR cross-origin.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin")
+        if origin is not None and origin not in set(get_allowed_origins()):
+            return JSONResponse(
+                {"detail": "Origen no permitido."},
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        return await call_next(request)
 
 
 # auto_error=False es la pieza clave: si el header falta o está mal formado,

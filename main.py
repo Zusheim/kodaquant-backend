@@ -3,11 +3,13 @@ import asyncio
 import logging
 import time
 load_dotenv()
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from gradio import Server
 import spaces
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from services.currency_engine import convert_to_usd
 from services.prediccion import generate_predictions
 from services.risk_manager import calculate_portfolio
@@ -18,6 +20,9 @@ from core.security import (
     get_allowed_origins,   # <-- CAMBIO: lista cerrada de orígenes CORS
     ALLOWED_METHODS,
     ALLOWED_HEADERS,
+    StrictOriginMiddleware,  # <-- FIX: bloquea Origin no permitido a nivel app
+                              #     (gradio.Server pisa nuestro CORSMiddleware
+                              #     en prod -- ver detalle en core/security.py)
 )
 from api.payments import router as payments_router
 from api.online_learning import router as online_learning_router
@@ -199,6 +204,43 @@ app.add_middleware(
     allow_headers=ALLOWED_HEADERS,     # Authorization, Content-Type — no "*"
     expose_headers=["Content-Type", "Cache-Control"],
 )
+
+# FIX CRÍTICO — gradio.Server SIEMPRE agrega su propio CustomCORSMiddleware
+# en .launch() (después de este punto, ver app.py), y ese middleware queda
+# por FUERA de nuestro CORSMiddleware de arriba sin importar el orden acá.
+# Su regla solo restringe origen si el Host es localhost -- en *.hf.space
+# NUNCA aplica esa restricción, así que termina permitiendo cualquier
+# Origin con credentials=true, pisando get_allowed_origins(). Verificado
+# contra gradio==6.22.0 (ver core/security.py::StrictOriginMiddleware para
+# el detalle completo). Esta capa rechaza (403) el request ANTES de que
+# llegue al router, así que ningún header que agregue Gradio después
+# importa: la request nunca se procesó.
+app.add_middleware(StrictOriginMiddleware)
+
+
+# FIX — blindaje JSON-only. Ninguna respuesta de esta API debe poder
+# renderizar como HTML, sin importar qué falle. Starlette por default
+# puede devolver su propia página de error para excepciones no atrapadas;
+# estos handlers garantizan que 404/422/500 y cualquier excepción no
+# manejada siempre vuelvan como JSON, consistente con lo que espera
+# quantiService.js (response.json() en cada llamada).
+@app.exception_handler(StarletteHTTPException)
+async def _json_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def _json_validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.exception_handler(Exception)
+async def _json_unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Excepción no manejada en %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Error interno del servidor."},
+    )
 
 # --- ZeroGPU probe -----------------------------------------------------
 # ROUND 3 — causa raíz real del "No @spaces.GPU function detected during
