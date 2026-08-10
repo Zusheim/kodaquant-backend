@@ -113,50 +113,180 @@ logger.setLevel(logging.INFO)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # -------------------------------------------------------------------------
 
+import io
+import random
+
 import numpy as np
 import pandas as pd
 import requests as _requests
 import yfinance as yf
 
-# FIX: el radar dispara ~10-15 tickers en paralelo (ThreadPoolExecutor), y
-# cada uno hace 2 llamadas yf.download() (_build_features) + 1 yf.Ticker()
-# (sentiment) -- 20-30+ requests concurrentes a query2.finance.yahoo.com.
-# El pool por-host default de urllib3 es 10 conexiones: al superarlo se
-# descartaban conexiones ("Connection pool is full, discarding connection")
-# y Yahoo empezaba a devolver respuestas vacías/JSON inválido bajo esa
-# carga, tumbando el radar entero. Una sesión compartida con pool más
-# grande, pasada a TODAS las llamadas yfinance, resuelve ambos síntomas.
-_YF_SESSION = _requests.Session()
-_yf_adapter = _requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
-_YF_SESSION.mount("https://", _yf_adapter)
-_YF_SESSION.mount("http://", _yf_adapter)
+try:
+    from curl_cffi import requests as _cffi_requests
+    _CURL_CFFI_AVAILABLE = True
+except ImportError:  # extra faltante -- degrada a requests plano, nunca tumba el boot
+    _cffi_requests = None
+    _CURL_CFFI_AVAILABLE = False
+    logger.warning(
+        "curl_cffi no instalado -- las llamadas yfinance corren sobre un "
+        "requests.Session estándar (huella TLS de Python, bloqueable por "
+        "Cloudflare/Yahoo). `pip install curl_cffi` para impersonation real."
+    )
 
-# FIX #2: el pool más grande no alcanzó -- Yahoo sigue devolviendo cuerpo
-# vacío ("Expecting value: line 1 column 1") cuando ~15 tickers disparan
-# yf.download/yf.Ticker EN SIMULTÁNEO (rate-limit del lado de Yahoo, no de
-# nuestro pool). _YF_CONCURRENCY acota cuántas llamadas a Yahoo corren
-# REALMENTE al mismo tiempo (el resto espera, en vez de dispararse todas
-# juntas); el retry con backoff absorbe los rechazos transitorios que
-# igual ocurran dentro de ese límite.
+# --- FIX BLOQUEO YAHOO (HF Spaces / IPs de datacenter) --------------------
+# Yahoo Finance identifica tráfico no-navegador PRINCIPALMENTE por la huella
+# TLS/JA3 del handshake (Cloudflare bot management), no solo por el header
+# User-Agent -- un `requests.Session` estándar (pila OpenSSL/urllib3) tiene
+# una huella distinguible de un navegador real AUNQUE el User-Agent diga
+# "Chrome". Por eso rotar solo el header (lo pedido originalmente) no
+# alcanza contra este bloqueo específico: `curl_cffi` reproduce el
+# handshake TLS/HTTP2 bit a bit de un navegador real vía `impersonate=`.
+# Se combina con headers reales rotados (Accept/Accept-Language/UA a juego
+# con el perfil impersonado) como refuerzo ante cualquier inspección a
+# nivel de header. `_IMPERSONATE_PROFILES`/`_UA_POOL` están alineados
+# índice a índice -- cada perfil TLS lleva su UA real correspondiente.
+_IMPERSONATE_PROFILES = ("chrome124", "chrome131", "edge101", "safari17_2_ios")
+_UA_POOL = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, "
+    "like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, "
+    "like Gecko) Edge/101.0.1210.47 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+)
+_COMMON_BROWSER_HEADERS = {
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+
+def _build_yf_session(profile_index: int = 0):
+    """
+    Fábrica de sesión inyectada en TODAS las llamadas yfinance del motor.
+    `profile_index` selecciona el perfil de impersonation (rotado por
+    `_yf_call_with_retry` en cada reintento, ver abajo) -- así un bloqueo
+    correlacionado a UN fingerprint específico no tumba también el
+    reintento inmediato siguiente. Con `curl_cffi` disponible, cada sesión
+    es una réplica TLS/HTTP2 real de un navegador (Chrome/Edge/Safari);
+    sin el extra, cae a `requests.Session` estándar con el pool ampliado
+    que ya resolvía la saturación de conexiones concurrentes (FIX
+    original, ver comentario debajo) -- comportamiento previo intacto
+    como último fallback.
+    """
+    profile = _IMPERSONATE_PROFILES[profile_index % len(_IMPERSONATE_PROFILES)]
+    ua = _UA_POOL[profile_index % len(_UA_POOL)]
+
+    if _CURL_CFFI_AVAILABLE:
+        session = _cffi_requests.Session(impersonate=profile)
+    else:
+        session = _requests.Session()
+        # FIX original: el radar dispara ~10-15 tickers en paralelo
+        # (ThreadPoolExecutor), y cada uno hace 2 llamadas yf.download()
+        # (_build_features) + 1 yf.Ticker() (sentiment) -- 20-30+ requests
+        # concurrentes a query2.finance.yahoo.com. El pool por-host default
+        # de urllib3 es 10 conexiones: al superarlo se descartaban
+        # conexiones ("Connection pool is full, discarding connection").
+        adapter = _requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+    session.headers.update({**_COMMON_BROWSER_HEADERS, "User-Agent": ua})
+    return session
+
+
+# Sesión "caliente" para el primer intento de cada llamada (evita el costo
+# de reconstruir un handshake/sesión en el camino feliz); los reintentos
+# posteriores rotan a un perfil nuevo vía `_build_yf_session`, ver
+# `_yf_call_with_retry`.
+_YF_SESSION = _build_yf_session(0)
+
+# FIX #2 (sigue vigente con o sin curl_cffi): Yahoo rate-limitea por IP de
+# origen cuando ~15 tickers disparan yf.download/yf.Ticker EN SIMULTÁNEO --
+# _YF_CONCURRENCY acota cuántas llamadas a Yahoo corren REALMENTE al mismo
+# tiempo (el resto espera, en vez de dispararse todas juntas); el retry con
+# backoff + jitter absorbe los rechazos transitorios que igual ocurran
+# dentro de ese límite.
 _YF_CONCURRENCY = threading.BoundedSemaphore(4)
 
 
-def _yf_call_with_retry(fn, *, attempts: int = 3, backoff_s: float = 0.8):
-    """Ejecuta `fn` (una llamada yfinance) bajo el semáforo de concurrencia,
-    con reintentos ante respuesta vacía/error transitorio de Yahoo."""
+def _yf_call_with_retry(fn, *, attempts: int = 4, backoff_s: float = 0.9):
+    """
+    Ejecuta `fn(session)` bajo el semáforo de concurrencia, con reintentos
+    ante respuesta vacía/error transitorio de Yahoo. `fn` recibe la sesión
+    del intento actual y DEBE usarla en su llamada yfinance (`session=`) --
+    el intento 0 reutiliza `_YF_SESSION` (camino feliz, sin costo extra de
+    handshake); desde el intento 1 se reconstruye una sesión con OTRO
+    perfil de impersonation/UA (ver `_build_yf_session`), así un bloqueo
+    correlacionado a un fingerprint específico no repite el mismo rechazo
+    en cada reintento. Backoff exponencial + jitter aleatorio evita que
+    reintentos de tickers en paralelo converjan en el mismo instante.
+    """
     with _YF_CONCURRENCY:
         last_exc: Exception | None = None
         for attempt in range(attempts):
+            session = _YF_SESSION if attempt == 0 else _build_yf_session(attempt)
             try:
-                result = fn()
+                result = fn(session)
                 if result is None or (hasattr(result, "empty") and result.empty):
                     raise ValueError("yfinance devolvió una respuesta vacía")
                 return result
             except Exception as exc:  # noqa: BLE001 -- reintentamos cualquier fallo transitorio
                 last_exc = exc
                 if attempt < attempts - 1:
-                    time.sleep(backoff_s * (attempt + 1))
+                    jitter = random.uniform(0, 0.4)
+                    time.sleep(backoff_s * (attempt + 1) + jitter)
         raise last_exc
+
+
+# --- FALLBACK DE ÚLTIMO RECURSO: Stooq (sin auth, sin el mismo régimen de
+# anti-bot de Yahoo) -- SOLO para el universo cerrado y verificado abajo
+# (REGIME_TICKERS ∪ {PLAN_A_TICKER}, exactamente los símbolos que
+# prediccion.py escanea). Deliberadamente NO se usa para `macro_tickers`
+# (VIX/factores persistidos en scalers_dict.pkl, ej. ^GSPC/^TNX/GC=F,
+# desconocidos en este archivo): adivinar su símbolo Stooq violaría la
+# regla de "cero cifras inventadas" del motor si el mapeo no calzara 1:1,
+# y ESE tensor (feature window de la Bi-LSTM) exige paridad bit a bit con
+# el notebook de entrenamiento -- nunca una fuente alterna sin verificar.
+# Cubre los dos puntos de falla reportados en el bug (display close del
+# gráfico + sentimiento SPY/BTC-USD de get_market_sentiment) cuando Yahoo
+# sigue sin responder incluso tras agotar `_yf_call_with_retry`.
+_STOOQ_SYMBOL_MAP: dict[str, str] = {
+    "AAPL": "aapl.us", "MSFT": "msft.us", "NVDA": "nvda.us", "TSLA": "tsla.us",
+    "GOOGL": "googl.us", "AMZN": "amzn.us", "META": "meta.us", "SPY": "spy.us",
+    "BTC-USD": "btc.v", "ETH-USD": "eth.v",
+}
+
+
+def _stooq_daily_close(ticker: str, tail_days: int = 400) -> "pd.Series | None":
+    """
+    Serie de Close diario vía Stooq (CSV público, sin key) para `ticker` --
+    devuelve `None` (nunca lanza) si el símbolo no está en el universo
+    verificado o si la fuente falla, para que el caller decida su propio
+    fallback sin sorpresas.
+    """
+    stooq_symbol = _STOOQ_SYMBOL_MAP.get(ticker.strip().upper())
+    if stooq_symbol is None:
+        return None
+    try:
+        resp = _requests.get(
+            f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d",
+            timeout=10,
+            headers={"User-Agent": _UA_POOL[0]},
+        )
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+        if df.empty or "Close" not in df.columns or "Date" not in df.columns:
+            return None
+        df["Date"] = pd.to_datetime(df["Date"])
+        series = df.set_index("Date").sort_index()["Close"].dropna()
+        return series.tail(tail_days) if not series.empty else None
+    except Exception as exc:  # noqa: BLE001 -- último recurso: si falla, el caller sigue su propio fallback
+        logger.warning("Fallback Stooq falló para %s (%s): %r", ticker, stooq_symbol, exc)
+        return None
 from groq import (
     AsyncGroq,
     APIConnectionError as GroqAPIConnectionError,
@@ -1618,7 +1748,7 @@ def _fetch_feature_window(
     """
     all_symbols = list(dict.fromkeys([ticker] + macro_tickers))
     raw = _yf_call_with_retry(
-        lambda: yf.download(all_symbols, period="2y", auto_adjust=True, progress=False, session=_YF_SESSION)
+        lambda session: yf.download(all_symbols, period="2y", auto_adjust=True, progress=False, session=session)
     )
 
     # V3: bundle OHLCV COMPLETO solo para el ticker objetivo — ATR_14
@@ -1683,10 +1813,17 @@ def _fetch_feature_window(
     # del activo. Ver uso en `historical` dentro de `_forecast_asset`.
     display_col = f"{ticker}__DISPLAY_CLOSE"
     try:
-        raw_display = _yf_call_with_retry(
-            lambda: yf.download(ticker, period="2y", auto_adjust=False, progress=False, session=_YF_SESSION)
-        )
-        display_close = raw_display["Close"] if not raw_display.empty else None
+        try:
+            raw_display = _yf_call_with_retry(
+                lambda session: yf.download(ticker, period="2y", auto_adjust=False, progress=False, session=session)
+            )
+            display_close = raw_display["Close"] if not raw_display.empty else None
+        except Exception as yahoo_exc:  # noqa: BLE001 -- Yahoo agotó reintentos, se intenta Stooq antes de resignar
+            stooq_series = _stooq_daily_close(ticker)
+            if stooq_series is None:
+                raise yahoo_exc
+            print(f"⚠️ Yahoo sin respuesta para Regular Close de '{ticker}' ({yahoo_exc}) — usando Stooq como fuente alterna.")
+            display_close = stooq_series
         if isinstance(display_close, pd.DataFrame):  # MultiIndex de 1 solo símbolo, según versión de yfinance
             display_close = display_close[ticker] if ticker in display_close.columns else display_close.iloc[:, 0]
         if display_close is None or display_close.empty:
@@ -3077,12 +3214,19 @@ async def get_market_sentiment(symbol: str) -> dict[str, float | str]:
             loop = asyncio.get_running_loop()
 
             def _sync_momentum() -> float:
-                hist = _yf_call_with_retry(
-                    lambda: yf.Ticker(symbol, session=_YF_SESSION).history(
-                        period=f"{SENTIMENT_MOMENTUM_LOOKBACK_DAYS + 5}d"
+                try:
+                    hist = _yf_call_with_retry(
+                        lambda session: yf.Ticker(symbol, session=session).history(
+                            period=f"{SENTIMENT_MOMENTUM_LOOKBACK_DAYS + 5}d"
+                        )
                     )
-                )
-                closes = hist["Close"].dropna()
+                    closes = hist["Close"].dropna()
+                except Exception as yahoo_exc:  # noqa: BLE001 -- Yahoo agotó reintentos, se intenta Stooq
+                    stooq_series = _stooq_daily_close(symbol, tail_days=SENTIMENT_MOMENTUM_LOOKBACK_DAYS + 5)
+                    if stooq_series is None:
+                        raise yahoo_exc
+                    print(f"⚠️ Yahoo sin respuesta para sentimiento de '{symbol}' ({yahoo_exc}) — usando Stooq como fuente alterna.")
+                    closes = stooq_series
                 if len(closes) < 2:
                     raise ValueError(f"Histórico insuficiente para {symbol}")
                 window = closes.tail(SENTIMENT_MOMENTUM_LOOKBACK_DAYS)
