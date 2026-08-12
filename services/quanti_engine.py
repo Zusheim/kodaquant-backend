@@ -242,6 +242,67 @@ from yfinance.data import YfData as _YfData  # noqa: E402
 _YfData._get_cookie_basic = _patched_get_cookie_basic
 
 
+# --- PARCHE #2 (causa raíz del "JSONDecodeError: Expecting value: line 1
+# column 1 (char 0)" en el 100%% de los tickers, log de producción 2026-08-11,
+# DESPUÉS de que el parche de cookie de arriba ya eliminó el AttributeError
+# original) -----------------------------------------------------------------
+# `_get_crumb_basic()` real (data.py, verificado contra el wheel 0.2.44)
+# tiene DOS huecos que, combinados, dejan un crumb envenenado pegado para
+# SIEMPRE en el proceso:
+#   1) `self._crumb = crumb_response.text; if self._crumb is None or
+#      '<html>' in self._crumb: return None` -- un bloqueo anti-bot
+#      SILENCIOSO de Yahoo (200 OK, cuerpo vacío -- el patrón real observado,
+#      distinto de un 4xx) da `crumb_response.text == ''`: ni `None` ni
+#      contiene `'<html>'`, así que la validación NO lo detecta y
+#      `self._crumb` queda seteado a `''`.
+#   2) El guard de reuso al tope de la función es `if self._crumb is not
+#      None: return self._crumb` -- por diseño NO revalida contenido, así
+#      que ese `''` se devuelve tal cual en CADA llamada subsecuente, sin
+#      volver a golpear la red jamás, para el resto de la vida del proceso
+#      (`YfData` es Singleton).
+# `get()` (mismo archivo) solo dispara su propio retry-con-otra-estrategia
+# cuando `response.status_code >= 400` -- un 200 con cuerpo vacío tampoco
+# pasa por ahí. Resultado: exactamente lo observado en producción -- 0%%
+# de éxito, siempre el mismo error, sin recuperarse nunca con más reintentos.
+# Fix: validar contenido real (`.strip()`) además de `None`/`'<html>'`, y
+# dejar `self._crumb` en `None` explícito ante crumb vacío/blanco -- así
+# el PRÓXIMO intento (ver `_reset_yf_auth_state`/`_yf_call_with_retry` más
+# abajo) re-fetchea de verdad en vez de reservir el mismo vacío.
+def _patched_get_crumb_basic(self, proxy=None, timeout=30):
+    if self._crumb is not None and self._crumb.strip():
+        utils.get_yf_logger().debug("reusing crumb")
+        return self._crumb
+
+    cookie = self._get_cookie_basic()
+    if cookie is None:
+        return None
+
+    get_args = {
+        "url": "https://query1.finance.yahoo.com/v1/test/getcrumb",
+        "headers": self.user_agent_headers,
+        "cookies": {cookie.name: cookie.value},
+        "proxies": proxy,
+        "timeout": timeout,
+        "allow_redirects": True,
+    }
+    if self._session_is_caching:
+        get_args["expire_after"] = self._expire_after
+    crumb_response = self._session.get(**get_args)
+    fetched = crumb_response.text
+
+    if not fetched or not fetched.strip() or "<html>" in fetched:
+        utils.get_yf_logger().debug("no se recibió crumb válido (vacío/blanco o HTML de bloqueo)")
+        self._crumb = None  # explícito: nunca dejar un '' cacheado sirviéndose para siempre
+        return None
+
+    self._crumb = fetched
+    utils.get_yf_logger().debug(f"crumb = '{self._crumb}'")
+    return self._crumb
+
+
+_YfData._get_crumb_basic = _patched_get_crumb_basic
+
+
 def _purge_poisoned_cookie_cache_at_startup() -> None:
     """
     Autocuración EAGER, al importar el módulo (directriz explícita, además
@@ -390,6 +451,24 @@ _YfData(session=_YF_SESSION)
 _YF_CONCURRENCY = threading.BoundedSemaphore(4)
 
 
+def _reset_yf_auth_state() -> None:
+    """
+    Invalida cookie+crumb del Singleton `YfData` compartido por todo el
+    proceso. Necesario porque `_yf_call_with_retry` rota el PERFIL de
+    impersonation/UA en cada reintento (`_build_yf_session`), pero
+    `self._cookie`/`self._crumb` NO están atados a qué sesión los obtuvo
+    -- son atributos del Singleton, no de la sesión. Sin este reset, cada
+    reintento reutiliza el MISMO cookie/crumb potencialmente ya envenenado
+    (rate-limit/bloqueo anti-bot silencioso de Yahoo, ver
+    `_patched_get_crumb_basic` arriba), sin importar cuántas veces se rote
+    el fingerprint TLS -- exactamente el patrón observado en producción:
+    0%% de éxito across ~4 intentos x N tickers, mismo error siempre.
+    """
+    stale = _YfData()
+    stale._cookie = None
+    stale._crumb = None
+
+
 def _yf_call_with_retry(fn, *, attempts: int = 4, backoff_s: float = 0.9):
     """
     Ejecuta `fn(session)` bajo el semáforo de concurrencia, con reintentos
@@ -397,10 +476,12 @@ def _yf_call_with_retry(fn, *, attempts: int = 4, backoff_s: float = 0.9):
     del intento actual y DEBE usarla en su llamada yfinance (`session=`) --
     el intento 0 reutiliza `_YF_SESSION` (camino feliz, sin costo extra de
     handshake); desde el intento 1 se reconstruye una sesión con OTRO
-    perfil de impersonation/UA (ver `_build_yf_session`), así un bloqueo
-    correlacionado a un fingerprint específico no repite el mismo rechazo
-    en cada reintento. Backoff exponencial + jitter aleatorio evita que
-    reintentos de tickers en paralelo converjan en el mismo instante.
+    perfil de impersonation/UA (ver `_build_yf_session`) Y se fuerza un
+    cookie/crumb nuevos (`_reset_yf_auth_state`) -- así un bloqueo
+    correlacionado a un fingerprint O a un crumb específico no repite el
+    mismo rechazo en cada reintento. Backoff exponencial + jitter aleatorio
+    evita que reintentos de tickers en paralelo converjan en el mismo
+    instante.
     """
     with _YF_CONCURRENCY:
         last_exc: Exception | None = None
@@ -414,6 +495,7 @@ def _yf_call_with_retry(fn, *, attempts: int = 4, backoff_s: float = 0.9):
             except Exception as exc:  # noqa: BLE001 -- reintentamos cualquier fallo transitorio
                 last_exc = exc
                 if attempt < attempts - 1:
+                    _reset_yf_auth_state()
                     jitter = random.uniform(0, 0.4)
                     time.sleep(backoff_s * (attempt + 1) + jitter)
         raise last_exc
