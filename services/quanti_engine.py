@@ -464,7 +464,7 @@ def _reset_yf_auth_state() -> None:
     el fingerprint TLS -- exactamente el patrón observado en producción:
     0%% de éxito across ~4 intentos x N tickers, mismo error siempre.
     """
-    stale = _YfData()
+    stale = _YfData(session=_YF_SESSION)
     stale._cookie = None
     stale._crumb = None
 
