@@ -56,6 +56,15 @@ stripe>=15.0,<16.0
 # "spaces==X.Y.Z" al pip install además de este archivo). Pinearlo de
 # nuevo acá es un conflicto latente esperando pasar — ver la nota vieja
 # más abajo, que documentaba el mismo riesgo sin eliminarlo.
+#
+# CRÍTICO: este pin (6.22.0) DEBE coincidir exacto con `sdk_version` en
+# el front-matter YAML de README.md. HF inyecta `gradio[oauth,mcp]==<sdk_version>`
+# en el MISMO comando pip que procesa este archivo — si divergen, pip recibe
+# dos pines `==` mutuamente excluyentes del mismo paquete y falla con
+# ResolutionImpossible de inmediato (no es un conflicto de grafo real, es
+# un doble pin). Root cause del build fallido del 2026-08-12 (commit 6dcbbd6):
+# no existía README.md, así que HF usaba su default de plataforma (6.23.1)
+# mientras este archivo fijaba 6.22.0.
 gradio[oauth,mcp]==6.22.0
 
 # --- Database / Supabase -------------------------------------------------
