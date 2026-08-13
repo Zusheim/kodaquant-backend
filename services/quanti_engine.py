@@ -383,7 +383,9 @@ _COMMON_BROWSER_HEADERS = {
     "Connection": "keep-alive",
 }
 
-_YF_PROXY_URL = os.environ.get("YF_PROXY_URL")  # http://user:pass@host:port
+_YF_PROXY_POOL = [
+    p.strip() for p in os.environ.get("YF_PROXY_POOL", "").split(",") if p.strip()
+]
 
 def _build_yf_session(profile_index: int = 0):
     """
@@ -400,7 +402,8 @@ def _build_yf_session(profile_index: int = 0):
     """
     profile = _IMPERSONATE_PROFILES[profile_index % len(_IMPERSONATE_PROFILES)]
     ua = _UA_POOL[profile_index % len(_UA_POOL)]
-    proxies = {"http": _YF_PROXY_URL, "https": _YF_PROXY_URL} if _YF_PROXY_URL else None
+    proxy_url = _YF_PROXY_POOL[profile_index % len(_YF_PROXY_POOL)] if _YF_PROXY_POOL else None
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
     if _CURL_CFFI_AVAILABLE:
         session = _cffi_requests.Session(impersonate=profile, proxies=proxies)
@@ -473,7 +476,7 @@ def _reset_yf_auth_state() -> None:
     stale._crumb = None
 
 
-def _yf_call_with_retry(fn, *, attempts: int = 4, backoff_s: float = 0.9):
+def _yf_call_with_retry(fn, *, attempts: int = max(4, len(_YF_PROXY_POOL) or 4), backoff_s: float = 0.9):
     """
     Ejecuta `fn(session)` bajo el semáforo de concurrencia, con reintentos
     ante respuesta vacía/error transitorio de Yahoo. `fn` recibe la sesión
