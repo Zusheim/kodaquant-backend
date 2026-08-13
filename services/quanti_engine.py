@@ -383,9 +383,15 @@ _COMMON_BROWSER_HEADERS = {
     "Connection": "keep-alive",
 }
 
-_YF_PROXY_POOL = [
-    p.strip() for p in os.environ.get("YF_PROXY_POOL", "").split(",") if p.strip()
-]
+import re
+
+_YF_PROXY_POOL = []
+for _p in os.environ.get("YF_PROXY_POOL", "").split(","):
+    _p = _p.strip()
+    if not _p:
+        continue
+    _m = re.match(r"^\[(https?://[^\]]+)\]", _p)  # limpia formato Markdown [url](url)
+    _YF_PROXY_POOL.append(_m.group(1) if _m else _p)
 
 def _build_yf_session(profile_index: int = 0):
     """
