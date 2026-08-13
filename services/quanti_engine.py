@@ -12,16 +12,19 @@ matemático si la API de Groq no responde. Soporte de inferencia local
 (llama.cpp/Metal) retirado permanentemente — ver GROQ_API_KEY más abajo.
 
 Requisitos locales (Mac): `pip install keras tensorflow scikit-learn pandas
-yfinance httpx transformers torch` — sin re-entrenar nada, sin Colab. Cada
+requests httpx transformers torch` — sin re-entrenar nada, sin Colab. Cada
 especialista V5 (modelo + `scalers_dict.pkl`) vive en su propia carpeta bajo
 `services/kodaquant_models/<regimen>/`, ver `REGIME_TICKERS`/`_regime_for_ticker`.
+Datos de mercado vía Twelve Data (API oficial, requiere `TWELVE_DATA_API_KEY`)
++ fallback Stooq — ver `services/market_data.py`; yfinance fue retirado por
+completo (bloqueos recurrentes de Yahoo Finance en producción).
 
 Pipeline de inferencia (replica EXACTA del notebook de entrenamiento):
     scalers.pkl (pickle)
         -> feature_scalers[ticker]  (MinMaxScaler, fit en train)
         -> target_scalers[ticker]   (StandardScaler sobre log-returns)
         -> asset_to_id[ticker]      (embedding categórico)
-    yfinance (live) -> engineer_asset() -> ventana (lookback, n_features)
+    Twelve Data (live) -> engineer_asset() -> ventana (lookback, n_features)
         -> feature_scaler.transform() -> tensor (1, lookback, n_features)
     keras.Model(..., training=True) -> log-return escalado
         -> target_scaler.inverse_transform() -> log-return real (r_hat)
@@ -54,18 +57,6 @@ Contrato dinámico con el Command Center (frontend):
     queda como etiqueta narrativa/contextual, no participa en el cálculo.
 """
 
-# --- PARCHE macOS Intel: bug de build en el wheel de curl_cffi ---------
-# `_wrapper.abi3.so` referencia `_SCDynamicStoreCopyProxies` sin linkear
-# SystemConfiguration.framework (confirmado vía `otool -L`, sin esa
-# dependencia listada). Se precarga el framework en el namespace plano
-# del proceso ANTES de que `yfinance` importe `curl_cffi` internamente,
-# satisfaciendo el símbolo sin recompilar el wheel roto.
-import ctypes as _ctypes
-try:
-    _ctypes.CDLL("/System/Library/Frameworks/SystemConfiguration.framework/SystemConfiguration")
-except OSError:
-    pass  # Linux en prod: el framework no existe ni hace falta
-# -------------------------------------------------------------------------
 
 import asyncio
 import json
@@ -113,452 +104,17 @@ logger.setLevel(logging.INFO)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 # -------------------------------------------------------------------------
 
-import io
-import random
-from types import SimpleNamespace
-
 import numpy as np
 import pandas as pd
-import requests as _requests
-import yfinance as yf
 
-try:
-    from curl_cffi import requests as _cffi_requests
-    _CURL_CFFI_AVAILABLE = True
-except ImportError:  # extra faltante -- degrada a requests plano, nunca tumba el boot
-    _cffi_requests = None
-    _CURL_CFFI_AVAILABLE = False
-    logger.warning(
-        "curl_cffi no instalado -- las llamadas yfinance corren sobre un "
-        "requests.Session estándar (huella TLS de Python, bloqueable por "
-        "Cloudflare/Yahoo). `pip install curl_cffi` para impersonation real."
-    )
-
-# --- PARCHE BUG CONFIRMADO yfinance==0.2.44 + sesión no-requests ----------
-# `YfData._get_cookie_basic()` (yfinance/data.py L171, verificado línea a
-# línea contra el wheel pineado en requirements.txt) hace
-# `self._cookie = list(response.cookies)[0]` asumiendo que iterar
-# `response.cookies` (un `requests.cookies.RequestsCookieJar`) devuelve
-# objetos `Cookie` con `.name`/`.value`. Con `curl_cffi` (o cualquier sesión
-# no-requests) `response.cookies` es un objeto tipo `curl_cffi.requests.Cookies`
-# cuya iteración devuelve STRINGS (los nombres) -- `self._cookie` termina
-# siendo un string plano, y `_get_crumb_basic()` (L192) revienta al pedirle
-# `.name` -- exactamente `AttributeError: 'str' object has no attribute
-# 'name'`, reproducible y documentado en yfinance#2470/#2429/#2461/#2494/#2684
-# (upstream, closed as not planned -- no hay fix oficial en ninguna versión
-# probada). Ese string además queda cacheado en disco (peewee/sqlite, ver
-# `_save_cookie_basic`) -- una vez envenenado, CADA request posterior lo
-# reutiliza y falla IDÉNTICO (coincide con el log: 100% de los tickers
-# fallando igual, todo el proceso). Se reemplaza el método completo por una
-# versión que reconstruye el par (name, value) de forma robusta sea cual sea
-# el tipo de `response.cookies`, y que además invalida/reconstruye cualquier
-# cookie ya envenenada que viniera de la caché en disco de una corrida
-# previa al parche -- autocurativo, no requiere borrar caché a mano.
-def _extract_first_cookie_pair(cookies) -> "tuple[str, str] | None":
-    get_dict = getattr(cookies, "get_dict", None)
-    if callable(get_dict):
-        try:
-            d = get_dict()
-            if d:
-                return next(iter(d.items()))
-        except Exception:  # noqa: BLE001 -- se prueban las otras estrategias
-            pass
-    try:
-        d = dict(cookies)
-        if d and all(isinstance(v, str) for v in d.values()):
-            return next(iter(d.items()))
-    except (TypeError, ValueError):
-        pass
-    for item in cookies:
-        if hasattr(item, "name") and hasattr(item, "value"):
-            return item.name, item.value
-    return None
-
-
-# `YfData` es Singleton de proceso ("one session one cookie shared by all
-# threads", docstring real de la clase en 0.2.44) y `_get_cookie_and_crumb()`
-# no serializa el tramo de bootstrap -- bajo el escaneo paralelo del radar
-# (prediccion.py: asyncio.gather + run_in_executor sobre ~10-15 tickers a la
-# vez) cada hilo que llegue con self._cookie is None ANTES de que el primero
-# termine dispara SU PROPIA request a fc.yahoo.com en paralelo (rebaño de N
-# requests idénticas al arrancar el proceso, fuera del alcance de
-# _YF_CONCURRENCY que solo protege las llamadas de datos, no el bootstrap
-# interno de cookie de yfinance). Mismo patrón de double-checked locking que
-# _model_load_locks/_scalers_load_locks más abajo en este archivo.
-_COOKIE_BOOTSTRAP_LOCK = threading.Lock()
-
-
-def _patched_get_cookie_basic(self, proxy=None, timeout=30):
-    if self._cookie is not None and hasattr(self._cookie, "name"):
-        utils.get_yf_logger().debug("reusing cookie")
-        return self._cookie
-
-    loaded = self._load_cookie_basic()
-    if loaded is not None:
-        if hasattr(loaded, "name"):
-            self._cookie = loaded
-            return self._cookie
-        # Cookie envenenada (string plano) cacheada en disco por una corrida
-        # previa al parche -- se descarta y se re-fetchea en vivo abajo.
-        utils.get_yf_logger().debug("cookie cacheada inválida (pre-parche) -- descartando")
-
-    with _COOKIE_BOOTSTRAP_LOCK:
-        # Doble chequeo: otro hilo pudo haber completado el fetch (memoria O
-        # disco) mientras este esperaba el lock -- evita una segunda request
-        # de red redundante a fc.yahoo.com.
-        if self._cookie is not None and hasattr(self._cookie, "name"):
-            utils.get_yf_logger().debug("reusing cookie (post-lock)")
-            return self._cookie
-        loaded = self._load_cookie_basic()
-        if loaded is not None and hasattr(loaded, "name"):
-            self._cookie = loaded
-            return self._cookie
-
-        response = self._session.get(
-            url="https://fc.yahoo.com",
-            headers=self.user_agent_headers,
-            proxies=proxy,
-            timeout=timeout,
-            allow_redirects=True,
-        )
-        if not response.cookies:
-            utils.get_yf_logger().debug("response.cookies = None")
-            return None
-
-        pair = _extract_first_cookie_pair(response.cookies)
-        if pair is None or not pair[0]:
-            utils.get_yf_logger().debug("no se pudo extraer ningún par (name, value) de response.cookies")
-            return None
-
-        self._cookie = SimpleNamespace(name=pair[0], value=pair[1])
-        self._save_cookie_basic(self._cookie)
-        utils.get_yf_logger().debug(f"fetched basic cookie = {self._cookie.name}")
-        return self._cookie
-
-
-from yfinance import utils  # noqa: E402 -- usado por el parche de arriba (mismo logger que data.py)
-from yfinance import cache as _yf_cookie_cache  # noqa: E402 -- purga de arranque, ver _purge_poisoned_cookie_cache_at_startup
-from yfinance.data import YfData as _YfData  # noqa: E402
-_YfData._get_cookie_basic = _patched_get_cookie_basic
-
-
-# --- PARCHE #2 (causa raíz del "JSONDecodeError: Expecting value: line 1
-# column 1 (char 0)" en el 100%% de los tickers, log de producción 2026-08-11,
-# DESPUÉS de que el parche de cookie de arriba ya eliminó el AttributeError
-# original) -----------------------------------------------------------------
-# `_get_crumb_basic()` real (data.py, verificado contra el wheel 0.2.44)
-# tiene DOS huecos que, combinados, dejan un crumb envenenado pegado para
-# SIEMPRE en el proceso:
-#   1) `self._crumb = crumb_response.text; if self._crumb is None or
-#      '<html>' in self._crumb: return None` -- un bloqueo anti-bot
-#      SILENCIOSO de Yahoo (200 OK, cuerpo vacío -- el patrón real observado,
-#      distinto de un 4xx) da `crumb_response.text == ''`: ni `None` ni
-#      contiene `'<html>'`, así que la validación NO lo detecta y
-#      `self._crumb` queda seteado a `''`.
-#   2) El guard de reuso al tope de la función es `if self._crumb is not
-#      None: return self._crumb` -- por diseño NO revalida contenido, así
-#      que ese `''` se devuelve tal cual en CADA llamada subsecuente, sin
-#      volver a golpear la red jamás, para el resto de la vida del proceso
-#      (`YfData` es Singleton).
-# `get()` (mismo archivo) solo dispara su propio retry-con-otra-estrategia
-# cuando `response.status_code >= 400` -- un 200 con cuerpo vacío tampoco
-# pasa por ahí. Resultado: exactamente lo observado en producción -- 0%%
-# de éxito, siempre el mismo error, sin recuperarse nunca con más reintentos.
-# Fix: validar contenido real (`.strip()`) además de `None`/`'<html>'`, y
-# dejar `self._crumb` en `None` explícito ante crumb vacío/blanco -- así
-# el PRÓXIMO intento (ver `_reset_yf_auth_state`/`_yf_call_with_retry` más
-# abajo) re-fetchea de verdad en vez de reservir el mismo vacío.
-def _patched_get_crumb_basic(self, proxy=None, timeout=30):
-    if self._crumb is not None and self._crumb.strip():
-        utils.get_yf_logger().debug("reusing crumb")
-        return self._crumb
-
-    cookie = self._get_cookie_basic()
-    if cookie is None:
-        return None
-
-    get_args = {
-        "url": "https://query1.finance.yahoo.com/v1/test/getcrumb",
-        "headers": self.user_agent_headers,
-        "cookies": {cookie.name: cookie.value},
-        "proxies": proxy,
-        "timeout": timeout,
-        "allow_redirects": True,
-    }
-    if self._session_is_caching:
-        get_args["expire_after"] = self._expire_after
-    crumb_response = self._session.get(**get_args)
-    fetched = crumb_response.text
-
-    if not fetched or not fetched.strip() or "<html>" in fetched:
-        utils.get_yf_logger().debug("no se recibió crumb válido (vacío/blanco o HTML de bloqueo)")
-        self._crumb = None  # explícito: nunca dejar un '' cacheado sirviéndose para siempre
-        return None
-
-    self._crumb = fetched
-    utils.get_yf_logger().debug(f"crumb = '{self._crumb}'")
-    return self._crumb
-
-
-_YfData._get_crumb_basic = _patched_get_crumb_basic
-
-
-def _purge_poisoned_cookie_cache_at_startup() -> None:
-    """
-    Autocuración EAGER, al importar el módulo (directriz explícita, además
-    del self-heal LAZY ya cubierto al 100%% por `_patched_get_cookie_basic`
-    en el primer acceso de cualquier hilo): purga la fila 'basic' de la
-    caché peewee/sqlite de yfinance (`cache.get_cookie_cache()`, verificado
-    contra el wheel real 0.2.44 -- misma tabla que `_save_cookie_basic`/
-    `_load_cookie_basic` usan arriba) si contiene una cookie pre-parche
-    (string plano, sin `.name`) de una corrida anterior al fix. Reutiliza
-    EXACTAMENTE el mismo criterio de validez (`hasattr(cookie, "name")`)
-    que el parche de arriba para no divergir la lógica en dos lugares.
-
-    Nunca lanza: un fallo de disco/permisos acá (ej. filesystem read-only
-    en cierto punto del ciclo de vida de un Space de HF) no debe tumbar el
-    boot del motor -- el self-heal lazy sigue cubriendo el caso igual en el
-    peor escenario, esto es puro refuerzo "cero intervención manual".
-    """
-    try:
-        cookie_cache = _yf_cookie_cache.get_cookie_cache()
-        cached = cookie_cache.lookup("basic")
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Purga de arranque: caché de cookies yfinance no disponible (%r) -- se omite.", exc)
-        return
-
-    if cached is None:
-        return
-
-    stored_cookie = cached.get("cookie")
-    if stored_cookie is None or hasattr(stored_cookie, "name"):
-        return  # vacía o ya sana -- nada que purgar
-
-    try:
-        cookie_cache.store("basic", None)  # delete-then-no-insert, ver cache.py _CookieCache.store
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Purga de arranque: no se pudo eliminar la cookie 'basic' envenenada en disco (%r) -- "
-            "el self-heal lazy en _patched_get_cookie_basic sigue cubriendo este caso en el primer acceso.",
-            exc,
-        )
-    else:
-        logger.warning(
-            "Purga de arranque: cookie 'basic' envenenada (tipo %s, pre-parche) eliminada de la "
-            "caché en disco de yfinance -- autocuración sin intervención manual.",
-            type(stored_cookie).__name__,
-        )
-
-
-_purge_poisoned_cookie_cache_at_startup()
-# ---------------------------------------------------------------------------
-
-# --- FIX BLOQUEO YAHOO (HF Spaces / IPs de datacenter) --------------------
-# Yahoo Finance identifica tráfico no-navegador PRINCIPALMENTE por la huella
-# TLS/JA3 del handshake (Cloudflare bot management), no solo por el header
-# User-Agent -- un `requests.Session` estándar (pila OpenSSL/urllib3) tiene
-# una huella distinguible de un navegador real AUNQUE el User-Agent diga
-# "Chrome". Por eso rotar solo el header (lo pedido originalmente) no
-# alcanza contra este bloqueo específico: `curl_cffi` reproduce el
-# handshake TLS/HTTP2 bit a bit de un navegador real vía `impersonate=`.
-# Se combina con headers reales rotados (Accept/Accept-Language/UA a juego
-# con el perfil impersonado) como refuerzo ante cualquier inspección a
-# nivel de header. `_IMPERSONATE_PROFILES`/`_UA_POOL` están alineados
-# índice a índice -- cada perfil TLS lleva su UA real correspondiente.
-_IMPERSONATE_PROFILES = ("chrome124", "chrome131", "edge101", "safari17_2_ios")
-_UA_POOL = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, "
-    "like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, "
-    "like Gecko) Edge/101.0.1210.47 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-)
-_COMMON_BROWSER_HEADERS = {
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-}
-
-import re
-
-_YF_PROXY_POOL = []
-for _p in os.environ.get("YF_PROXY_POOL", "").split(","):
-    _p = _p.strip()
-    if not _p:
-        continue
-    _m = re.match(r"^\[(https?://[^\]]+)\]", _p)  # limpia formato Markdown [url](url)
-    _YF_PROXY_POOL.append(_m.group(1) if _m else _p)
-
-def _build_yf_session(profile_index: int = 0):
-    """
-    Fábrica de sesión inyectada en TODAS las llamadas yfinance del motor.
-    `profile_index` selecciona el perfil de impersonation (rotado por
-    `_yf_call_with_retry` en cada reintento, ver abajo) -- así un bloqueo
-    correlacionado a UN fingerprint específico no tumba también el
-    reintento inmediato siguiente. Con `curl_cffi` disponible, cada sesión
-    es una réplica TLS/HTTP2 real de un navegador (Chrome/Edge/Safari);
-    sin el extra, cae a `requests.Session` estándar con el pool ampliado
-    que ya resolvía la saturación de conexiones concurrentes (FIX
-    original, ver comentario debajo) -- comportamiento previo intacto
-    como último fallback.
-    """
-    profile = _IMPERSONATE_PROFILES[profile_index % len(_IMPERSONATE_PROFILES)]
-    ua = _UA_POOL[profile_index % len(_UA_POOL)]
-    proxy_url = _YF_PROXY_POOL[profile_index % len(_YF_PROXY_POOL)] if _YF_PROXY_POOL else None
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-
-    if _CURL_CFFI_AVAILABLE:
-        session = _cffi_requests.Session(impersonate=profile, proxies=proxies)
-    else:
-        session = _requests.Session()
-        # FIX original: el radar dispara ~10-15 tickers en paralelo
-        # (ThreadPoolExecutor), y cada uno hace 2 llamadas yf.download()
-        # (_build_features) + 1 yf.Ticker() (sentiment) -- 20-30+ requests
-        # concurrentes a query2.finance.yahoo.com. El pool por-host default
-        # de urllib3 es 10 conexiones: al superarlo se descartaban
-        # conexiones ("Connection pool is full, discarding connection").
-        adapter = _requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        if proxies:
-            session.proxies.update(proxies)
-
-    session.headers.update({**_COMMON_BROWSER_HEADERS, "User-Agent": ua})
-    return session
-
-
-# Sesión "caliente" para el primer intento de cada llamada (evita el costo
-# de reconstruir un handshake/sesión en el camino feliz); los reintentos
-# posteriores rotan a un perfil nuevo vía `_build_yf_session`, ver
-# `_yf_call_with_retry`.
-_YF_SESSION = _build_yf_session(0)
-
-# --- ASIGNACIÓN GLOBAL E INFALIBLE de la sesión a `YfData` ----------------
-# `YfData` es Singleton de proceso; `_set_session(session)` es no-op cuando
-# `session is None` (verificado contra el wheel real 0.2.44), así que
-# CUALQUIER llamada yfinance SIN `session=` explícito (ej.
-# `data_pipeline.py::_fetch_headlines_yfinance` -> `yf.Ticker(ticker).news`,
-# que nunca pasa `session=`) simplemente hereda lo que el Singleton ya tenga
-# bindeado -- pero solo DESPUÉS de que la primera llamada CON sesión
-# explícita haya corrido. Sin este bind eager, si esa llamada sin sesión es
-# la PRIMERA en ejecutarse en el proceso (perfectamente posible: es la misma
-# carrera de `asyncio.gather` que motiva `_COOKIE_BOOTSTRAP_LOCK` arriba,
-# aplicada esta vez al propio objeto sesión), el Singleton arrancaría con un
-# `requests.Session()` plano (`_set_session(session or requests.Session())`
-# en `YfData.__init__`) -- exactamente la huella TLS/JA3 bloqueable que todo
-# el bloque `curl_cffi`/`_IMPERSONATE_PROFILES` de arriba existe para evitar.
-# Instanciar el Singleton acá, ANTES de que ningún otro módulo (data_pipeline.py
-# u otro) pueda ganar esa carrera, cierra el hueco de forma determinista.
-_YfData(session=_YF_SESSION)
-
-# FIX #2 (sigue vigente con o sin curl_cffi): Yahoo rate-limitea por IP de
-# origen cuando ~15 tickers disparan yf.download/yf.Ticker EN SIMULTÁNEO --
-# _YF_CONCURRENCY acota cuántas llamadas a Yahoo corren REALMENTE al mismo
-# tiempo (el resto espera, en vez de dispararse todas juntas); el retry con
-# backoff + jitter absorbe los rechazos transitorios que igual ocurran
-# dentro de ese límite.
-_YF_CONCURRENCY = threading.BoundedSemaphore(4)
-
-
-def _reset_yf_auth_state() -> None:
-    """
-    Invalida cookie+crumb del Singleton `YfData` compartido por todo el
-    proceso. Necesario porque `_yf_call_with_retry` rota el PERFIL de
-    impersonation/UA en cada reintento (`_build_yf_session`), pero
-    `self._cookie`/`self._crumb` NO están atados a qué sesión los obtuvo
-    -- son atributos del Singleton, no de la sesión. Sin este reset, cada
-    reintento reutiliza el MISMO cookie/crumb potencialmente ya envenenado
-    (rate-limit/bloqueo anti-bot silencioso de Yahoo, ver
-    `_patched_get_crumb_basic` arriba), sin importar cuántas veces se rote
-    el fingerprint TLS -- exactamente el patrón observado en producción:
-    0%% de éxito across ~4 intentos x N tickers, mismo error siempre.
-    """
-    stale = _YfData(session=_YF_SESSION)
-    stale._cookie = None
-    stale._crumb = None
-
-
-def _yf_call_with_retry(fn, *, attempts: int = max(4, len(_YF_PROXY_POOL) or 4), backoff_s: float = 0.9):
-    """
-    Ejecuta `fn(session)` bajo el semáforo de concurrencia, con reintentos
-    ante respuesta vacía/error transitorio de Yahoo. `fn` recibe la sesión
-    del intento actual y DEBE usarla en su llamada yfinance (`session=`) --
-    el intento 0 reutiliza `_YF_SESSION` (camino feliz, sin costo extra de
-    handshake); desde el intento 1 se reconstruye una sesión con OTRO
-    perfil de impersonation/UA (ver `_build_yf_session`) Y se fuerza un
-    cookie/crumb nuevos (`_reset_yf_auth_state`) -- así un bloqueo
-    correlacionado a un fingerprint O a un crumb específico no repite el
-    mismo rechazo en cada reintento. Backoff exponencial + jitter aleatorio
-    evita que reintentos de tickers en paralelo converjan en el mismo
-    instante.
-    """
-    with _YF_CONCURRENCY:
-        last_exc: Exception | None = None
-        for attempt in range(attempts):
-            session = _YF_SESSION if attempt == 0 else _build_yf_session(attempt)
-            try:
-                result = fn(session)
-                if result is None or (hasattr(result, "empty") and result.empty):
-                    raise ValueError("yfinance devolvió una respuesta vacía")
-                return result
-            except Exception as exc:  # noqa: BLE001 -- reintentamos cualquier fallo transitorio
-                last_exc = exc
-                if attempt < attempts - 1:
-                    _reset_yf_auth_state()
-                    jitter = random.uniform(0, 0.4)
-                    time.sleep(backoff_s * (attempt + 1) + jitter)
-        raise last_exc
-
-
-# --- FALLBACK DE ÚLTIMO RECURSO: Stooq (sin auth, sin el mismo régimen de
-# anti-bot de Yahoo) -- SOLO para el universo cerrado y verificado abajo
-# (REGIME_TICKERS ∪ {PLAN_A_TICKER}, exactamente los símbolos que
-# prediccion.py escanea). Deliberadamente NO se usa para `macro_tickers`
-# (VIX/factores persistidos en scalers_dict.pkl, ej. ^GSPC/^TNX/GC=F,
-# desconocidos en este archivo): adivinar su símbolo Stooq violaría la
-# regla de "cero cifras inventadas" del motor si el mapeo no calzara 1:1,
-# y ESE tensor (feature window de la Bi-LSTM) exige paridad bit a bit con
-# el notebook de entrenamiento -- nunca una fuente alterna sin verificar.
-# Cubre los dos puntos de falla reportados en el bug (display close del
-# gráfico + sentimiento SPY/BTC-USD de get_market_sentiment) cuando Yahoo
-# sigue sin responder incluso tras agotar `_yf_call_with_retry`.
-_STOOQ_SYMBOL_MAP: dict[str, str] = {
-    "AAPL": "aapl.us", "MSFT": "msft.us", "NVDA": "nvda.us", "TSLA": "tsla.us",
-    "GOOGL": "googl.us", "AMZN": "amzn.us", "META": "meta.us", "SPY": "spy.us",
-    "BTC-USD": "btc.v", "ETH-USD": "eth.v",
-}
-
-
-def _stooq_daily_close(ticker: str, tail_days: int = 400) -> "pd.Series | None":
-    """
-    Serie de Close diario vía Stooq (CSV público, sin key) para `ticker` --
-    devuelve `None` (nunca lanza) si el símbolo no está en el universo
-    verificado o si la fuente falla, para que el caller decida su propio
-    fallback sin sorpresas.
-    """
-    stooq_symbol = _STOOQ_SYMBOL_MAP.get(ticker.strip().upper())
-    if stooq_symbol is None:
-        return None
-    try:
-        resp = _requests.get(
-            f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d",
-            timeout=10,
-            headers={"User-Agent": _UA_POOL[0]},
-        )
-        resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
-        if df.empty or "Close" not in df.columns or "Date" not in df.columns:
-            return None
-        df["Date"] = pd.to_datetime(df["Date"])
-        series = df.set_index("Date").sort_index()["Close"].dropna()
-        return series.tail(tail_days) if not series.empty else None
-    except Exception as exc:  # noqa: BLE001 -- último recurso: si falla, el caller sigue su propio fallback
-        logger.warning("Fallback Stooq falló para %s (%s): %r", ticker, stooq_symbol, exc)
-        return None
+# --- Proveedor de datos de mercado: Twelve Data (API oficial, gratuita) +
+# Stooq (fallback sin key) -- yfinance y el pool de proxies fueron
+# RETIRADOS por completo (bloqueos recurrentes de Yahoo Finance / "Proxy
+# CONNECT aborted" en producción). Toda la lógica de red, rate limiting,
+# caché en disco y mapeo de símbolos vive ahora en services/market_data.py
+# -- este archivo solo importa las dos funciones públicas que necesita.
+# Ver ese módulo para el detalle completo de la migración.
+from services.market_data import fetch_feature_ohlcv, fetch_close_history, DEFAULT_HISTORY_SESSIONS
 from groq import (
     AsyncGroq,
     APIConnectionError as GroqAPIConnectionError,
@@ -2019,23 +1575,15 @@ def _fetch_feature_window(
     devolverlo. `close` (para todo lo demás) permanece intacto.
     """
     all_symbols = list(dict.fromkeys([ticker] + macro_tickers))
-    raw = _yf_call_with_retry(
-        lambda session: yf.download(all_symbols, period="2y", auto_adjust=True, progress=False, session=session)
-    )
-
     # V3: bundle OHLCV COMPLETO solo para el ticker objetivo — ATR_14
     # necesita High/Low, OBV necesita Volume. Los macro tickers permanecen
     # Close-only, replicando exactamente engineer_asset()/download_all() del
     # notebook (no se calculan técnicos sobre los factores macro). Columnas
     # planas `f"{ticker}_High"` / `_Low` / `_Volume`, mismo patrón de
-    # nombrado que download_all() en entrenamiento.py.
-    close = pd.DataFrame(index=raw["Close"].index)
-    close[ticker] = raw["Close"][ticker]
-    close[f"{ticker}_High"] = raw["High"][ticker]
-    close[f"{ticker}_Low"] = raw["Low"][ticker]
-    close[f"{ticker}_Volume"] = raw["Volume"][ticker]
-    for macro_ticker in macro_tickers:
-        close[macro_ticker] = raw["Close"][macro_ticker]
+    # nombrado que download_all() en entrenamiento.py. `fetch_feature_ohlcv`
+    # (services/market_data.py, Twelve Data + fallback Stooq) ya devuelve
+    # exactamente este layout -- reemplaza 1:1 el antiguo `yf.download`.
+    close = fetch_feature_ohlcv(ticker, macro_tickers, min_sessions=DEFAULT_HISTORY_SESSIONS)
     close = close.ffill().dropna()
 
     # --- FIX VELA VIVA (cripto 24/7, sin campana de cierre) -----------------
@@ -2067,81 +1615,35 @@ def _fetch_feature_window(
             )
 
     # --- FIX PRICING (Adjusted vs Regular Close) ---------------------------
-    # `close[ticker]` de arriba es Auto-Adjusted Close (auto_adjust=True) —
-    # correcto y OBLIGATORIO para el modelo/indicadores (paridad bit a bit
-    # con engineer_asset() de entrenamiento, ver docstring). Pero un ajuste
-    # retroactivo por dividendos hace que ESE mismo precio, usado tal cual
-    # para el histórico que ve el usuario en el chart, no calce con el
-    # "Regular Close" real (Google Finance / Yahoo quote) — la discrepancia
-    # crece cuanto más atrás en el tiempo, según cuántos dividendos pagó el
-    # activo en la ventana. Se descarga una serie separada, SOLO Close, SIN
-    # ajustar, exclusivamente para el ticker objetivo (no macro, no O/H/L/V
-    # — esos siguen sirviendo únicamente al modelo) y se alinea al mismo
-    # índice de sesiones. El precio más reciente (ancla del forecast) es
-    # prácticamente idéntico en ambas series por construcción de yfinance
-    # (el factor de ajuste en la sesión más reciente es ~1.0) — esto NUNCA
-    # introduce un salto visual entre histórico y proyección, solo corrige
-    # los puntos más antiguos del histórico para que calcen con la realidad
-    # del activo. Ver uso en `historical` dentro de `_forecast_asset`.
+    # Bajo yfinance, este bloque descargaba una SEGUNDA serie (Regular
+    # Close, sin ajustar) porque `auto_adjust=True` aplicaba un ajuste
+    # retroactivo por dividendos que no coincidía con el precio que
+    # realmente vio el usuario ese día — y esas dos descargas independientes
+    # podían desincronizarse entre sí (ver el FIX de "ancla desfasada" que
+    # existía acá antes de esta migración).
+    #
+    # Twelve Data no tiene esa dualidad en el plan gratuito: `time_series`
+    # devuelve UNA sola serie de Close (la operada, sin ajuste retroactivo
+    # por dividendos) — la misma que ya se usó arriba para los indicadores.
+    # No hay una segunda fuente que descargar ni que pueda desincronizarse:
+    # todo el bloque de reconciliación de dos índices queda eliminado.
+    # `display_col` se conserva solo por compatibilidad con los
+    # consumidores aguas abajo que ya leen esa columna (ver `historical`
+    # dentro de `_forecast_asset`).
+    #
+    # CAVEAT HONESTO (léase antes de asumir paridad con el pipeline
+    # anterior): si `train_kodaquant_v5.py` entrenó específicamente contra
+    # el Auto-Adjusted Close de Yahoo (que sí incorpora dividendos, no solo
+    # splits), este cambio de proveedor introduce un desvío estructural
+    # MENOR en la serie de precio de activos con dividendo alto (ej. AAPL,
+    # MSFT) alrededor de cada fecha ex-dividendo. No es un bug de esta
+    # migración — es una diferencia real de metodología entre fuentes de
+    # datos que ningún mapeo de símbolos puede maquillar. Si la paridad
+    # exacta con el entrenamiento original es crítica para tu caso de uso,
+    # conviene re-validar el error de forecast contra Twelve Data como
+    # fuente en vez de asumir equivalencia bit a bit con yfinance.
     display_col = f"{ticker}__DISPLAY_CLOSE"
-    try:
-        try:
-            raw_display = _yf_call_with_retry(
-                lambda session: yf.download(ticker, period="2y", auto_adjust=False, progress=False, session=session)
-            )
-            display_close = raw_display["Close"] if not raw_display.empty else None
-        except Exception as yahoo_exc:  # noqa: BLE001 -- Yahoo agotó reintentos, se intenta Stooq antes de resignar
-            stooq_series = _stooq_daily_close(ticker)
-            if stooq_series is None:
-                raise yahoo_exc
-            print(f"⚠️ Yahoo sin respuesta para Regular Close de '{ticker}' ({yahoo_exc}) — usando Stooq como fuente alterna.")
-            display_close = stooq_series
-        if isinstance(display_close, pd.DataFrame):  # MultiIndex de 1 solo símbolo, según versión de yfinance
-            display_close = display_close[ticker] if ticker in display_close.columns else display_close.iloc[:, 0]
-        if display_close is None or display_close.empty:
-            raise ValueError("respuesta vacía")
-        # FIX (ancla desfasada / "lag" del cursor): `close.index` y
-        # `display_close.index` vienen de DOS llamadas yf.download()
-        # independientes — nada garantiza que ambas devuelvan la MISMA
-        # fecha como sesión más reciente (latencia de red, refresco parcial
-        # del endpoint no-ajustado, etc.). Un `.reindex().ffill().bfill()`
-        # ciego enmascara ese hueco: si a `display_close` le falta
-        # justo la fila más nueva, el ffill arrastra el cierre de un día
-        # ANTERIOR y lo presenta como si fuera el precio de hoy — exactamente
-        # el síntoma de "ancla con lag" reportado. Se valida explícitamente
-        # la cobertura de la sesión más reciente antes de confiar en ella.
-        latest_session = close.index[-1]
-        if display_close.index[-1] < latest_session:
-            missing_sessions = int((close.index > display_close.index[-1]).sum())
-            print(
-                f"⚠️ Regular Close de '{ticker}' desactualizado: la fuente no-ajustada "
-                f"llega solo hasta {display_close.index[-1].strftime('%Y-%m-%d')}, pero la "
-                f"sesión más reciente real es {latest_session.strftime('%Y-%m-%d')} "
-                f"({missing_sessions} sesión/es sin cobertura). Se evita el ffill silencioso "
-                "sobre la(s) fila(s) faltante(s): esas sesiones usan Auto-Adjusted Close "
-                "como fallback puntual (huecos intermedios sí se rellenan por feriados de "
-                "mercado normales)."
-            )
-            aligned_display = display_close.reindex(close.index)
-            # Solo las sesiones estrictamente posteriores a la última cobertura real
-            # de la fuente no-ajustada se completan con Auto-Adjusted Close (fallback
-            # explícito y acotado); todo lo demás (huecos intermedios normales, p. ej.
-            # feriados que no calzan 1:1 entre ambas descargas) sigue su ffill/bfill
-            # habitual, que ahí sí es información real, solo con fecha de publicación
-            # ligeramente distinta entre fuentes.
-            stale_mask = aligned_display.index > display_close.index[-1]
-            aligned_display = aligned_display.ffill().bfill()
-            aligned_display.loc[stale_mask] = close.loc[stale_mask, ticker]
-            close[display_col] = aligned_display
-        else:
-            close[display_col] = display_close.reindex(close.index).ffill().bfill()
-    except Exception as exc:  # noqa: BLE001
-        print(
-            f"⚠️ No se pudo obtener Regular Close (sin ajustar) de '{ticker}' ({exc}) — "
-            "el histórico visual usará Auto-Adjusted Close como fallback (puede no calzar "
-            "exactamente con el oráculo real)."
-        )
-        close[display_col] = close[ticker]
+    close[display_col] = close[ticker]
 
     # CUTOFF RETROACTIVO (online learning): si se pide reconstruir la ventana
     # tal cual estaba en una fecha pasada (`as_of_date`), se descarta TODA
@@ -3429,7 +2931,7 @@ def _derive_capital_signal(radar_data: dict) -> str:
 # ---------------------------------------------------------------------------
 
 # FIX (Circuit Breaker por "timeout" que no era lentitud de red): 2.5s
-# alcanza justo para un round-trip de yfinance en condiciones ideales, pero
+# alcanza justo para un round-trip a Twelve Data en condiciones ideales, pero
 # CERO margen para jitter real de red o para una cola momentánea en el
 # executor. Con `_SENTIMENT_EXECUTOR` dedicado (arriba) la contención con
 # Keras ya no existe, así que este valor ahora refleja tolerancia real a
@@ -3486,19 +2988,12 @@ async def get_market_sentiment(symbol: str) -> dict[str, float | str]:
             loop = asyncio.get_running_loop()
 
             def _sync_momentum() -> float:
-                try:
-                    hist = _yf_call_with_retry(
-                        lambda session: yf.Ticker(symbol, session=session).history(
-                            period=f"{SENTIMENT_MOMENTUM_LOOKBACK_DAYS + 5}d"
-                        )
-                    )
-                    closes = hist["Close"].dropna()
-                except Exception as yahoo_exc:  # noqa: BLE001 -- Yahoo agotó reintentos, se intenta Stooq
-                    stooq_series = _stooq_daily_close(symbol, tail_days=SENTIMENT_MOMENTUM_LOOKBACK_DAYS + 5)
-                    if stooq_series is None:
-                        raise yahoo_exc
-                    print(f"⚠️ Yahoo sin respuesta para sentimiento de '{symbol}' ({yahoo_exc}) — usando Stooq como fuente alterna.")
-                    closes = stooq_series
+                # `fetch_close_history` (Twelve Data + fallback Stooq, ver
+                # services/market_data.py) ya devuelve la serie de Close
+                # completa cacheada (2y) — el mismo dato que ya se descargó
+                # para el forecast de este ticker si corrió en la misma
+                # ventana de TTL, cero llamadas de red extra en ese caso.
+                closes = fetch_close_history(symbol, min_days=SENTIMENT_MOMENTUM_LOOKBACK_DAYS + 5)
                 if len(closes) < 2:
                     raise ValueError(f"Histórico insuficiente para {symbol}")
                 window = closes.tail(SENTIMENT_MOMENTUM_LOOKBACK_DAYS)
@@ -3571,7 +3066,7 @@ async def _build_investment_plans(
 ) -> dict:
     """
     ASÍNCRONA: Plan A, Plan B y su sentimiento de mercado se despachan EN
-    PARALELO vía asyncio.gather (cada forecast es un yfinance.download +
+    PARALELO vía asyncio.gather (cada forecast es un fetch a Twelve Data +
     bucle autoregresivo Keras independiente; cada sentiment es su propio
     fetch con Circuit Breaker propio) en vez de secuencial — corta la
     latencia total de cada generación de estrategia.

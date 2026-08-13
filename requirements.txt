@@ -83,15 +83,11 @@ pandas==3.0.3
 scikit-learn==1.6.1
 keras==3.15.1
 tensorflow>=2.16.1,<2.21
-yfinance==0.2.44
-multitasking==0.0.13
-# curl_cffi: NO es dependencia declarada de yfinance==0.2.44 (verificado
-# contra el METADATA del wheel) -- hay que pinearlo aparte. Sin esto,
-# quanti_engine.py degrada solo a requests.Session estándar (huella TLS
-# bloqueable por Cloudflare/Yahoo, ver _build_yf_session). Bound abierto
-# a mayor de patch porque libera ABI compilado por SO/arch (manylinux) que
-# HF Spaces resuelve en build; <1.0 evita saltos de API mayor sin probar.
-curl_cffi>=0.7.1,<1.0
+# yfinance / multitasking / curl_cffi RETIRADOS (migración a Twelve Data +
+# fallback Stooq, ver services/market_data.py — bloqueos recurrentes de
+# Yahoo Finance en producción). El nuevo proveedor solo necesita `requests`
+# (ya pineado más abajo en la sección HTTP/networking), cero dependencias
+# nuevas.
 
 # --- LLM / search --------------------------------------------------------
 groq>=0.31.0,<2.0.0
