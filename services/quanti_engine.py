@@ -383,6 +383,7 @@ _COMMON_BROWSER_HEADERS = {
     "Connection": "keep-alive",
 }
 
+_YF_PROXY_URL = os.environ.get("YF_PROXY_URL")  # http://user:pass@host:port
 
 def _build_yf_session(profile_index: int = 0):
     """
@@ -399,9 +400,10 @@ def _build_yf_session(profile_index: int = 0):
     """
     profile = _IMPERSONATE_PROFILES[profile_index % len(_IMPERSONATE_PROFILES)]
     ua = _UA_POOL[profile_index % len(_UA_POOL)]
+    proxies = {"http": _YF_PROXY_URL, "https": _YF_PROXY_URL} if _YF_PROXY_URL else None
 
     if _CURL_CFFI_AVAILABLE:
-        session = _cffi_requests.Session(impersonate=profile)
+        session = _cffi_requests.Session(impersonate=profile, proxies=proxies)
     else:
         session = _requests.Session()
         # FIX original: el radar dispara ~10-15 tickers en paralelo
@@ -413,6 +415,8 @@ def _build_yf_session(profile_index: int = 0):
         adapter = _requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
+        if proxies:
+            session.proxies.update(proxies)
 
     session.headers.update({**_COMMON_BROWSER_HEADERS, "User-Agent": ua})
     return session
