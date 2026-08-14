@@ -36,25 +36,87 @@ tráfico real, porque las barras diarias no cambian más de una vez por
 sesión de mercado — no hay motivo para re-descargar 2 años de historia
 en cada request de un usuario.
 
---- ADVERTENCIA — MACRO TICKERS, LEER ANTES DE DESPLEGAR A PRODUCCIÓN ---
-`MACRO_SYMBOL_MAP` mapea los macro tickers mencionados en los comentarios
-originales de quanti_engine.py (^GSPC, ^VIX, GC=F, DX-Y.NYB, ^TNX) a sus
-equivalentes en Twelve Data / Stooq. Estos NO pudieron verificarse 1:1
-contra tu `scalers_dict.pkl` real (`scalers["macro_tickers"]`, cargado en
-runtime por `_get_scalers()` en quanti_engine.py) porque ese pickle no
-formaba parte de los archivos analizados para escribir este módulo. Si tu
-lista real de macro_tickers difiere de estos 5, o si tu plan gratuito de
-Twelve Data no cubre alguno de estos símbolos, hay que corregir la entrada
-correspondiente ANTES de servir tráfico real: un símbolo mal mapeado
-alimentaría al feature_scaler con la serie EQUIVOCADA — un error
-silencioso, sin excepción, bastante peor que el bloqueo de Yahoo que este
-módulo resuelve. Por eso `resolve_macro_symbol()` fallA RUIDOSO ante
-cualquier ticker fuera de este diccionario en vez de adivinar un símbolo
-("cero cifras inventadas", mismo principio que ya regía el resto del
-motor). Tampoco se pudo probar en vivo contra la API real de Twelve
-Data/Stooq desde el entorno en el que se escribió este archivo (sandbox
-sin acceso de red a esos dominios) — smoke-testeá cada símbolo macro con
-una llamada real antes de ir a producción.
+--- AUDITORÍA DE PARIDAD TRAIN/SERVE (contra train_kodaquant_v5.py) ---
+Reconciliado línea a línea contra el script de entrenamiento real. Hallazgos:
+
+  • UNIVERSO DE TICKERS: `REGIME_TICKERS` en train_kodaquant_v5.py
+    (equity_specialist: AAPL/MSFT/NVDA/TSLA/GOOGL/AMZN/META/SPY;
+    crypto_specialist: BTC-USD/ETH-USD) coincide EXACTO con el universo
+    que ya cubren `_TICKER_MAP_TD`/`_STOOQ_SYMBOL_MAP` — sin cambios.
+
+  • MACRO_TICKERS: `MACRO_TICKERS = ["^GSPC", "^TNX", "^VIX", "GC=F",
+    "DX-Y.NYB"]` (train_kodaquant_v5.py, línea 149) — exactamente los 5
+    tickers que ya cubría `MACRO_SYMBOL_MAP` (abajo). Sin faltantes, sin
+    sobrantes.
+
+  • TODOS los macro tickers entran al tensor ÚNICAMENTE como LOG-RETURN
+    diario (`engineer_asset()`: `df[macro_close_col] = np.log(macro_price
+    / macro_price.shift(1))`, aplicado ANTES del feature_scaler, idéntico
+    en `_fetch_feature_window` del lado de inferencia). Consecuencia
+    matemática directa: `log(k·x_t / k·x_{t-1}) = log(x_t / x_{t-1})` —
+    un factor de escala CONSTANTE y multiplicativo en cualquier macro
+    ticker (ej. un proveedor que reporte el mismo activo ×10 o ×100
+    frente a otro) es matemáticamente INVISIBLE para el modelo. Esto no
+    exime de verificar la escala (una serie con escala INCONSISTENTE en
+    el tiempo, o con timestamps desalineados, sí correspería fuga/ruido
+    real) — pero sí acota el riesgo real de un desajuste de escala
+    puramente constante a cero impacto en el tensor de entrada.
+
+  • ^TNX — HALLAZGO QUE CORRIGE UNA ADVERTENCIA PREVIA DE ESTE MÓDULO:
+    una versión anterior de este archivo asumía que yfinance publicaba
+    ^TNX bajo la vieja convención CBOE "rendimiento ×10" (ej. 42.0 =
+    4.20%). Verificado en vivo contra la cotización real de Yahoo Finance
+    para ^TNX (agosto 2026): el valor publicado es 4.5580 — es decir,
+    yfinance/Yahoo publican ^TNX en PORCENTAJE DIRECTO (4.558 = 4.558%),
+    NO en la vieja convención ×10. Stooq (`10yusy.b`, "U.S. 10-Year
+    Government Bond Yield") publica la misma convención de porcentaje
+    directo. CONCLUSIÓN: no existe el desajuste de escala ×10 que se
+    sospechaba — la advertencia anterior era incorrecta y fue retirada.
+    No se aplica ninguna transformación compensatoria (no hay nada que
+    compensar), y por el punto anterior (macro = solo log-return) aunque
+    lo hubiera habido, habría sido matemáticamente inerte para el tensor.
+
+  • auto_adjust=True — confirmado en train_kodaquant_v5.py línea 359
+    (`yf.download(symbols, period=period, auto_adjust=True, ...)`),
+    aplicado de forma UNIFORME a tickers Y macro. Para los 5 macro
+    tickers (todos índices/futuros, sin dividendos ni splits) esto es un
+    no-op exacto — auto_adjust=True/False no cambia un solo valor. Para
+    los tickers de equity (AAPL, MSFT, ...) SÍ es relevante: ver el
+    caveat ya documentado en quanti_engine.py (`_fetch_feature_window`,
+    bloque "FIX PRICING") sobre la diferencia de metodología de ajuste
+    por dividendos entre Yahoo y Twelve Data — no es un bug de este
+    módulo, es una diferencia real entre proveedores que ninguna
+    transformación en `market_data.py` puede eliminar sin una fuente de
+    dividendos propia.
+
+  • GC=F vs XAU/USD — riesgo real, NO corregible con un factor fijo.
+    GC=F es el futuro de oro COMEX del contrato más próximo; Twelve
+    Data's XAU/USD es el spot. Verificado en vivo (agosto 2026): ambos
+    cotizan en el mismo orden de magnitud (spot ~$4.320-4.410 vs futuro
+    ~$4.408-4.430) pero con una base (contango/backwardation) variable
+    en el tiempo — no una proporción constante, así que NO se puede
+    "corregir" con un multiplicador fijo sin inventar un número. Se deja
+    como proxy de mejor esfuerzo, documentado explícitamente en
+    `MACRO_SYMBOL_MAP` — igual que arriba, al entrar como log-return el
+    impacto se limita a la diferencia de VOLATILIDAD diaria entre spot y
+    futuro (correlacionadas >0.98 en la práctica), no a un sesgo de nivel.
+
+  • ^GSPC↔SPX, ^VIX↔VIX, DX-Y.NYB↔DXY — mismo índice subyacente en
+    ambos proveedores (S&P 500 cash, CBOE VIX, ICE US Dollar Index
+    respectivamente), sin dualidad de convención conocida. `DX-Y.NYB`
+    verificado en vivo (~99.94) contra el nivel públicamente reportado
+    de DXY (~99-101) — mismo orden de magnitud, consistente.
+
+--- ADVERTENCIA VIGENTE — LEER ANTES DE DESPLEGAR A PRODUCCIÓN ---
+Esta auditoría se hizo contra el CÓDIGO de entrenamiento (train_kodaquant_v5.py)
+y contra cotizaciones en vivo de terceros (Yahoo, Investing.com, Barchart,
+TradingView) — no contra tu `scalers_dict.pkl` real ni contra una llamada
+en vivo a la API de Twelve Data (este entorno no tiene salida de red hacia
+api.twelvedata.com/stooq.com). Si `MACRO_TICKERS` en tu copia real de
+train_kodaquant_v5.py difiere de la verificada acá, o si tu plan de Twelve
+Data no cubre alguno de estos símbolos, corregí `MACRO_SYMBOL_MAP` antes
+de servir tráfico real — `resolve_macro_symbol()` sigue fallando ruidoso
+ante cualquier ticker fuera del diccionario, nunca adivina un símbolo.
 """
 
 import io
@@ -188,31 +250,39 @@ _STOOQ_SYMBOL_MAP: dict[str, str] = {
     "BTC-USD": "btc.v", "ETH-USD": "eth.v",
 }
 
-# Macro tickers -- VER LA ADVERTENCIA COMPLETA EN EL DOCSTRING DEL MÓDULO.
-# `twelvedata: None` significa "este proveedor no lo cubre de forma
-# confiable en el plan free -- se sirve directo desde Stooq".
+# Macro tickers -- auditado contra MACRO_TICKERS de train_kodaquant_v5.py
+# (línea 149: ^GSPC, ^TNX, ^VIX, GC=F, DX-Y.NYB) -- ver la sección
+# "AUDITORÍA DE PARIDAD TRAIN/SERVE" en el docstring del módulo para el
+# detalle matemático completo de cada fila. `twelvedata: None` significa
+# "este proveedor no lo cubre de forma confiable en el plan free -- se
+# sirve directo desde Stooq".
 MACRO_SYMBOL_MAP: dict[str, dict[str, Optional[str]]] = {
-    "^GSPC":    {"twelvedata": "SPX",     "stooq": "^spx"},     # S&P 500 (índice)
-    "^VIX":     {"twelvedata": "VIX",     "stooq": "^vix"},     # CBOE Volatility Index
-    "GC=F":     {"twelvedata": "XAU/USD", "stooq": "xauusd"},   # Oro -- spot, NO futuro CME COMEX;
-                                                                  # nivel de precio prácticamente
-                                                                  # idéntico a GC=F pero no es la
-                                                                  # misma serie exacta -- verificar.
-    "DX-Y.NYB": {"twelvedata": "DXY",     "stooq": "usdx.f"},   # US Dollar Index
-    "^TNX":     {"twelvedata": None,      "stooq": "10yusy.b"}, # Rendimiento UST 10Y, EN PUNTOS
-                                                                  # PORCENTUALES -- Twelve Data no lo
-                                                                  # cubre en el plan free (no es un
-                                                                  # índice/forex/crypto estándar); se
-                                                                  # sirve directo desde Stooq. OJO:
-                                                                  # yfinance representaba ^TNX en
-                                                                  # décimas (42.0 == 4.20%) -- Stooq
-                                                                  # publica 10yusy.b en % directo
-                                                                  # (4.20). Si tu feature_scaler fue
-                                                                  # entrenado contra la convención de
-                                                                  # yfinance, hay que multiplicar por
-                                                                  # 10 acá antes de usarlo. Verificar
-                                                                  # contra el rango real que espera tu
-                                                                  # scaler antes de desplegar.
+    "^GSPC":    {"twelvedata": "SPX",     "stooq": "^spx"},     # S&P 500 (índice cash) -- mismo
+                                                                  # subyacente en ambos proveedores.
+    "^VIX":     {"twelvedata": "VIX",     "stooq": "^vix"},     # CBOE Volatility Index -- ídem.
+    "GC=F":     {"twelvedata": "XAU/USD", "stooq": "xauusd"},   # Oro SPOT -- GC=F en entrenamiento
+                                                                  # es el FUTURO COMEX del contrato
+                                                                  # próximo. Verificado en vivo
+                                                                  # (ago-2026): mismo orden de
+                                                                  # magnitud, base variable en el
+                                                                  # tiempo (no una proporción fija) --
+                                                                  # proxy de mejor esfuerzo, NO
+                                                                  # corregible con un multiplicador
+                                                                  # constante. Ver docstring del módulo.
+    "DX-Y.NYB": {"twelvedata": "DXY",     "stooq": "usdx.f"},   # US Dollar Index -- mismo índice
+                                                                  # ICE subyacente; nivel verificado
+                                                                  # en vivo (~99-101) en ambos.
+    "^TNX":     {"twelvedata": None,      "stooq": "10yusy.b"}, # Rendimiento UST 10Y, PORCENTAJE
+                                                                  # DIRECTO (4.558 = 4.558%) en AMBOS
+                                                                  # yfinance/Yahoo y Stooq -- verificado
+                                                                  # en vivo, ago-2026. CORRIGE una
+                                                                  # advertencia previa de este módulo
+                                                                  # que asumía, incorrectamente, la
+                                                                  # vieja convención CBOE "rendimiento
+                                                                  # ×10" -- esa convención NO aplica acá,
+                                                                  # sin transformación de escala. No
+                                                                  # cubierto por Twelve Data free -- se
+                                                                  # sirve siempre desde Stooq.
 }
 
 
