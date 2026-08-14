@@ -11,8 +11,10 @@ de features distintas entre equity y cripto).
 
 CICLO (1x/día, post-cierre de mercado):
   1. Por cada ticker con predicción pendiente de ayer (ledger SQLite):
-     descarga el cierre real (yfinance), calcula el error vs. lo
-     predicho, y resuelve a qué régimen pertenece (`_regime_for_ticker`).
+     descarga el cierre real (Twelve Data + fallback Stooq, ver
+     services/market_data.py — yfinance retirado del proyecto), calcula
+     el error vs. lo predicho, y resuelve a qué régimen pertenece
+     (`_regime_for_ticker`).
   2. Agrupa los samples en un micro-batch POR RÉGIMEN.
   3. Por cada régimen con batch no vacío: carga una copia fresca de
      `model_v5.keras` (grafo de entrenamiento normal, no el bridge MC
@@ -39,7 +41,8 @@ from typing import Any, Iterator
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+
+from services.market_data import fetch_close_history
 
 from services.quanti_engine import (
     REGIME_TICKERS,
@@ -248,21 +251,27 @@ def _reconstruct_scaled_sample(
 
 
 def _fetch_actual_close(ticker: str, target_date: str) -> float | None:
-    """Cierre real de `target_date` (ventana de descarga corta, por-ticker y diaria)."""
-    start = (pd.Timestamp(target_date) - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
-    end = (pd.Timestamp(target_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    """
+    Cierre real de `target_date` -- vía `fetch_close_history`
+    (services/market_data.py: Twelve Data + fallback Stooq, misma caché en
+    disco que ya usa `_fetch_feature_window`/`get_market_sentiment`;
+    yfinance retirado del proyecto). Reemplaza 1:1 el antiguo
+    `yf.download(ticker, start=..., end=..., auto_adjust=True, ...)` --
+    incluso reutiliza la descarga ya cacheada de este mismo ticker si el
+    ciclo diario corrió después de un forecast reciente, cero llamada de
+    red extra en ese caso.
+    """
     try:
-        raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+        closes = fetch_close_history(ticker, min_days=10)
     except Exception as exc:  # noqa: BLE001
-        print(f"⚠️ [online_learning] yfinance falló pidiendo el cierre real de {ticker} @ {target_date}: {exc!r}")
+        print(f"⚠️ [online_learning] fetch_close_history falló pidiendo el cierre real de {ticker} @ {target_date}: {exc!r}")
         return None
-    if raw.empty:
+    if closes.empty:
         return None
-    close_col = raw["Close"][ticker] if isinstance(raw["Close"], pd.DataFrame) else raw["Close"]
     target_ts = pd.Timestamp(target_date)
-    if target_ts not in close_col.index:
+    if target_ts not in closes.index:
         return None
-    return float(close_col.loc[target_ts])
+    return float(closes.loc[target_ts])
 
 
 # ---------------------------------------------------------------------------
