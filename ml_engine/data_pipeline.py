@@ -8,7 +8,11 @@ KodaQuant V5 — Requerimiento 1 (Cero Fricción / Anti-CAPTCHAs).
 Añade la variable continua `NEWS_SENTIMENT_SCORE` (rango [-1, 1]) al tensor
 de entrada del modelo, calculada EXCLUSIVAMENTE con APIs nativas:
 
-    1) yfinance.Ticker(ticker).news    -> fuente primaria, sin API key.
+    1) DDGS (DuckDuckGo News Search) -> fuente primaria, sin API key.
+       Reemplaza a `yfinance.Ticker(ticker).news` (yfinance retirado por
+       completo del proyecto, ver services/market_data.py) manteniendo el
+       mismo rol estructural: gratuita, sin key, no depende de que el
+       operador configure nada para tener AL MENOS cobertura básica.
     2) Finnhub REST API                -> fallback, requiere FINNHUB_API_KEY.
        `/company-news` para equities, `/news?category=crypto` para cripto
        (ver `_is_crypto_ticker`/`_fetch_headlines_finnhub` — V6, fix de
@@ -18,7 +22,10 @@ PROHIBIDO en este módulo: Selenium, BeautifulSoup, requests directos a
 portales de noticias, o cualquier scraping HTML iterativo. Cualquiera de
 esos vectores colapsa el pipeline productivo ante CAPTCHAs, Cloudflare o
 baneos de IP del proveedor de hosting — exactamente lo que este pipeline
-está diseñado para evitar.
+está diseñado para evitar. DDGS consume el endpoint JSON de noticias de
+DuckDuckGo (misma librería `ddgs` ya usada por
+`quanti_engine.search_financial_web`, ya pineada en requirements.txt) —
+no es scraping de HTML de portales de noticias individuales.
 
 V7 (auditoría "señal muerta" universal, post-fix-tz V6): dos fallos
 independientes que colapsaban NEWS_SENTIMENT_SCORE a 0.0 EXACTO pese al
@@ -79,7 +86,24 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import pandas as pd
 import requests  # Únicamente para el endpoint JSON de Finnhub — API nativa, NO scraping.
-import yfinance as yf
+
+# --- Búsqueda de noticias vía DDGS (DuckDuckGo) — reemplaza a yfinance.news
+# como fuente primaria, gratuita y sin API key (yfinance retirado por
+# completo del proyecto, ver services/market_data.py). Mismo import
+# defensivo (paquete renombrado `duckduckgo_search` -> `ddgs`) que ya usa
+# `quanti_engine.search_financial_web`; `ddgs` ya está pineado en
+# requirements.txt, cero dependencias nuevas.
+try:
+    from ddgs import DDGS
+except ImportError:  # pragma: no cover
+    try:
+        from duckduckgo_search import DDGS  # type: ignore[no-redef]
+    except ImportError:
+        DDGS = None  # type: ignore[assignment,misc]  # se valida en runtime, ver _fetch_headlines_ddg
+
+DDG_REGION = os.getenv("DDG_REGION", "es-es")
+DDG_SAFESEARCH = os.getenv("DDG_SAFESEARCH", "moderate")
+MAX_DDG_HEADLINES = 10  # techo por-ticker -- Finnhub complementa si esto no alcanza
 
 logger = logging.getLogger("kodaquant.data_pipeline")
 
@@ -173,7 +197,7 @@ _RETRY_BACKOFF_SECONDS = 1.5
 # compute_sentiment_score en train_kodaquant_v5.py/quanti_engine.py — un
 # proxy de régimen/beta derivado 100% de precio, variable estructuralmente
 # distinta de esta, cero solapamiento de información): es que la cobertura
-# de prensa por-ticker vía yfinance/Finnhub es ESPORÁDICA en equity (pocos
+# de prensa por-ticker vía DDGS/Finnhub es ESPORÁDICA en equity (pocos
 # titulares/semana), así que la señal día a día alterna tramos planos
 # (relleno neutro) con saltos discretos cada vez que aterriza un titular —
 # exactamente el patrón de alta frecuencia que un BiLSTM aprende a
@@ -242,36 +266,37 @@ def _normalize_timestamp(ts_raw) -> Optional[datetime]:
         return None
 
 
-def _fetch_headlines_yfinance(ticker: str) -> list[dict]:
+def _fetch_headlines_ddg(ticker: str, max_results: int = MAX_DDG_HEADLINES) -> list[dict]:
     """
-    Fuente primaria — `yfinance.Ticker(ticker).news`: endpoint JSON nativo de
-    Yahoo Finance consumido internamente por la librería (sin scraping de
-    HTML, sin navegador headless). Soporta tanto el esquema plano legado
-    como el esquema anidado bajo "content" de yfinance >= 0.2.40.
+    Fuente primaria — búsqueda de noticias vía DDGS (`ddgs.news`, JSON nativo
+    de DuckDuckGo, sin scraping de portales individuales, sin API key).
+    Reemplaza 1:1 el rol de `yfinance.Ticker(ticker).news` (retirado, ver
+    services/market_data.py): misma firma de retorno (`title`/`published_at`),
+    mismo lugar en `fetch_recent_headlines` (primaria, Finnhub complementa).
     """
+    if DDGS is None:
+        logger.warning("DDGS no instalado (`pip install ddgs`) -- fuente primaria de noticias deshabilitada; solo Finnhub (si hay API key).")
+        return []
+
+    # Cripto: "-USD" es la convención de símbolo de todo el proyecto
+    # (REGIME_TICKERS/MACRO_SYMBOL_MAP), no específica de ningún proveedor
+    # -- se usa solo el símbolo base (ej. "BTC") para una query de noticias
+    # más natural que "BTC-USD".
+    query = f"{ticker.split('-')[0]} crypto" if _is_crypto_ticker(ticker) else f"{ticker} stock"
+
     try:
-        raw = yf.Ticker(ticker).news or []
-    except Exception as exc:  # noqa: BLE001 — red/HTTP transitorio de Yahoo
-        logger.warning("yfinance.news falló para %s: %r", ticker, exc)
+        with DDGS() as ddgs:
+            raw = list(
+                ddgs.news(query, region=DDG_REGION, safesearch=DDG_SAFESEARCH, max_results=max_results)
+            )
+    except Exception as exc:  # noqa: BLE001 -- red/HTTP transitorio de DDG
+        logger.warning("DDGS.news falló para %s: %r", ticker, exc)
         return []
 
     headlines = []
     for item in raw:
-        # `item.get("content", item)` devuelve `None` (no `item`) si la clave
-        # "content" EXISTE pero vale None (variante de esquema observada en
-        # algunas respuestas de yfinance) -> `.get()` sobre None revienta con
-        # AttributeError, no capturado por el try/except de arriba (que solo
-        # envuelve la llamada de red), abortando TODO el ticker en vez de
-        # degradar ese titular puntual. `or item` cubre ambos casos (clave
-        # ausente Y clave presente-pero-None).
-        content = item.get("content") or item
-        title = content.get("title") or content.get("summary") or ""
-        ts_raw = (
-            content.get("pubDate")
-            or item.get("providerPublishTime")
-            or content.get("providerPublishTime")
-        )
-        published_at = _normalize_timestamp(ts_raw)
+        title = (item.get("title") or "").strip()
+        published_at = _normalize_timestamp(item.get("date"))
         if title and published_at is not None:
             headlines.append({"title": title, "published_at": published_at})
     return headlines
@@ -282,7 +307,7 @@ def _is_crypto_ticker(ticker: str) -> bool:
     Heurística deliberadamente auto-contenida (sin importar `REGIME_TICKERS`
     de quanti_engine.py/train_kodaquant_v5.py: SON quienes importan
     data_pipeline.py, importar en sentido inverso crearía un ciclo). La
-    convención de yfinance para cripto es SIEMPRE '<SÍMBOLO>-USD'
+    convención de todo el proyecto para cripto es SIEMPRE '<SÍMBOLO>-USD'
     (BTC-USD, ETH-USD); ningún ticker de equity/ETF del universo entrenado
     usa ese sufijo -> heurística exacta y suficiente para este propósito.
     """
@@ -293,7 +318,7 @@ def _fetch_headlines_finnhub(ticker: str, lookback_days: int = NEWS_LOOKBACK_DAY
     """
     Fallback — API REST gratuita de Finnhub, JSON puro, sin scraping.
     Requiere `FINNHUB_API_KEY` en el entorno; si falta, se omite
-    silenciosamente (yfinance sigue siendo la fuente primaria y suficiente
+    silenciosamente (DDGS sigue siendo la fuente primaria y suficiente
     en la mayoría de los casos).
 
     V6 (auditoría "señal muerta" `crypto_specialist`, NEWS_SENTIMENT_SCORE
@@ -357,11 +382,11 @@ def _fetch_headlines_finnhub(ticker: str, lookback_days: int = NEWS_LOOKBACK_DAY
 
 def fetch_recent_headlines(ticker: str) -> list[dict]:
     """
-    Orquesta ambas fuentes nativas (yfinance -> Finnhub) y deduplica por
-    título. yfinance es la fuente primaria (no exige API key); Finnhub
-    complementa cobertura solo cuando yfinance devuelve pocos titulares.
+    Orquesta ambas fuentes nativas (DDGS -> Finnhub) y deduplica por
+    título. DDGS es la fuente primaria (no exige API key); Finnhub
+    complementa cobertura solo cuando DDGS devuelve pocos titulares.
     """
-    headlines = _fetch_headlines_yfinance(ticker)
+    headlines = _fetch_headlines_ddg(ticker)
     if len(headlines) < 5:
         headlines += _fetch_headlines_finnhub(ticker)
 
@@ -453,7 +478,8 @@ def get_daily_news_sentiment(
 
     # FIX: pandas 3.x ya no fuerza datetime64[ns] en todos lados -- conserva
     # la resolución de origen de cada Serie (target_index puede venir en
-    # [us] de yfinance, "date" en [s] desde el parseo de published_at).
+    # [us] del feed de mercado (Twelve Data/Stooq, ver services/market_data.py),
+    # "date" en [s] desde el parseo de published_at).
     # merge_asof exige que ambas claves compartan EXACTAMENTE el mismo
     # dtype, si no: "incompatible merge keys ... must be the same type".
     # Se normalizan ambas a [ns] explícitamente antes de mergear.
