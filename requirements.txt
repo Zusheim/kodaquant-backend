@@ -151,7 +151,18 @@ click==8.4.2
 deprecation==2.1.0
 packaging==26.2
 platformdirs==4.10.0
-setuptools==83.0.0
+# FIX 2026-08-15 (RONDA 3) -- ResolutionImpossible real en el build de HF:
+# `torch==2.11.0` exige `setuptools<82` (verificado en el METADATA real
+# del wheel: `Requires-Dist: setuptools<82`) contra el `setuptools==83.0.0`
+# que este archivo pineaba -- dos pines `==`/`<` mutuamente excluyentes
+# del mismo paquete, exactamente la misma clase de conflicto que ya se
+# documentó arriba para `pydantic_core`/`spaces`. Se destina el pin acá
+# por la misma razón: dejar que pip resuelva la versión de `setuptools`
+# más alta que satisfaga TODOS los constraints reales (torch incluido)
+# en vez de fijar un número que choca apenas cambie cualquiera de los dos
+# extremos. Nada de este proyecto depende de una versión exacta de
+# `setuptools` -- es pura herramienta de build para paquetes con
+# `setup.py` legacy en la cadena de dependencias.
 six==1.17.0
 StrEnum==0.4.15
 wheel==0.47.0
