@@ -219,6 +219,12 @@ EPOCHS = 100
 VALIDATION_SPLIT = 0.1
 HUBER_DELTA = 1.0
 
+# Lote para inferencia final masiva (predict + GradientTape en evaluate_asset,
+# extract_temporal_attention y compute_feature_attribution). Acota el pico de RAM
+# del backward pass de EinsumDense en el runner CPU de CI (~7GB) sin tocar la
+# lógica matemática: es puramente una estrategia de inyección al modelo.
+EVAL_BATCH_SIZE = 256
+
 GAMMA_INITIAL = 0.0
 GAMMA_MAX = 1.5
 GAMMA_WARMUP_EPOCHS = 35
@@ -1226,9 +1232,10 @@ def train_model(model: keras.Model, X_train, asset_id_train, y_train,
 # ============================================================
 # FASE D: EVALUACIÓN — RECONSTRUCCIÓN DE PRECIOS + DIRECTIONAL ACCURACY
 # ============================================================
-def evaluate_asset(model: keras.Model, test: dict, ticker: str, target_scaler: StandardScaler) -> dict:
+def evaluate_asset(model: keras.Model, test: dict, ticker: str, target_scaler: StandardScaler,
+                    batch_size: int = EVAL_BATCH_SIZE) -> dict:
     asset_id_col = test["asset_id"].reshape(-1, 1)
-    y_pred_scaled = model.predict([test["X"], asset_id_col], verbose=0)
+    y_pred_scaled = model.predict([test["X"], asset_id_col], verbose=0, batch_size=batch_size)
     mu_scaled = y_pred_scaled[:, 0:1]
     r_hat = target_scaler.inverse_transform(mu_scaled).flatten()
     r_true = target_scaler.inverse_transform(test["y"]).flatten()
@@ -1251,35 +1258,68 @@ FEATURE_NAMES = ["LOG_RETURN_1D"] + TECH_COLS + MACRO_TICKERS  # orden exacto de
 
 
 def compute_feature_attribution(model: keras.Model, X_test: np.ndarray, asset_id_test: np.ndarray,
-                                  feature_names: list[str] = FEATURE_NAMES) -> pd.Series:
+                                  feature_names: list[str] = FEATURE_NAMES,
+                                  batch_size: int = EVAL_BATCH_SIZE) -> pd.Series:
     """
     Atribución por gradiente |∂ŷ/∂x| promediada sobre timesteps y muestras. NO son los pesos
     de BahdanauAttention (esos ponderan PASOS TEMPORALES, no canales de feature) — esta es la
     métrica correcta para cuantificar cuánto responde la salida a NEWS_SENTIMENT_SCORE frente
     a las otras 16 variables del tensor.
+
+    Batch inference (Requisito de Oro): el forward+backward de EinsumDense sobre las >4000
+    muestras de X_test_all en un solo pase saturaba la RAM del runner CPU (ResourceExhaustedError).
+    Aquí se trocea X_test en chunks lógicos de `batch_size` filas, se abre un GradientTape
+    independiente por chunk y se ACUMULA la suma (no el promedio) de |∂ŷ/∂x| sobre
+    (muestras, timesteps). Al final se normaliza dividiendo por (N_muestras * T_timesteps),
+    que es exactamente la misma normalización que keras.ops.mean(axis=(0,1)) aplicaba sobre
+    el tensor completo. Resultado matemáticamente idéntico al cálculo en un solo batch —ningún
+    dato se trunca ni se descarta—, salvo el reordenamiento de sumas de punto flotante inherente
+    a cualquier reducción por chunks (diferencia en el orden de ~1e-7, irrelevante en magnitud
+    frente a los propios gradientes).
     """
     import tensorflow as tf
 
-    x_tensor = tf.convert_to_tensor(X_test, dtype=tf.float32)
-    asset_tensor = tf.convert_to_tensor(asset_id_test.reshape(-1, 1), dtype=tf.int32)
+    n_samples, n_timesteps = X_test.shape[0], X_test.shape[1]
+    n_channels = X_test.shape[2]
+    grad_abs_sum = np.zeros(n_channels, dtype=np.float64)
 
-    with tf.GradientTape() as tape:
-        tape.watch(x_tensor)
-        preds = model([x_tensor, asset_tensor], training=False)
-    grads = tape.gradient(preds, x_tensor)
+    for start in range(0, n_samples, batch_size):
+        end = min(start + batch_size, n_samples)
 
-    mean_abs_grad = keras.ops.convert_to_numpy(keras.ops.mean(keras.ops.abs(grads), axis=(0, 1)))
+        x_chunk = tf.convert_to_tensor(X_test[start:end], dtype=tf.float32)
+        asset_chunk = tf.convert_to_tensor(
+            asset_id_test[start:end].reshape(-1, 1), dtype=tf.int32
+        )
+
+        with tf.GradientTape() as tape:
+            tape.watch(x_chunk)
+            preds_chunk = model([x_chunk, asset_chunk], training=False)
+        grads_chunk = tape.gradient(preds_chunk, x_chunk)
+
+        # Suma parcial (sin promediar todavía) sobre (muestras, timesteps) del chunk.
+        chunk_sum = keras.ops.convert_to_numpy(
+            keras.ops.sum(keras.ops.abs(grads_chunk), axis=(0, 1))
+        )
+        grad_abs_sum += chunk_sum.astype(np.float64)
+
+        # Libera explícitamente activaciones/gradientes del chunk antes del siguiente lote.
+        del x_chunk, asset_chunk, preds_chunk, grads_chunk, tape
+
+    mean_abs_grad = grad_abs_sum / (n_samples * n_timesteps)
     return pd.Series(mean_abs_grad, index=feature_names, name="mean_abs_gradient").sort_values(ascending=False)
 
 
-def extract_temporal_attention(model: keras.Model, X_test: np.ndarray, asset_id_test: np.ndarray) -> np.ndarray:
+def extract_temporal_attention(model: keras.Model, X_test: np.ndarray, asset_id_test: np.ndarray,
+                                 batch_size: int = EVAL_BATCH_SIZE) -> np.ndarray:
     """Pesos reales de BahdanauAttention por PASO TEMPORAL (diagnóstico complementario, no por feature)."""
     attention_extractor = keras.Model(
         inputs=model.inputs,
         outputs=model.get_layer("bahdanau_attention").output[1],
         name="attention_extractor",
     )
-    weights = attention_extractor.predict([X_test, asset_id_test.reshape(-1, 1)], verbose=0)
+    weights = attention_extractor.predict(
+        [X_test, asset_id_test.reshape(-1, 1)], verbose=0, batch_size=batch_size
+    )
     return weights.squeeze(-1)
 
 
@@ -1428,7 +1468,7 @@ def run_regime_pipeline(regime_name: str, regime_cfg: dict) -> dict:
 
     X_test_all = np.concatenate([test_sets[t]["X"] for t in tickers], axis=0)
     asset_id_test_all = np.concatenate([test_sets[t]["asset_id"] for t in tickers], axis=0)
-    attribution = compute_feature_attribution(model, X_test_all, asset_id_test_all)
+    attribution = compute_feature_attribution(model, X_test_all, asset_id_test_all, batch_size=EVAL_BATCH_SIZE)
     logger.info("      Atribución por gradiente (|∂ŷ/∂x|) — top 5 de 17 variables:")
     for feat, val in attribution.head(5).items():
         marker = "  <- NEWS_SENTIMENT_SCORE" if feat == "NEWS_SENTIMENT_SCORE" else ""
