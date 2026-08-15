@@ -80,6 +80,189 @@ peewee==4.1.1
 # not touched by the Gradio conflict) ---------------------------------
 numpy==2.5.1
 pandas==3.0.3
+# pyarrow -- engine de parquet para pandas (df.to_parquet/read_parquet, ver
+# download_all en train_kodaquant_v5.py). pandas por si solo no trae ningun
+# engine de parquet; sin esto, to_parquet() falla con ImportError. 25.0.1 =
+# ultimo estable, wheels cp312 nativos, exige numpy>=1.21.2 (satisfecho por
+# el pin arriba).
+pyarrow==25.0.1
+scikit-learn==1.6.1
+keras==3.15.1
+tensorflow>=2.16.1,<2.21
+# matplotlib -- graficas de evaluacion del modelo en train_kodaquant_v5.py
+# (ml_engine/). 3.11.1 = ultimo estable, wheels cp312 nativos, compatible
+# con numpy==2.5.1 fijado arriba.
+matplotlib==3.11.1
+# yfinance / multitasking / curl_cffi RETIRADOS (migración a Twelve Data +
+# fallback Stooq, ver services/market_data.py — bloqueos recurrentes de
+# Yahoo Finance en producción). El nuevo proveedor solo necesita `requests`
+# (ya pineado más abajo en la sección HTTP/networking), cero dependencias
+# nuevas.
+
+# --- LLM / search --------------------------------------------------------
+groq>=0.31.0,<2.0.0
+ddgs>=9.0.0
+
+# --- NLP / Sentimiento (FinBERT) ------------------------------------------
+# FIX 2026-08-15 -- el conflicto que documentaba esta nota (transformers
+# exigía huggingface-hub<1.0 frente al huggingface-hub>=1.16.0,<2.0 de
+# gradio[oauth,mcp]==6.22.0) queda OBSOLETO: ese pin `<1.0` era propio de
+# la serie transformers 4.x. Verificado en vivo contra PyPI (agosto 2026):
+# transformers 5.15.0 declara `huggingface-hub<2.0,>=1.5.0` -- intersecta
+# sin conflicto con el `>=1.16.0,<2.0` de gradio (resuelve a la última
+# versión compatible de huggingface-hub dentro de ese rango; NO se pinea
+# acá a propósito, mismo criterio que pydantic_core más arriba: pinear
+# ambos extremos por separado es la forma más rápida de recrear un
+# conflicto nuevo si cualquiera de los dos paquetes ajusta su rango).
+#
+# FIX 2026-08-15 (RONDA 2) -- HF rechazó el build con "torch version in
+# requirements.txt is not compatible with ZeroGPU. Supported versions:
+# 2.11.0, 2.10.0, 2.9.1, 2.8.0". El pin anterior (`torch==2.13.0+cpu` +
+# `--extra-index-url .../whl/cpu`) tenía DOS problemas reales, no uno:
+#   1. 2.13.0 no está en la whitelist que el validador de ZeroGPU chequea
+#      de forma ESTÁTICA contra este archivo (nunca llega a instalarse,
+#      el error es previo al build).
+#   2. Ese validador espera el wheel CUDA real de PyPI (el que trae la
+#      Space cuando el hardware asignado es un ZeroGPU real) -- el índice
+#      CPU-only (`+cpu`, sin `nvidia-*-cu12`) es exactamente el paquete
+#      "liviano" que la optimización anterior buscaba a propósito, pero
+#      es justo lo que ZeroGPU no reconoce como compatible con su propio
+#      mecanismo de asignación dinámica de GPU (`spaces` parchea
+#      `torch.cuda` en tiempo de import; un build sin CUDA no tiene qué
+#      parchear). Se elimina el `--extra-index-url` por completo y se
+#      pinea la ÚLTIMA versión de la whitelist (2.11.0) del índice
+#      DEFAULT de PyPI -- el wheel real, tal como ZeroGPU lo espera.
+#      `_get_finbert_pipeline()` en data_pipeline.py sigue haciendo el
+#      import de torch de forma perezosa y DESPUÉS de que `import spaces`
+#      ya corrió en main.py -- el orden que exige ZeroGPU (`spaces` antes
+#      que cualquier import de torch) sigue respetado sin tocar nada ahí.
+#      Sin costo real: este Space es gratuito bajo el tier ZeroGPU
+#      (hardware compartido, cupo dinámico) -- no hay tarjeta ni pago
+#      involucrado por instalar el wheel CUDA completo.
+torch==2.11.0
+transformers==5.15.0
+
+# --- Parsing / scraping ---------------------------------------------------
+beautifulsoup4==4.15.0
+lxml==6.1.1
+html5lib==1.1
+soupsieve==2.8.4
+webencodings==0.5.1
+
+# --- Email -----------------------------------------------------------------
+aiosmtplib>=3.0.0
+
+# --- Misc / packaging -------------------------------------------------
+python-dotenv==1.2.2
+python-dateutil==2.9.0.post0
+pytz==2026.2
+PyYAML>=6.0.3,<7.0
+click==8.4.2
+deprecation==2.1.0
+packaging==26.2
+platformdirs==4.10.0
+# FIX 2026-08-15 (RONDA 3) -- ResolutionImpossible real en el build de HF:
+# `torch==2.11.0` exige `setuptools<82` (verificado en el METADATA real
+# del wheel: `Requires-Dist: setuptools<82`) contra el `setuptools==83.0.0`
+# que este archivo pineaba -- dos pines `==`/`<` mutuamente excluyentes
+# del mismo paquete, exactamente la misma clase de conflicto que ya se
+# documentó arriba para `pydantic_core`/`spaces`. Se destina el pin acá
+# por la misma razón: dejar que pip resuelva la versión de `setuptools`
+# más alta que satisfaga TODOS los constraints reales (torch incluido)
+# en vez de fijar un número que choca apenas cambie cualquiera de los dos
+# extremos. Nada de este proyecto depende de una versión exacta de
+# `setuptools` -- es pura herramienta de build para paquetes con
+# `setup.py` legacy en la cadena de dependencias.
+six==1.17.0
+StrEnum==0.4.15
+wheel==0.47.0# --- Web framework (bounds mirror what gradio==6.22.0 itself requires,
+# since HF's Gradio SDK auto-installs it alongside this file) -------------
+fastapi>=0.115.2,<1.0
+starlette>=1.0.1,<2.0
+uvicorn>=0.32.0,<1.0
+uvloop==0.22.1
+httptools==0.8.0
+watchfiles==1.2.0
+websockets==15.0.1
+h11==0.16.0
+h2==4.3.0
+hpack==4.2.0
+hyperframe==6.1.0
+anyio>=4.14.1,<5.0
+
+# --- Data validation / settings -------------------------------------------
+# Range narrowed to what gradio[mcp]==6.22.0 itself requires
+# (pydantic>=2.11.10,<=2.12.5) — ZeroGPU pulls in the mcp extra, whose
+# pydantic bound is tighter than gradio's own base <=3.0.
+pydantic>=2.11.10,<=2.12.5
+# pydantic_core intentionally NOT pinned here: it must match pydantic's
+# own exact internal requirement. Pinning both and then loosening only
+# pydantic re-creates the same class of conflict this file just fixed.
+pydantic-settings==2.14.2
+annotated-types==0.7.0
+typing-inspection==0.4.2
+typing_extensions>=4.16.0,<5.0
+email-validator==2.3.0
+
+# --- HTTP / networking -----------------------------------------------------
+httpx>=0.28.1,<1.0
+httpcore==1.0.9
+requests==2.34.2
+urllib3==2.7.0
+certifi==2026.6.17
+idna==3.18
+charset-normalizer==3.4.7
+dnspython==2.8.0
+yarl==1.24.2
+multidict==6.7.1
+propcache==0.5.2
+frozendict==2.4.7
+
+# --- Auth / security ---------------------------------------------------
+PyJWT==2.13.0
+cryptography==48.0.1
+cffi==2.0.0
+pycparser==3.0
+
+# --- Pagos ---------------------------------------------------------------
+stripe>=15.0,<16.0
+
+# --- ZeroGPU probe (gradio.Server nativo, ver main.py) -------------------
+# `spaces` NO se pinea acá a propósito: la plataforma de HF Spaces ya lo
+# fuerza a su propia versión en el build (ver el log de build: agrega
+# "spaces==X.Y.Z" al pip install además de este archivo). Pinearlo de
+# nuevo acá es un conflicto latente esperando pasar — ver la nota vieja
+# más abajo, que documentaba el mismo riesgo sin eliminarlo.
+#
+# CRÍTICO: este pin (6.22.0) DEBE coincidir exacto con `sdk_version` en
+# el front-matter YAML de README.md. HF inyecta `gradio[oauth,mcp]==<sdk_version>`
+# en el MISMO comando pip que procesa este archivo — si divergen, pip recibe
+# dos pines `==` mutuamente excluyentes del mismo paquete y falla con
+# ResolutionImpossible de inmediato (no es un conflicto de grafo real, es
+# un doble pin). Root cause del build fallido del 2026-08-12 (commit 6dcbbd6):
+# no existía README.md, así que HF usaba su default de plataforma (6.23.1)
+# mientras este archivo fijaba 6.22.0.
+gradio[oauth,mcp]==6.22.0
+
+# --- Database / Supabase -------------------------------------------------
+supabase==2.31.0
+supabase-auth==2.31.0
+supabase-functions==2.31.0
+postgrest==2.31.0
+realtime==2.31.0
+storage3==2.31.0
+peewee==4.1.1
+
+# --- Data / ML / forecasting (fixed — critical for the predictive models,
+# not touched by the Gradio conflict) ---------------------------------
+numpy==2.5.1
+pandas==3.0.3
+# pyarrow -- engine de parquet para pandas (df.to_parquet/read_parquet, ver
+# download_all en train_kodaquant_v5.py). pandas por si solo no trae ningun
+# engine de parquet; sin esto, to_parquet() falla con ImportError. 25.0.1 =
+# ultimo estable, wheels cp312 nativos, exige numpy>=1.21.2 (satisfecho por
+# el pin arriba).
+pyarrow==25.0.1
 scikit-learn==1.6.1
 keras==3.15.1
 tensorflow>=2.16.1,<2.21
