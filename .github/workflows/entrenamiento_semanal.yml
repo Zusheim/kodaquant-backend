@@ -17,6 +17,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      # NUEVO: libera espacio en disco ANTES de instalar dependencias --
+      # root cause de "[Errno 28] No space left on device": TensorFlow +
+      # CUDA + torch no entran junto a las herramientas preinstaladas
+      # (Android SDK, .NET, Haskell/GHC) que el runner ubuntu-latest trae
+      # por defecto y este pipeline nunca usa. swap-storage desactivado
+      # (solo genera warnings, no libera espacio real relevante acá).
+      - name: Liberar espacio en disco del runner
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -41,7 +58,10 @@ jobs:
           # para compat con el validador ZeroGPU de HF. Instalarlos sueltos
           # acá (como antes) los sobrescribía con versiones sin pinear,
           # deshaciendo esos fixes en cada corrida de entrenamiento.
-          pip install -r requirements.txt
+          # --no-cache-dir -- NUEVO: el cache de pip (wheels descargados)
+          # ocupaba espacio real de disco además de TensorFlow/torch/CUDA
+          # ya instalados -- root cause de "No space left on device".
+          python -m pip install --no-cache-dir -r requirements.txt
 
       - name: Ejecutar script de entrenamiento
         env:
