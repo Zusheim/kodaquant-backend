@@ -1,6 +1,8 @@
 from dotenv import load_dotenv
 import asyncio
+import contextlib
 import logging
+import threading
 import time
 load_dotenv()
 from fastapi import Depends, HTTPException, Request
@@ -40,6 +42,11 @@ from core.config import settings
 
 logger = logging.getLogger("kodaquant.main")
 
+# NOTA: `lifespan` NO se pasa acá (`Server(lifespan=...)`) a propósito —
+# `Blocks.launch()`/`App.create_app()` lo pisa igual que a `@app.on_event`
+# (ver el bloque de comentarios "RONDA 4" junto al probe de ZeroGPU, más
+# abajo). El único punto que gradio realmente respeta es
+# `app.launch(app_kwargs={"lifespan": lifespan})` en app.py.
 app = Server(title="KodaQuant Terminal", version="4.0")
 app.include_router(payments_router)
 app.include_router(auth_router, prefix="/api/v1/auth")
@@ -270,36 +277,96 @@ async def _json_unhandled_exception_handler(request: Request, exc: Exception):
 def _zerogpu_probe() -> str:
     return "ok"
 
-@app.on_event("startup")
-async def _log_asgi_startup() -> None:
+
+# FIX 2026-08-15 (RONDA 4) — CAUSA RAÍZ REAL del estado zombi "Starting...".
+#
+# Auditoría línea a línea de gradio==6.22.0 (gradio/routes.py::App.create_app,
+# gradio/blocks.py::Blocks.launch, gradio/server.py::Server.launch):
+#
+#   Server.launch()  ->  blocks.launch(_app=self, app_kwargs=app_kwargs, ...)
+#   Blocks.launch()  ->  App.create_app(self, app=_app, app_kwargs=app_kwargs, ...)
+#   App.create_app(): como `app` (=self, nuestra instancia YA construida)
+#     NO es None, toma la rama:
+#         app.router.lifespan_context = create_lifespan_handler(
+#             app_kwargs.get("lifespan", None), *delete_cache
+#         )
+#
+# Esa línea PISA `app.router.lifespan_context` con un handler construido a
+# partir de `app_kwargs` — el dict que se le pasa a `.launch()`, NUNCA el
+# `lifespan=` que se le pasó al CONSTRUCTOR `Server(...)`. Como `app.py`
+# (rondas 1-3) llamaba `app.launch()` sin `app_kwargs`, `app_kwargs.get(
+# "lifespan")` daba `None` -> el lifespan real quedaba DESCARTADO en
+# silencio. Y como `router.lifespan_context` se reasigna DIRECTO (no se
+# compone con la implementación default de Starlette que sí lee
+# `router.on_startup`), cualquier `@app.on_event("startup")` registrado
+# antes de `.launch()` (como el que vivía acá) también queda huérfano —
+# explica exacto por qué "KodaQuant ASGI startup complete" NUNCA aparecía
+# en los logs de producción pese a que el resto del pipeline sí corría.
+#
+# FIX REAL: el lifespan tiene que viajar como `app_kwargs={"lifespan": lifespan}`
+# en la LLAMADA a `.launch()` (ver app.py) — es el ÚNICO punto de la cadena
+# que `create_app` efectivamente respeta. `lifespan` se define acá y se
+# exporta para que app.py lo importe.
+def _warm_zerogpu_probe_sync() -> None:
+    """
+    Red de seguridad INDEPENDIENTE de todo el ciclo de vida ASGI/Gradio de
+    arriba: corre en un hilo daemon disparado en el momento del IMPORT de
+    este módulo — mucho antes de que exista `router`/`lifespan_context`
+    alguno para pisar. Garantiza al menos una ejecución real de
+    `_zerogpu_probe` durante el arranque del proceso sin importar qué haga
+    `Server.launch()` internamente ni qué versión de gradio la sirva.
+    """
+    try:
+        result = _zerogpu_probe()
+        logger.info("ZeroGPU probe warm-up OK (hilo de import, red de seguridad): %s", result)
+    except Exception as exc:
+        logger.warning("ZeroGPU probe warm-up (hilo de import) falló (no crítico): %r", exc)
+
+
+threading.Thread(
+    target=_warm_zerogpu_probe_sync, daemon=True, name="zerogpu-warmup-import"
+).start()
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    """
+    Lifespan real de la app — DEBE inyectarse vía
+    `app.launch(app_kwargs={"lifespan": lifespan})` en app.py (ver bloque
+    de comentarios arriba). Pasarlo al constructor `Server(lifespan=...)`
+    o registrar `@app.on_event("startup")` NO alcanza: ambos caminos son
+    pisados por `Blocks.launch()`/`App.create_app()` antes de que el
+    Space quede realmente sirviendo tráfico.
+    """
     # Uvicorn solo loguea el genérico "Application startup complete.". Este
     # marcador con timestamp deja explícito en los logs del Space cuánto
     # tardó el cold start real (imports de TensorFlow/Keras + montaje de
     # gradio) — clave para diferenciar "todo bien, algo externo mandó
     # SIGTERM" de "el arranque fue tan lento que algo lo mató por timeout".
-    # Ver app.py: el launcher ahora sobrevive a cualquiera de los dos casos,
-    # pero esta línea ayuda a confirmar cuál está pasando si vuelve a fallar.
     logger.info("KodaQuant ASGI startup complete — rutas + probe de ZeroGPU montados.")
 
-    async def _warm_zerogpu_probe() -> None:
-        # FIX 2026-08-15 — "Starting..." colgado en el dashboard de HF.
-        # Registrar `_zerogpu_probe` con `@app.api()`/`@spaces.GPU()` no
-        # basta en todos los casos: el hypervisor de ZeroGPU necesita ver
-        # al menos UNA ejecución real durante el boot para marcar el Space
-        # como "Running", no le alcanza con que la función solo exista en
-        # la tabla de endpoints. Fire-and-forget con timeout: si ZeroGPU no
-        # responde o el tier actual no lo tiene habilitado, esto NUNCA debe
-        # retrasar ni tumbar "Application startup complete".
+    async def _warm_zerogpu_probe_async() -> None:
+        # Segunda ejecución del probe, esta vez DENTRO del ciclo de vida
+        # ASGI real (útil si el hilo de import de arriba corrió antes de
+        # que `device-api.zero` estuviera listo para recibirlo). Fire-and-
+        # forget con timeout: si ZeroGPU no responde o el tier actual no lo
+        # tiene habilitado, esto NUNCA debe retrasar ni tumbar el arranque.
         try:
             loop = asyncio.get_running_loop()
             result = await asyncio.wait_for(
                 loop.run_in_executor(None, _zerogpu_probe), timeout=15.0
             )
-            logger.info("ZeroGPU probe warm-up OK: %s", result)
+            logger.info("ZeroGPU probe warm-up OK (lifespan ASGI): %s", result)
         except Exception as exc:
-            logger.warning("ZeroGPU probe warm-up falló (no crítico): %r", exc)
+            logger.warning("ZeroGPU probe warm-up (lifespan ASGI) falló (no crítico): %r", exc)
 
-    asyncio.create_task(_warm_zerogpu_probe())
+    warmup_task = asyncio.create_task(_warm_zerogpu_probe_async())
+    try:
+        yield
+    finally:
+        warmup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await warmup_task
 
 @app.get("/")
 async def root():

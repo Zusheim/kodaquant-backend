@@ -20,15 +20,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # FIX: numpy==2.5.1 exige Python>=3.12 (root cause del build fallido).
+          # 3.12 ya es el runtime real del HF Space (ver python_version en
+          # sync_huggingface.yml) -- esto solo alinea train/serve parity.
+          python-version: '3.12'
 
       - name: Cache pip dependencies
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-pip-3.12-${{ hashFiles('requirements.txt') }}
           restore-keys: |
-            ${{ runner.os }}-pip-
+            ${{ runner.os }}-pip-3.12-
 
       - name: Install dependencies
         run: |
@@ -80,3 +83,24 @@ jobs:
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
           commit_author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
+
+      # NUEVO: push directo a HF -- NO depende del `on: push` de
+      # sync_huggingface.yml, porque el commit de arriba usa GITHUB_TOKEN y
+      # GitHub NO dispara otros workflows con ese token (evita loops
+      # infinitos). Sin este step, los pesos nunca llegaban a HF solos.
+      - name: Publicar pesos del modelo en Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          pip install -U "huggingface_hub[cli]"
+
+          # <-- SUSTITUIR: "Zusheim/kodaquant-backend" por tu repo_id de destino en HF.
+          # --repo-type: "model" si es un HF Model Repo separado, o "space"
+          # si quieres subir los pesos directo al mismo Space del backend
+          # (Zusheim/kodaquant-backend, ver sync_huggingface.yml).
+          # <-- SUSTITUIR: "services/kodaquant_models/" si tu ruta de artefactos difiere.
+          huggingface-cli upload tu-usuario/quanti-model \
+            services/kodaquant_models/ . \
+            --repo-type model \
+            --token "$HF_TOKEN" \
+            --commit-message "🤖 MLOps: sync pesos entrenados $(date -u +%Y-%m-%dT%H:%M:%SZ)"

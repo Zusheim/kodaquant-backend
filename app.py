@@ -1,23 +1,30 @@
 """
 Entrypoint de Hugging Face Spaces (app_file: app.py).
 
-ROUND 3 — se elimina el patrón `gr.mount_gradio_app` + supervisor de
-uvicorn manual (rondas 1 y 2). Ese patrón exportaba como `app` un FastAPI
-plano con Gradio montado como sub-app en un path escondido — el
-hypervisor de ZeroGPU nunca lo reconoce como demo Gradio nativo, sin
-importar qué hubiera adentro de esa sub-app ("No @spaces.GPU function
-detected during startup" persistente).
+ROUND 4 -- FIX del estado zombi "Starting..."/"Building..." permanente en
+el dashboard de HF (ver el bloque de comentarios "RONDA 4" en main.py,
+junto a `_zerogpu_probe`, para la auditoría completa línea a línea contra
+gradio==6.22.0).
 
-`main.app` ahora es un `gradio.Server` (ver main.py): un FastAPI real con
-las mismas rutas, CORS y middleware de KodaQuant, pero del tipo que
-Gradio/ZeroGPU reconocen nativamente. `.launch()` reemplaza al
-`uvicorn.run()` manual — ya no hay que bindear el puerto a mano, manejar
-Errno 98 ni reintentar ante OSError; Server.launch() maneja el ciclo de
-vida completo (y detecta el entorno de Spaces automáticamente, igual que
-Blocks.launch()).
+Resumen: `Server.launch()` (rondas 1-3) invocaba `app.launch()` SIN
+`app_kwargs`. Internamente, `Blocks.launch()` -> `App.create_app()`
+reasigna `app.router.lifespan_context` a partir de
+`app_kwargs.get("lifespan")` — nunca del `lifespan=` pasado al
+constructor `Server(...)` ni de ningún `@app.on_event("startup")`
+registrado antes de `.launch()`. Sin `app_kwargs={"lifespan": lifespan}`
+explícito ACÁ, el hook de arranque real (log de "ASGI startup complete" +
+warm-up del probe de ZeroGPU) queda descartado en silencio — causa raíz
+real de que el hypervisor de HF nunca viera la señal de arranque que
+esperaba y el Space quedara colgado en "Starting...".
+
+`main.app` sigue siendo un `gradio.Server` (FastAPI real que ZeroGPU
+reconoce nativamente, ver ROUND 3) — `.launch()` sigue reemplazando al
+`uvicorn.run()` manual, maneja el ciclo de vida completo y detecta el
+entorno de Spaces automáticamente. Lo único que cambia acá es el
+`app_kwargs={"lifespan": lifespan}` explícito.
 """
 
-from main import app
+from main import app, lifespan
 
 if __name__ == "__main__":
-    app.launch()
+    app.launch(app_kwargs={"lifespan": lifespan})

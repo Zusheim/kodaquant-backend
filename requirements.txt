@@ -1,3 +1,12 @@
+# --extra-index-url del build de CPU oficial de PyTorch -- declarado acá
+# arriba de todo (pip trata los flags de índice como opciones GLOBALES de
+# la corrida completa de `pip install -r`, sin importar en qué línea
+# aparezcan, pero se deja en el tope del archivo por legibilidad y para
+# no depender de esa semántica implícita). Ver sección "NLP / Sentimiento
+# (FinBERT)" más abajo para el detalle completo de por qué torch necesita
+# este índice en particular.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 # --- Web framework (bounds mirror what gradio==6.22.0 itself requires,
 # since HF's Gradio SDK auto-installs it alongside this file) -------------
 fastapi>=0.115.2,<1.0
@@ -93,13 +102,29 @@ tensorflow>=2.16.1,<2.21
 groq>=0.31.0,<2.0.0
 ddgs>=9.0.0
 
-# NOTA: torch/transformers (FinBERT) NO se instalan a propósito --
-# transformers exige huggingface-hub<1.0, gradio==6.22.0 exige
-# huggingface-hub>=1.16.0: conflicto real, ninguna versión de transformers
-# lo resuelve. `_score_text` en data_pipeline.py ya contempla esto -- ante
-# ImportError cae a NEUTRAL_SCORE por titular (no rompe el radar, solo
-# resigna el matiz de sentimiento de noticias). No agregar torch/transformers
-# de nuevo sin antes resolver ese conflicto de raíz (p.ej. bajar gradio).
+# --- NLP / Sentimiento (FinBERT) ------------------------------------------
+# FIX 2026-08-15 -- el conflicto que documentaba esta nota (transformers
+# exigía huggingface-hub<1.0 frente al huggingface-hub>=1.16.0,<2.0 de
+# gradio[oauth,mcp]==6.22.0) queda OBSOLETO: ese pin `<1.0` era propio de
+# la serie transformers 4.x. Verificado en vivo contra PyPI (agosto 2026):
+# transformers 5.15.0 declara `huggingface-hub<2.0,>=1.5.0` -- intersecta
+# sin conflicto con el `>=1.16.0,<2.0` de gradio (resuelve a la última
+# versión compatible de huggingface-hub dentro de ese rango; NO se pinea
+# acá a propósito, mismo criterio que pydantic_core más arriba: pinear
+# ambos extremos por separado es la forma más rápida de recrear un
+# conflicto nuevo si cualquiera de los dos paquetes ajusta su rango).
+#
+# `torch` va con el índice CPU-only oficial de PyTorch -- este runner ya
+# fuerza toda la inferencia Keras a CPU (ver [DEVICE GUARD] en
+# quanti_engine.py); instalar el wheel CUDA por defecto de PyPI arrastraría
+# varios GB de paquetes `nvidia-*-cu12` sin ningún uso real en este Space,
+# solo para inflar el build. `_get_finbert_pipeline()` en data_pipeline.py
+# ya hace el import de forma perezosa (dentro de la función, no a nivel de
+# módulo) y DESPUÉS de que `import spaces` ya corrió en main.py -- respeta
+# el orden que exige ZeroGPU (`spaces` antes que cualquier import de torch)
+# sin tener que reordenar nada. (Índice CPU declarado al tope del archivo.)
+torch==2.13.0+cpu
+transformers==5.15.0
 
 # --- Parsing / scraping ---------------------------------------------------
 beautifulsoup4==4.15.0

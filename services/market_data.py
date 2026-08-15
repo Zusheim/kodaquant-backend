@@ -852,6 +852,65 @@ def _fetch_symbol_ohlcv(
 # API pública -- consumida por services/quanti_engine.py
 # ---------------------------------------------------------------------------
 
+def _normalize_daily_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """
+    FIX 2026-08-15 (alineación 24/7 vs 5/5) -- normaliza un índice de
+    fechas a tz-naive con la hora puesta a medianoche.
+
+    Las 3 fuentes de este módulo NO garantizan el mismo dtype de índice:
+    Twelve Data (`_td_time_series`) pide `"timezone": "UTC"` y puede
+    devolver timestamps CON offset explícito (tz-aware) según el símbolo/
+    intervalo, mientras que FRED (`_fred_series_daily`) y Stooq
+    (`_stooq_daily_close`) siempre devuelven `pd.to_datetime(...)`
+    tz-naive. Un solo símbolo (target O macro) tz-aware colisionando
+    contra el otro tz-naive hace que `.reindex()` entre ambos falle en
+    TODAS las fechas (no solo fines de semana) -- indistinguible, en el
+    mensaje de error final, de un genuino hueco de historia. Se normaliza
+    ACÁ, en el borde de ingesta de cada símbolo, para que ninguna
+    comparación de índices aguas abajo pueda volver a pisar este bug.
+    """
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    return index.normalize()
+
+
+def _macro_close_ffilled_to_daily_calendar(macro_close: pd.Series, upto: pd.Timestamp) -> pd.Series:
+    """
+    FIX 2026-08-15 (alineación 24/7 vs 5/5) -- CAUSA RAÍZ real de
+    "ventana de features vacía" para BTC-USD/ETH-USD.
+
+    Cripto cotiza 24/7; los macro tickers (SPY/DGS10/XAU-USD/VIXY/UUP,
+    todos vía bolsas tradicionales) cotizan 5/5. El código anterior hacía
+    `macro_df["close"].reindex(out.index)` -- un reindex DIRECTO contra el
+    calendario de 7 días de cripto, que deja NaN en cada sábado/domingo
+    (el macro ticker simplemente no tiene fila esos días). El `.ffill()`
+    posterior sobre el DataFrame COMBINADO alcanza a tapar la mayoría de
+    esos huecos, pero CUALQUIER fila líder de `out.index` anterior a la
+    primera fecha del macro ticker (o cualquier huequito interno que el
+    ffill combinado no alcance a cubrir de forma determinista según el
+    orden de columnas) sobrevive como NaN -- y `dropna()` sobre el frame
+    completo basta para vaciarlo entero si eso golpea suficientes filas.
+
+    Fix real: upsamplear la serie del macro ticker a un calendario DIARIO
+    CORRIDO (freq="D", fin de semana incluido) y hacer forward-fill DENTRO
+    de esa serie -- ANTES de reindexarla contra el calendario 24/7 del
+    ticker objetivo. Así, el valor de un viernes de bolsa queda disponible
+    como el macro-input válido para sábado y domingo de cripto, sin
+    depender del orden ni de la suerte del ffill final sobre el frame ya
+    combinado. Nunca se hace `bfill` (relleno hacia atrás): eso sería fuga
+    de información (un valor FUTURO del macro ticker "explicando" un día
+    pasado) -- el único costo real de este fix es que los primeros días,
+    anteriores al primer dato macro disponible, siguen sin cobertura y se
+    recortan más abajo, exactamente igual que antes.
+    """
+    if macro_close.empty:
+        return macro_close
+    macro_close = macro_close[~macro_close.index.duplicated(keep="last")].sort_index()
+    calendar_end = max(macro_close.index.max(), upto)
+    daily_calendar = pd.date_range(macro_close.index.min(), calendar_end, freq="D")
+    return macro_close.reindex(daily_calendar).ffill()
+
+
 def fetch_feature_ohlcv(ticker: str, macro_tickers: list[str], min_sessions: int = DEFAULT_HISTORY_SESSIONS) -> pd.DataFrame:
     """
     Reemplazo directo del antiguo `yf.download(all_symbols, period="2y",
@@ -863,10 +922,26 @@ def fetch_feature_ohlcv(ticker: str, macro_tickers: list[str], min_sessions: int
         out[f"{ticker}_Low"]     -- Low diario (requerido por ATR_14)
         out[f"{ticker}_Volume"]  -- Volume diario (requerido por OBV_ROC_20)
         out[macro_ticker]        -- Close diario de cada factor macro
+
+    Ver `_macro_close_ffilled_to_daily_calendar` para el fix de alineación
+    24/7 (cripto) vs 5/5 (macro tickers) -- antes de esta fecha, este
+    mismo merge era la causa raíz real de
+    "'BTC-USD'/'ETH-USD': ventana de features vacía tras alinear con los
+    macro tickers" (ver logs de producción del 2026-08-15).
     """
     td_symbol = _resolve_td_symbol(ticker)
     stooq_symbol = _resolve_stooq_symbol(ticker)
     target_df = _fetch_symbol_ohlcv(ticker, td_symbol, stooq_symbol, min_sessions)
+
+    target_index = _normalize_daily_index(target_df.index)
+    target_index = target_index[~target_index.duplicated(keep="last")]
+    # Puede desordenar la serie si la fuente ya venía ordenada pero con
+    # timestamps tz-aware cuya normalización cambia el orden relativo en
+    # un caso límite (feriados con horario de cierre distinto) -- sort
+    # explícito, nunca asumido.
+    target_df = target_df.loc[~target_df.index.duplicated(keep="last")].copy()
+    target_df.index = _normalize_daily_index(target_df.index)
+    target_df = target_df.sort_index()
 
     out = pd.DataFrame(index=target_df.index)
     out[ticker] = target_df["close"]
@@ -874,14 +949,20 @@ def fetch_feature_ohlcv(ticker: str, macro_tickers: list[str], min_sessions: int
     out[f"{ticker}_Low"] = target_df["low"]
     out[f"{ticker}_Volume"] = target_df["volume"]
 
+    target_last_date = out.index.max() if not out.empty else pd.Timestamp.utcnow().normalize()
+
     for macro_ticker in macro_tickers:
         mapping = resolve_macro_symbol(macro_ticker)
         macro_df = _fetch_symbol_ohlcv(
             macro_ticker, mapping.get("twelvedata"), mapping.get("stooq"), min_sessions,
             fred_series_id=mapping.get("fred"),
         )
-        out[macro_ticker] = macro_df["close"].reindex(out.index)
+        macro_close = macro_df["close"].copy()
+        macro_close.index = _normalize_daily_index(macro_close.index)
+        macro_close_daily = _macro_close_ffilled_to_daily_calendar(macro_close, target_last_date)
+        out[macro_ticker] = macro_close_daily.reindex(out.index)
 
+    out = out.sort_index()
     out = out.ffill().dropna()
     if out.empty:
         raise ValueError(
