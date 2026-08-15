@@ -1,5 +1,5 @@
 # %%
-#!pip install yfinance nltk -q
+#!pip install nltk -q
 
 """
 train_kodaquant_v5.py — KodaQuant V5: Enrutamiento de Modelos Especialistas
@@ -103,7 +103,6 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from keras import layers
 from scipy.interpolate import CubicSpline
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -112,7 +111,31 @@ from sklearn.preprocessing import MinMaxScaler, StandardScaler
 # data_pipeline.py vive junto a este script (o en services/, ver sys.path
 # más abajo) — Requerimiento 1: pipeline NLP de sentimiento de noticias.
 sys.path.append(str(Path(__file__).resolve().parent))
+# services/ vive un nivel arriba (ver MODELS_ROOT más abajo) — ahí vive
+# market_data.py, single source of truth de proveedores/mapeo de símbolo
+# (Twelve Data + FRED + Stooq) que ya sirve el radar en producción.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "services"))
 from data_pipeline import get_daily_news_sentiment  # noqa: E402
+
+# V11 (FIX 2026-08-15) — yfinance RETIRADO por completo (ver requirements.txt).
+# Reemplazo: los mismos proveedores/mapeos de símbolo de
+# services/market_data.py (Twelve Data primaria, FRED para ^TNX, Stooq como
+# último recurso) — cero mapeo de símbolo paralelo/duplicado. Se importan los
+# primitivos de BAJO nivel (parametrizados por tamaño de historial) en vez
+# del wrapper `fetch_feature_ohlcv`/`_fetch_symbol_ohlcv`: ese wrapper está
+# tuneado para la ventana CORTA de inferencia que consume quanti_engine.py
+# (`DEFAULT_HISTORY_SESSIONS`, ~2y) — el entrenamiento necesita el historial
+# COMPLETO de `PERIOD` (10y) para construir el dataset supervisado.
+from market_data import (  # noqa: E402
+    FRED_API_KEY,
+    TWELVE_DATA_API_KEY,
+    _fred_series_daily,
+    _resolve_stooq_symbol,
+    _resolve_td_symbol,
+    _stooq_daily_close,
+    _td_time_series,
+    resolve_macro_symbol,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -297,8 +320,14 @@ keras.utils.set_random_seed(SEED)
 # ============================================================
 # FASE A: ETL — DESCARGA UNIFICADA (OHLCV) + FEATURE ENGINEERING POR ACTIVO
 # ============================================================
-MAX_DOWNLOAD_RETRIES = 5
-BACKOFF_BASE_SECONDS = 2.0
+# V11 -- sesiones/año objetivo para dimensionar `outputsize`/`tail_days` de
+# Twelve Data/Stooq/FRED según `PERIOD` ("10y") -- reemplaza a
+# MAX_DOWNLOAD_RETRIES/BACKOFF_BASE_SECONDS (yfinance): los reintentos ahora
+# viven DENTRO de cada primitivo de market_data.py (`_td_time_series`,
+# `_stooq_daily_close`, `_fred_series_daily`), no hace falta una capa extra acá.
+_HISTORY_SESSIONS_PER_YEAR = 252
+_HISTORY_BUFFER_SESSIONS = 60      # feriados / años bisiestos -- margen defensivo
+_TD_MAX_OUTPUTSIZE = 5000          # tope real del plan Basic de Twelve Data (ver market_data.py)
 # Smart Cache Invalidation — antigüedad máxima tolerada del .parquet cacheado
 # ANTES de forzarse la caché era válida indefinidamente mientras compilara el
 # set de columnas requeridas (ver `download_all`), sin importar cuán vieja
@@ -347,28 +376,99 @@ def purge_data_cache(data_dir: Path = DATA_DIR) -> None:
         logger.info("[purga CI/CD] FORCE_FRESH_DATA=True -> %s ya estaba vacío.", data_dir)
 
 
-def _download_with_backoff(symbols: list[str], period: str,
-                            max_retries: int = MAX_DOWNLOAD_RETRIES,
-                            backoff_base: float = BACKOFF_BASE_SECONDS) -> pd.DataFrame:
-    """Reintenta la descarga con backoff exponencial ante 429/timeouts transitorios."""
-    import time
+def _period_to_sessions(period: str) -> int:
+    """'10y' / '6mo' / '400d' -> nº de sesiones diarias objetivo, con margen."""
+    p = period.strip().lower()
+    if p.endswith("y"):
+        years = float(p[:-1])
+    elif p.endswith("mo"):
+        years = float(p[:-2]) / 12.0
+    elif p.endswith("d"):
+        years = float(p[:-1]) / 365.0
+    else:
+        raise ValueError(f"Formato de 'period' no soportado: '{period}'")
+    return int(round(years * _HISTORY_SESSIONS_PER_YEAR)) + _HISTORY_BUFFER_SESSIONS
 
-    last_exc: Exception | None = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            data = yf.download(symbols, period=period, auto_adjust=True, progress=False)
-            if data is None or data.empty:
-                raise ValueError("yfinance devolvió un DataFrame vacío")
-            return data
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt == max_retries:
-                break
-            wait_s = backoff_base * (2 ** (attempt - 1))
-            logger.warning("Descarga falló (intento %d/%d): %r — reintentando en %.0fs",
-                           attempt, max_retries, exc, wait_s)
-            time.sleep(wait_s)
-    raise RuntimeError(f"No se pudo descargar {symbols} tras {max_retries} intentos") from last_exc
+
+def _fetch_symbol_history(internal_key: str, td_symbol: str | None, stooq_symbol: str | None,
+                           sessions: int, fred_series_id: str | None = None) -> pd.DataFrame:
+    """
+    Historial COMPLETO (no la ventana corta de inferencia) para `internal_key`,
+    vía la MISMA cascada de proveedores que `market_data._fetch_symbol_ohlcv`
+    (FRED -> Twelve Data -> Stooq), pero con `sessions` real (10y) en vez del
+    `DEFAULT_HISTORY_SESSIONS` (~2y) fijo que ese wrapper usa para servir el
+    radar -- de ahí que acá se llame directo a los primitivos de bajo nivel.
+    """
+    df: pd.DataFrame | None = None
+
+    if fred_series_id and FRED_API_KEY:
+        fred_series = _fred_series_daily(fred_series_id, tail_days=sessions)
+        if fred_series is not None and not fred_series.empty:
+            df = pd.DataFrame({"close": fred_series})
+            df["open"] = df["high"] = df["low"] = df["close"]
+            df["volume"] = np.nan
+
+    if (df is None or df.empty) and td_symbol and TWELVE_DATA_API_KEY:
+        df = _td_time_series(td_symbol, outputsize=min(sessions, _TD_MAX_OUTPUTSIZE))
+
+    if (df is None or df.empty) and stooq_symbol:
+        series = _stooq_daily_close(stooq_symbol, tail_days=sessions)
+        if series is not None and not series.empty:
+            df = pd.DataFrame({"close": series})
+            df["open"] = df["high"] = df["low"] = df["close"]
+            df["volume"] = np.nan
+            logger.warning(
+                "'%s': historial de entrenamiento servido desde fallback Stooq -- "
+                "Open/High/Low replicados desde Close, Volume=NaN.", internal_key,
+            )
+
+    if df is None or df.empty:
+        fuentes = [n for n, v in (("FRED", fred_series_id), ("Twelve Data", td_symbol),
+                                   ("Stooq", stooq_symbol)) if v]
+        raise RuntimeError(
+            f"Sin historial de entrenamiento para '{internal_key}': todas las fuentes "
+            f"configuradas ({', '.join(fuentes) if fuentes else 'ninguna'}) fallaron."
+        )
+    return df
+
+
+def _fetch_all_symbols_flat(tickers: list[str], macro_tickers: list[str], period: str) -> pd.DataFrame:
+    """
+    Reemplazo directo de `yf.download(all_symbols, period=period,
+    auto_adjust=True)`: ensambla el MISMO layout ancho que ya consumía
+    `engineer_asset` -- `{ticker}_Open/High/Low/Close/Volume` por cada ticker
+    operable, `{macro}_Close` por cada factor macro (único campo que
+    `engineer_asset` lee de un macro ticker) -- vía Twelve Data/FRED/Stooq,
+    MISMOS mapeos de símbolo que sirven el radar en producción
+    (services/market_data.py, single source of truth).
+    """
+    sessions = _period_to_sessions(period)
+    pieces: list[pd.DataFrame] = []
+
+    for ticker in tickers:
+        df = _fetch_symbol_history(
+            ticker, _resolve_td_symbol(ticker), _resolve_stooq_symbol(ticker), sessions,
+        )
+        pieces.append(df[["open", "high", "low", "close", "volume"]].rename(columns={
+            "open": f"{ticker}_Open", "high": f"{ticker}_High", "low": f"{ticker}_Low",
+            "close": f"{ticker}_Close", "volume": f"{ticker}_Volume",
+        }))
+
+    for macro_ticker in macro_tickers:
+        mapping = resolve_macro_symbol(macro_ticker)
+        df = _fetch_symbol_history(
+            macro_ticker, mapping.get("twelvedata"), mapping.get("stooq"), sessions,
+            fred_series_id=mapping.get("fred"),
+        )
+        pieces.append(df[["close"]].rename(columns={"close": f"{macro_ticker}_Close"}))
+
+    # outer join real por fecha -- preserva calendarios distintos entre
+    # cripto (24/7) y equity/macro (días hábiles), igual que el índice
+    # combinado que yf.download devolvía para un batch multi-símbolo.
+    flat = pd.concat(pieces, axis=1, join="outer").sort_index()
+    if flat.empty:
+        raise ValueError("Descarga completa vacía tras ensamblar el universo (Twelve Data/FRED/Stooq).")
+    return flat
 
 
 def _cache_is_stale(cached: pd.DataFrame, max_age_hours: int = _CACHE_MAX_AGE_HOURS) -> bool:
@@ -382,9 +482,9 @@ def _cache_is_stale(cached: pd.DataFrame, max_age_hours: int = _CACHE_MAX_AGE_HO
 
     max_date = pd.Timestamp(cached.index.max())
     # Normaliza a tz-aware UTC ANTES de restar contra `datetime.now(utc)` --
-    # el índice cacheado puede venir tz-naive (yfinance diario típico) o
-    # tz-aware (localizado al exchange), según símbolo/versión; mismo
-    # patrón defensivo que `get_daily_news_sentiment` en data_pipeline.py.
+    # el índice cacheado puede venir tz-naive (Stooq/FRED) o tz-aware
+    # (Twelve Data, `timezone=UTC` explícito), según proveedor/símbolo;
+    # mismo patrón defensivo que `get_daily_news_sentiment` en data_pipeline.py.
     max_date = max_date.tz_localize("UTC") if max_date.tzinfo is None else max_date.tz_convert("UTC")
     age = datetime.now(timezone.utc) - max_date.to_pydatetime()
     return age > timedelta(hours=max_age_hours)
@@ -436,16 +536,7 @@ def download_all(tickers: list[str], macro_tickers: list[str], period: str,
                 cache_path.name, cached.index.max(), _CACHE_MAX_AGE_HOURS,
             )
 
-    raw = _download_with_backoff(all_symbols, period)
-    flat = pd.DataFrame(index=raw.index)
-    available_fields = set(raw.columns.get_level_values(0))
-    for field in fields:
-        if field not in available_fields:
-            continue
-        sub = raw[field]
-        for sym in all_symbols:
-            if sym in sub.columns:
-                flat[f"{sym}_{field}"] = sub[sym]
+    flat = _fetch_all_symbols_flat(tickers, macro_tickers, period)
 
     flat.to_parquet(cache_path)
     logger.info("[cache local] guardado en %s (sincronizada, fecha más reciente %s)",
