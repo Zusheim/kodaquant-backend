@@ -33,6 +33,18 @@ _CRYPTO_TICKERS = frozenset(REGIME_TICKERS.get("crypto_specialist", ()))
 
 TOP_N_RECOMMENDATIONS = 3
 
+# FIX 2026-08-15 -- ver ROOT CAUSE de "degradación total del radar" en el
+# docstring de services/market_data.py. Antes de esto, `_scan_universe`
+# despachaba los 10 tickers de REGIME_TICKERS los 10 A LA VEZ (cada uno con
+# inferencia Keras CPU-only real + I/O de red), maximizando tanto la
+# contención de CPU como la ventana en la que todos pedían los mismos 5
+# macro tickers compartidos al mismo tiempo -- el single-flight lock nuevo
+# en market_data.py ya colapsa esa ráfaga a 1 request por macro ticker,
+# pero acotar la concurrencia acá es la segunda capa: con esto, el primer
+# ticker despachado resuelve (y cachea) el macro context casi en solitario,
+# y el resto del universo entra de a oleadas encontrando caché ya tibia.
+_SCAN_CONCURRENCY = 4
+
 # Alpha Seeker — candidatos reales para "Quanti's Choice" (selección
 # automática de Plan B en modo discovery, ver _resolve_plan_b_ticker en
 # quanti_engine.py). Tope de candidatos expuestos al motor de allocation.
@@ -210,13 +222,15 @@ async def _scan_universe() -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, 
     quanti_engine._build_investment_plans.
     """
     loop = asyncio.get_running_loop()
+    semaphore = asyncio.Semaphore(_SCAN_CONCURRENCY)
 
     async def _safe_forecast(ticker: str):
-        try:
-            return await loop.run_in_executor(None, _forecast_asset, ticker, DEFAULT_FORECAST_HORIZON_DAYS)
-        except Exception as exc:  # noqa: BLE001 — un ticker caído no tumba el radar completo
-            logger.warning("Forecast radar falló para %s: %r", ticker, exc)
-            return None
+        async with semaphore:  # FIX 2026-08-15 — ver _SCAN_CONCURRENCY arriba
+            try:
+                return await loop.run_in_executor(None, _forecast_asset, ticker, DEFAULT_FORECAST_HORIZON_DAYS)
+            except Exception as exc:  # noqa: BLE001 — un ticker caído no tumba el radar completo
+                logger.warning("Forecast radar falló para %s: %r", ticker, exc)
+                return None
 
     *forecasts, spy_sentiment, btc_sentiment = await asyncio.gather(
         *(_safe_forecast(t) for t in _RADAR_UNIVERSE),

@@ -117,6 +117,49 @@ train_kodaquant_v5.py difiere de la verificada acá, o si tu plan de Twelve
 Data no cubre alguno de estos símbolos, corregí `MACRO_SYMBOL_MAP` antes
 de servir tráfico real — `resolve_macro_symbol()` sigue fallando ruidoso
 ante cualquier ticker fuera del diccionario, nunca adivina un símbolo.
+
+--- ROOT CAUSE REAL DE "degradación total del radar" (FIX 2026-08-15) ---
+El fix del 2026-08-15 de arriba (^GSPC/^VIX/DX-Y.NYB/^TNX directo a Stooq)
+resolvía el 404 de Twelve Data pero destapó el bug real, más grave:
+`services/prediccion._scan_universe` despacha los 10 tickers de
+REGIME_TICKERS en PARALELO real (`asyncio.gather` sobre 10
+`run_in_executor`, ver prediccion.py) y CADA uno de esos 10 hilos llama a
+`fetch_feature_ohlcv(ticker, macro_tickers, ...)`, que a su vez pide los
+MISMOS 5 macro tickers compartidos por todo el universo. Sin coordinación
+entre hilos, eso dispara hasta 10 requests SIMULTÁNEAS por cada uno de los
+4 macro tickers que van directo a Stooq (~40 requests en una ráfaga de
+milisegundos) contra un endpoint CSV público, anónimo, sin key y sin rate
+limit documentado del lado servidor — el patrón clásico que Stooq
+responde bloqueando/sirviendo una página de error en vez de CSV real
+(`_stooq_daily_close` ya detectaba ese caso devolviendo `None`, pero
+`_fetch_symbol_ohlcv` no tenía ningún colchón: en cuanto Stooq fallaba
+para el símbolo, lanzaba `RuntimeError` de inmediato). Como ^GSPC (y el
+resto de los macro tickers) es un input COMPARTIDO por los 10 modelos, un
+solo bloqueo de Stooq tumba el forecast de LOS 10 tickers a la vez —
+exactamente "degradación total del radar", no un fallo aislado.
+
+Tres capas de fix, todas en este módulo (`_fetch_symbol_ohlcv` +
+`_stooq_daily_close`), cero cambios de contrato hacia quanti_engine.py/
+prediccion.py:
+  1. SINGLE-FLIGHT por símbolo (`_lock_for` + `threading.Lock`): con 10
+     hilos pidiendo '^GSPC' a la vez, solo el PRIMERO golpea la red: los
+     otros 9 esperan el lock y reusan lo que ese hilo dejó en caché.
+     Colapsa la ráfaga de ~10 requests por macro ticker a 1 sola.
+  2. THROTTLE + REINTENTOS propios para Stooq (`_STOOQ_CONCURRENCY` +
+     `_stooq_throttle` + backoff en `_stooq_daily_close`) — antes Stooq
+     no tenía NINGÚN control del lado cliente (a diferencia de Twelve
+     Data, que sí tenía semáforo + rate limiter); un solo intento fallido
+     (glitch transitorio, no necesariamente bloqueo) mataba el símbolo
+     entero sin reintentar.
+  3. CACHÉ STALE COMO ÚLTIMO RECURSO (`_cache_get(..., ignore_ttl=True)`
+     en `_fetch_symbol_ohlcv`): si Twelve Data Y Stooq fallan los DOS en
+     vivo, antes de lanzar `RuntimeError` (y tumbar el universo completo)
+     se busca la última descarga exitosa en disco sin importar el TTL de
+     6h — para un macro factor que entra al tensor como log-return diario,
+     servir el dato de ayer en vez de "nada" es estrictamente mejor y
+     evita la cascada total. Solo se lanza `RuntimeError` si JAMÁS hubo
+     una descarga exitosa para ese símbolo (arranque en frío + ambos
+     proveedores caídos a la vez, caso genuinamente irrecuperable).
 """
 
 import io
@@ -172,6 +215,56 @@ _rate_call_log: list[float] = []
 # (mismo rol que _YF_CONCURRENCY cumplía bajo yfinance).
 _TD_CONCURRENCY = threading.BoundedSemaphore(4)
 
+# FIX 2026-08-15 -- Stooq (fallback CSV público, sin key) NO tenía ningún
+# control de concurrencia propio, a diferencia de Twelve Data arriba. Bajo
+# un scan paralelo de las 10 tickers de REGIME_TICKERS, eso permitía
+# ráfagas de hasta ~40 requests simultáneas contra un endpoint anónimo sin
+# rate limit documentado -- el patrón real que dispara los bloqueos/CSV
+# vacíos observados en producción (ver ROOT CAUSE en el docstring del
+# módulo). El single-flight lock (`_lock_for`, más abajo) ya colapsa la
+# mayor parte de esa ráfaga, pero este semáforo + throttle es la segunda
+# capa de defensa para cualquier request que sí llegue a golpear la red.
+_STOOQ_CONCURRENCY = threading.BoundedSemaphore(2)
+_STOOQ_RATE_LOCK = threading.Lock()
+_STOOQ_RATE_WINDOW_S = 10.0
+_STOOQ_RATE_MAX_CALLS = 3
+_stooq_call_log: list[float] = []
+
+
+def _stooq_throttle() -> None:
+    with _STOOQ_RATE_LOCK:
+        now = time.monotonic()
+        while _stooq_call_log and now - _stooq_call_log[0] > _STOOQ_RATE_WINDOW_S:
+            _stooq_call_log.pop(0)
+        if len(_stooq_call_log) >= _STOOQ_RATE_MAX_CALLS:
+            wait_s = _STOOQ_RATE_WINDOW_S - (now - _stooq_call_log[0]) + 0.05
+            if wait_s > 0:
+                logger.debug("Rate limiter Stooq: esperando %.2fs.", wait_s)
+                time.sleep(wait_s)
+        _stooq_call_log.append(time.monotonic())
+
+
+# ---------------------------------------------------------------------------
+# Single-flight por símbolo -- ver ROOT CAUSE en el docstring del módulo.
+# Un `threading.Lock` dedicado por `internal_key` (creado on-demand, nunca
+# liberado -- son ~15 símbolos como mucho, memoria irrelevante) asegura que
+# de los N hilos que puedan pedir el MISMO ticker en paralelo (ej. '^GSPC'
+# pedido por los 10 forecasts del universo a la vez), solo UNO llega a
+# tocar la red; el resto espera el lock y reusa lo que ese hilo dejó en
+# caché -- sin este mecanismo, cada hilo repetía la descarga completa.
+# ---------------------------------------------------------------------------
+_SYMBOL_LOCKS: dict[str, threading.Lock] = {}
+_SYMBOL_LOCKS_META = threading.Lock()
+
+
+def _lock_for(internal_key: str) -> threading.Lock:
+    with _SYMBOL_LOCKS_META:
+        lock = _SYMBOL_LOCKS.get(internal_key)
+        if lock is None:
+            lock = threading.Lock()
+            _SYMBOL_LOCKS[internal_key] = lock
+        return lock
+
 
 def _throttle() -> None:
     with _RATE_LOCK:
@@ -201,17 +294,30 @@ def _cache_path(cache_key: str) -> Path:
     return _CACHE_DIR / f"{safe}.json"
 
 
-def _cache_get(cache_key: str) -> Optional[pd.DataFrame]:
+def _cache_get(cache_key: str, ignore_ttl: bool = False) -> Optional[pd.DataFrame]:
+    """
+    `ignore_ttl=True` -- FIX 2026-08-15, ver ROOT CAUSE en el docstring del
+    módulo: devuelve lo último cacheado en disco SIN importar si el TTL de
+    6h ya venció. Uso exclusivo del fallback de última instancia en
+    `_fetch_symbol_ohlcv` cuando Twelve Data Y Stooq fallan los dos en
+    vivo -- para un macro factor que entra al tensor como log-return
+    diario, un dato de ayer sigue siendo estrictamente mejor que tumbar el
+    universo entero. El camino normal (`ignore_ttl=False`, default) NO
+    cambia de comportamiento.
+    """
     path = _cache_path(cache_key)
     try:
         with _CACHE_LOCK:
             if not path.exists():
                 return None
             payload = json.loads(path.read_text())
-        if time.time() - payload.get("_cached_at", 0) > _CACHE_TTL_S:
+        age_s = time.time() - payload.get("_cached_at", 0)
+        if not ignore_ttl and age_s > _CACHE_TTL_S:
             return None
         df = pd.read_json(io.StringIO(payload["data"]), orient="split")
         df.index = pd.to_datetime(df.index)
+        if ignore_ttl and age_s > _CACHE_TTL_S:
+            df.attrs["_stale_age_hours"] = round(age_s / 3600, 1)
         return df
     except Exception as exc:  # noqa: BLE001 -- caché corrupta/ilegible jamás tumba el fetch real
         logger.debug("Caché ilegible para %s (%r) -- se ignora y se re-descarga.", cache_key, exc)
@@ -399,29 +505,58 @@ def _td_payload_to_df(payload: dict) -> Optional[pd.DataFrame]:
 # Stooq -- fallback CSV sin key (mismo endpoint que ya usaba quanti_engine.py)
 # ---------------------------------------------------------------------------
 
-def _stooq_daily_close(stooq_symbol: str, tail_days: int = 400) -> Optional[pd.Series]:
-    try:
-        resp = requests.get(
-            "https://stooq.com/q/d/l/",
-            # FIX 2026-08-15: antes se interpolaba stooq_symbol crudo en el
-            # f-string de la URL -- el '^' de los símbolos de índice (^spx,
-            # ^vix) viaja sin url-encodear (%5E). `params=` deja que
-            # `requests` lo encodee correctamente; evita un CSV vacío/
-            # malformado que silenciaba el fallback justo para índices.
-            params={"s": stooq_symbol, "i": "d"},
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0 (KodaQuant market_data fallback)"},
-        )
-        resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
-        if df.empty or "Close" not in df.columns or "Date" not in df.columns:
-            return None
-        df["Date"] = pd.to_datetime(df["Date"])
-        series = df.set_index("Date").sort_index()["Close"].dropna()
-        return series.tail(tail_days) if not series.empty else None
-    except Exception as exc:  # noqa: BLE001 -- último recurso: si falla, el caller decide su propio fallback
-        logger.warning("Stooq falló para '%s': %r", stooq_symbol, exc)
-        return None
+def _stooq_daily_close(stooq_symbol: str, tail_days: int = 400, attempts: int = 3) -> Optional[pd.Series]:
+    """
+    FIX 2026-08-15 (ver ROOT CAUSE en el docstring del módulo): antes esto
+    era un único intento sin throttle ni semáforo -- bajo ráfaga paralela
+    (10 tickers x hasta 4 macro tickers directo a Stooq) un solo glitch
+    transitorio o un bloqueo momentáneo del endpoint anónimo mataba el
+    símbolo entero de inmediato. Ahora reintenta con backoff (glitches
+    transitorios: timeout, 5xx, CSV vacío que Stooq a veces sirve bajo
+    carga) Y respeta `_STOOQ_CONCURRENCY`/`_stooq_throttle` para no ser,
+    en sí mismo, la causa de la próxima ráfaga.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(attempts):
+        with _STOOQ_CONCURRENCY:
+            _stooq_throttle()
+            try:
+                resp = requests.get(
+                    "https://stooq.com/q/d/l/",
+                    # FIX 2026-08-15 (previo): antes se interpolaba
+                    # stooq_symbol crudo en el f-string de la URL -- el '^'
+                    # de los símbolos de índice (^spx, ^vix) viaja sin
+                    # url-encodear (%5E). `params=` deja que `requests` lo
+                    # encodee correctamente; evita un CSV vacío/malformado
+                    # que silenciaba el fallback justo para índices.
+                    params={"s": stooq_symbol, "i": "d"},
+                    timeout=10,
+                    headers={"User-Agent": "Mozilla/5.0 (KodaQuant market_data fallback)"},
+                )
+                resp.raise_for_status()
+                df = pd.read_csv(io.StringIO(resp.text))
+                if df.empty or "Close" not in df.columns or "Date" not in df.columns:
+                    # Stooq devuelve 200 con un cuerpo que NO es el CSV
+                    # esperado cuando bloquea/limita un cliente anónimo
+                    # (página de error, CSV vacío) -- se trata como fallo
+                    # transitorio, reintentable, no como "símbolo inválido".
+                    raise ValueError(
+                        f"Stooq devolvió una respuesta sin columnas Close/Date "
+                        f"para '{stooq_symbol}' (posible bloqueo/rate-limit "
+                        f"anónimo bajo carga)."
+                    )
+                df["Date"] = pd.to_datetime(df["Date"])
+                series = df.set_index("Date").sort_index()["Close"].dropna()
+                if series.empty:
+                    raise ValueError(f"Stooq devolvió CSV sin filas válidas para '{stooq_symbol}'.")
+                return series.tail(tail_days)
+            except Exception as exc:  # noqa: BLE001 -- reintentamos cualquier fallo transitorio
+                last_exc = exc
+                if attempt < attempts - 1:
+                    time.sleep(1.5 * (attempt + 1))
+
+    logger.warning("Stooq falló para '%s' tras %d intento(s): %r", stooq_symbol, attempts, last_exc)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -440,35 +575,74 @@ def _fetch_symbol_ohlcv(
     if cached is not None and len(cached) >= min(min_sessions, 30):
         return cached
 
-    df = _td_time_series(td_symbol, outputsize=DEFAULT_HISTORY_SESSIONS) if td_symbol else None
+    # FIX 2026-08-15 -- SINGLE-FLIGHT (ver ROOT CAUSE en el docstring del
+    # módulo). El universo completo (10 tickers, escaneado en paralelo por
+    # `prediccion._scan_universe`) comparte los MISMOS 5 macro tickers: sin
+    # este lock, hasta 10 hilos pedían '^GSPC' (u otro macro ticker) a la
+    # red AL MISMO TIEMPO, disparando la ráfaga que Stooq interpreta como
+    # abuso. Con el lock, solo el primer hilo en tomarlo golpea la red; el
+    # resto espera y reusa lo que ese hilo deja en caché -- de ahí el
+    # segundo `_cache_get` adentro (double-checked): si otro hilo ya
+    # resolvió el símbolo mientras esperábamos el lock, no repetimos nada.
+    with _lock_for(internal_key):
+        cached = _cache_get(f"ohlcv:{internal_key}")
+        if cached is not None and len(cached) >= min(min_sessions, 30):
+            return cached
 
-    if df is None or df.empty:
-        if stooq_symbol is None:
-            raise RuntimeError(
-                f"Sin datos para '{internal_key}': Twelve Data no respondió "
-                "y no hay símbolo Stooq de fallback registrado para este ticker."
-            )
-        series = _stooq_daily_close(stooq_symbol, tail_days=DEFAULT_HISTORY_SESSIONS + 30)
-        if series is None or series.empty:
-            raise RuntimeError(
-                f"Sin datos para '{internal_key}': Twelve Data y Stooq "
-                "fallaron ambos -- radar degradado para este símbolo."
-            )
-        df = pd.DataFrame({"close": series})
-        df["open"] = df["close"]
-        df["high"] = df["close"]
-        df["low"] = df["close"]
-        df["volume"] = np.nan
-        logger.warning(
-            "'%s': sirviendo desde fallback Stooq -- solo Close real; "
-            "Open/High/Low replicados desde Close y Volume=NaN "
-            "(ATR_14/OBV_ROC_20/ADX_14/STOCH_K_14 quedan degradados para "
-            "este ticker hasta que Twelve Data vuelva a responder).",
-            internal_key,
-        )
+        df = _td_time_series(td_symbol, outputsize=DEFAULT_HISTORY_SESSIONS) if td_symbol else None
 
-    _cache_set(f"ohlcv:{internal_key}", df)
-    return df
+        if df is None or df.empty:
+            if stooq_symbol is not None:
+                series = _stooq_daily_close(stooq_symbol, tail_days=DEFAULT_HISTORY_SESSIONS + 30)
+                if series is not None and not series.empty:
+                    df = pd.DataFrame({"close": series})
+                    df["open"] = df["close"]
+                    df["high"] = df["close"]
+                    df["low"] = df["close"]
+                    df["volume"] = np.nan
+                    logger.warning(
+                        "'%s': sirviendo desde fallback Stooq -- solo Close real; "
+                        "Open/High/Low replicados desde Close y Volume=NaN "
+                        "(ATR_14/OBV_ROC_20/ADX_14/STOCH_K_14 quedan degradados para "
+                        "este ticker hasta que Twelve Data vuelva a responder).",
+                        internal_key,
+                    )
+
+            if df is None or df.empty:
+                # FIX 2026-08-15 -- CACHÉ STALE COMO ÚLTIMO RECURSO, antes de
+                # rendirse. Twelve Data Y Stooq fallaron los dos en vivo; en
+                # vez de lanzar de inmediato (y con eso tumbar los 10
+                # forecasts que dependen de este mismo macro ticker), se
+                # busca la última descarga exitosa en disco sin importar si
+                # el TTL de 6h venció. Solo si NUNCA hubo una descarga
+                # exitosa (arranque en frío + ambos proveedores caídos a la
+                # vez) se lanza el RuntimeError real.
+                stale = _cache_get(f"ohlcv:{internal_key}", ignore_ttl=True)
+                if stale is not None and not stale.empty:
+                    stale_age_h = stale.attrs.get("_stale_age_hours")
+                    logger.warning(
+                        "'%s': Twelve Data y Stooq fallaron los dos en vivo -- "
+                        "sirviendo caché STALE (%s hs de antigüedad) en vez de "
+                        "tumbar el forecast completo. Reintentará una descarga "
+                        "en vivo en la próxima llamada.",
+                        internal_key, stale_age_h if stale_age_h is not None else "?",
+                    )
+                    return stale
+
+                if stooq_symbol is None:
+                    raise RuntimeError(
+                        f"Sin datos para '{internal_key}': Twelve Data no respondió, "
+                        "no hay símbolo Stooq de fallback registrado para este "
+                        "ticker, y no hay caché previa (ni siquiera stale) que servir."
+                    )
+                raise RuntimeError(
+                    f"Sin datos para '{internal_key}': Twelve Data y Stooq "
+                    "fallaron ambos y no hay caché previa (ni siquiera stale) "
+                    "que servir -- radar degradado para este símbolo."
+                )
+
+        _cache_set(f"ohlcv:{internal_key}", df)
+        return df
 
 
 # ---------------------------------------------------------------------------
