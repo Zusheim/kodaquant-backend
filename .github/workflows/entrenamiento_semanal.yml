@@ -94,13 +94,13 @@ jobs:
         run: |
           pip install -U "huggingface_hub[cli]"
 
-          # <-- SUSTITUIR: "Zusheim/kodaquant-backend" por tu repo_id de destino en HF.
-          # --repo-type: "model" si es un HF Model Repo separado, o "space"
-          # si quieres subir los pesos directo al mismo Space del backend
-          # (Zusheim/kodaquant-backend, ver sync_huggingface.yml).
-          # <-- SUSTITUIR: "services/kodaquant_models/" si tu ruta de artefactos difiere.
-          huggingface-cli upload tu-usuario/quanti-model \
-            services/kodaquant_models/ . \
-            --repo-type model \
+          # Destino: mismo Space del backend (Zusheim/kodaquant-backend).
+          # Ruta destino "services/kodaquant_models" (NO ".") -- preserva la
+          # misma ruta relativa que usa el código en runtime (quanti_engine.py
+          # espera crypto_specialist/ y equity_specialist/ ahí mismo, igual
+          # que en el checkout local).
+          huggingface-cli upload Zusheim/kodaquant-backend \
+            services/kodaquant_models/ services/kodaquant_models \
+            --repo-type space \
             --token "$HF_TOKEN" \
             --commit-message "🤖 MLOps: sync pesos entrenados $(date -u +%Y-%m-%dT%H:%M:%SZ)"

@@ -28,14 +28,22 @@ jobs:
           echo ".DS_Store" >> .gitignore
           
           # 2. Inyectar la llave de encendido de Gradio con Python 3.12
+          # FIX -- `sdk_version`/`python_version` DEBEN ir entre comillas.
+          # Verificado: `echo "python_version: 3.12" >> README.md` (sin
+          # comillas) produce un YAML donde ese valor se parsea como FLOAT
+          # (3.12), no como string "3.12" -- el mismo tipo de
+          # "configuration error" silencioso que ya rompió el build por el
+          # pin de torch. El template oficial de HF (`{{sdkVersion}}` /
+          # `{{pythonVersion}}`) siempre los entrega entre comillas dobles
+          # por esta razón exacta.
           echo "---" > README.md
           echo "title: KodaQuant Backend" >> README.md
           echo "emoji: 🚀" >> README.md
           echo "colorFrom: blue" >> README.md
           echo "colorTo: indigo" >> README.md
           echo "sdk: gradio" >> README.md
-          echo "sdk_version: 6.22.0" >> README.md
-          echo "python_version: 3.12" >> README.md
+          echo 'sdk_version: "6.22.0"' >> README.md
+          echo 'python_version: "3.12"' >> README.md
           echo "app_file: app.py" >> README.md
           echo "pinned: false" >> README.md
           echo "---" >> README.md
@@ -54,5 +62,5 @@ jobs:
           git add .
           
           # 5. Empaquetar y forzar la subida a Hugging Face
-          git commit -m "deploy: revertir a Gradio SDK para habilitar ZeroGPU y actualizar FastAPI"
+          git commit -m "deploy: sync automático a Hugging Face Spaces (ZeroGPU, front-matter README corregido)"
           git push --force https://Zusheim:$HF_TOKEN@huggingface.co/spaces/Zusheim/kodaquant-backend main

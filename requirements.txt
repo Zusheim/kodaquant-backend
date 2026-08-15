@@ -1,12 +1,3 @@
-# --extra-index-url del build de CPU oficial de PyTorch -- declarado acá
-# arriba de todo (pip trata los flags de índice como opciones GLOBALES de
-# la corrida completa de `pip install -r`, sin importar en qué línea
-# aparezcan, pero se deja en el tope del archivo por legibilidad y para
-# no depender de esa semántica implícita). Ver sección "NLP / Sentimiento
-# (FinBERT)" más abajo para el detalle completo de por qué torch necesita
-# este índice en particular.
---extra-index-url https://download.pytorch.org/whl/cpu
-
 # --- Web framework (bounds mirror what gradio==6.22.0 itself requires,
 # since HF's Gradio SDK auto-installs it alongside this file) -------------
 fastapi>=0.115.2,<1.0
@@ -114,16 +105,31 @@ ddgs>=9.0.0
 # ambos extremos por separado es la forma más rápida de recrear un
 # conflicto nuevo si cualquiera de los dos paquetes ajusta su rango).
 #
-# `torch` va con el índice CPU-only oficial de PyTorch -- este runner ya
-# fuerza toda la inferencia Keras a CPU (ver [DEVICE GUARD] en
-# quanti_engine.py); instalar el wheel CUDA por defecto de PyPI arrastraría
-# varios GB de paquetes `nvidia-*-cu12` sin ningún uso real en este Space,
-# solo para inflar el build. `_get_finbert_pipeline()` en data_pipeline.py
-# ya hace el import de forma perezosa (dentro de la función, no a nivel de
-# módulo) y DESPUÉS de que `import spaces` ya corrió en main.py -- respeta
-# el orden que exige ZeroGPU (`spaces` antes que cualquier import de torch)
-# sin tener que reordenar nada. (Índice CPU declarado al tope del archivo.)
-torch==2.13.0+cpu
+# FIX 2026-08-15 (RONDA 2) -- HF rechazó el build con "torch version in
+# requirements.txt is not compatible with ZeroGPU. Supported versions:
+# 2.11.0, 2.10.0, 2.9.1, 2.8.0". El pin anterior (`torch==2.13.0+cpu` +
+# `--extra-index-url .../whl/cpu`) tenía DOS problemas reales, no uno:
+#   1. 2.13.0 no está en la whitelist que el validador de ZeroGPU chequea
+#      de forma ESTÁTICA contra este archivo (nunca llega a instalarse,
+#      el error es previo al build).
+#   2. Ese validador espera el wheel CUDA real de PyPI (el que trae la
+#      Space cuando el hardware asignado es un ZeroGPU real) -- el índice
+#      CPU-only (`+cpu`, sin `nvidia-*-cu12`) es exactamente el paquete
+#      "liviano" que la optimización anterior buscaba a propósito, pero
+#      es justo lo que ZeroGPU no reconoce como compatible con su propio
+#      mecanismo de asignación dinámica de GPU (`spaces` parchea
+#      `torch.cuda` en tiempo de import; un build sin CUDA no tiene qué
+#      parchear). Se elimina el `--extra-index-url` por completo y se
+#      pinea la ÚLTIMA versión de la whitelist (2.11.0) del índice
+#      DEFAULT de PyPI -- el wheel real, tal como ZeroGPU lo espera.
+#      `_get_finbert_pipeline()` en data_pipeline.py sigue haciendo el
+#      import de torch de forma perezosa y DESPUÉS de que `import spaces`
+#      ya corrió en main.py -- el orden que exige ZeroGPU (`spaces` antes
+#      que cualquier import de torch) sigue respetado sin tocar nada ahí.
+#      Sin costo real: este Space es gratuito bajo el tier ZeroGPU
+#      (hardware compartido, cupo dinámico) -- no hay tarjeta ni pago
+#      involucrado por instalar el wheel CUDA completo.
+torch==2.11.0
 transformers==5.15.0
 
 # --- Parsing / scraping ---------------------------------------------------
