@@ -36,9 +36,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # torch/transformers YA están pineados en requirements.txt
+          # (torch==2.11.0, transformers==5.15.0 -- ver FIX RONDA 1/2 ahí)
+          # para compat con el validador ZeroGPU de HF. Instalarlos sueltos
+          # acá (como antes) los sobrescribía con versiones sin pinear,
+          # deshaciendo esos fixes en cada corrida de entrenamiento.
           pip install -r requirements.txt
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install transformers
 
       - name: Ejecutar script de entrenamiento
         env:
