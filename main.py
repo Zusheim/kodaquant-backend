@@ -281,6 +281,26 @@ async def _log_asgi_startup() -> None:
     # pero esta línea ayuda a confirmar cuál está pasando si vuelve a fallar.
     logger.info("KodaQuant ASGI startup complete — rutas + probe de ZeroGPU montados.")
 
+    async def _warm_zerogpu_probe() -> None:
+        # FIX 2026-08-15 — "Starting..." colgado en el dashboard de HF.
+        # Registrar `_zerogpu_probe` con `@app.api()`/`@spaces.GPU()` no
+        # basta en todos los casos: el hypervisor de ZeroGPU necesita ver
+        # al menos UNA ejecución real durante el boot para marcar el Space
+        # como "Running", no le alcanza con que la función solo exista en
+        # la tabla de endpoints. Fire-and-forget con timeout: si ZeroGPU no
+        # responde o el tier actual no lo tiene habilitado, esto NUNCA debe
+        # retrasar ni tumbar "Application startup complete".
+        try:
+            loop = asyncio.get_running_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _zerogpu_probe), timeout=15.0
+            )
+            logger.info("ZeroGPU probe warm-up OK: %s", result)
+        except Exception as exc:
+            logger.warning("ZeroGPU probe warm-up falló (no crítico): %r", exc)
+
+    asyncio.create_task(_warm_zerogpu_probe())
+
 @app.get("/")
 async def root():
     return {"status": "online", "system": "KodaQuant Terminal", "version": "4.0"}

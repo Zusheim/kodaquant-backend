@@ -257,9 +257,21 @@ _STOOQ_SYMBOL_MAP: dict[str, str] = {
 # "este proveedor no lo cubre de forma confiable en el plan free -- se
 # sirve directo desde Stooq".
 MACRO_SYMBOL_MAP: dict[str, dict[str, Optional[str]]] = {
-    "^GSPC":    {"twelvedata": "SPX",     "stooq": "^spx"},     # S&P 500 (índice cash) -- mismo
-                                                                  # subyacente en ambos proveedores.
-    "^VIX":     {"twelvedata": "VIX",     "stooq": "^vix"},     # CBOE Volatility Index -- ídem.
+    "^GSPC":    {"twelvedata": None,      "stooq": "^spx"},     # FIX 2026-08-15: Twelve Data devuelve
+                                                                  # 404 real en producción para "SPX"
+                                                                  # (time_series) -- índices cash NO
+                                                                  # están cubiertos de forma confiable
+                                                                  # en el plan Basic/free (mismo patrón
+                                                                  # públicamente documentado para VIX,
+                                                                  # ver soporte oficial TD). Se sirve
+                                                                  # SIEMPRE desde Stooq (mismo patrón
+                                                                  # que ya usa ^TNX abajo) -- no un
+                                                                  # 404 silencioso seguido de fallback
+                                                                  # lento, sino la ruta directa.
+    "^VIX":     {"twelvedata": None,      "stooq": "^vix"},     # FIX 2026-08-15: mismo caso -- VIX
+                                                                  # confirmado sin cobertura en TD free
+                                                                  # (documentado públicamente por TD).
+                                                                  # Directo a Stooq.
     "GC=F":     {"twelvedata": "XAU/USD", "stooq": "xauusd"},   # Oro SPOT -- GC=F en entrenamiento
                                                                   # es el FUTURO COMEX del contrato
                                                                   # próximo. Verificado en vivo
@@ -269,9 +281,10 @@ MACRO_SYMBOL_MAP: dict[str, dict[str, Optional[str]]] = {
                                                                   # proxy de mejor esfuerzo, NO
                                                                   # corregible con un multiplicador
                                                                   # constante. Ver docstring del módulo.
-    "DX-Y.NYB": {"twelvedata": "DXY",     "stooq": "usdx.f"},   # US Dollar Index -- mismo índice
-                                                                  # ICE subyacente; nivel verificado
-                                                                  # en vivo (~99-101) en ambos.
+    "DX-Y.NYB": {"twelvedata": None,      "stooq": "usdx.f"},   # FIX 2026-08-15: mismo caso -- índice
+                                                                  # ICE crudo, mismo patrón de
+                                                                  # no-cobertura en TD free que ^GSPC/
+                                                                  # ^VIX. Directo a Stooq.
     "^TNX":     {"twelvedata": None,      "stooq": "10yusy.b"}, # Rendimiento UST 10Y, PORCENTAJE
                                                                   # DIRECTO (4.558 = 4.558%) en AMBOS
                                                                   # yfinance/Yahoo y Stooq -- verificado
@@ -389,7 +402,13 @@ def _td_payload_to_df(payload: dict) -> Optional[pd.DataFrame]:
 def _stooq_daily_close(stooq_symbol: str, tail_days: int = 400) -> Optional[pd.Series]:
     try:
         resp = requests.get(
-            f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d",
+            "https://stooq.com/q/d/l/",
+            # FIX 2026-08-15: antes se interpolaba stooq_symbol crudo en el
+            # f-string de la URL -- el '^' de los símbolos de índice (^spx,
+            # ^vix) viaja sin url-encodear (%5E). `params=` deja que
+            # `requests` lo encodee correctamente; evita un CSV vacío/
+            # malformado que silenciaba el fallback justo para índices.
+            params={"s": stooq_symbol, "i": "d"},
             timeout=10,
             headers={"User-Agent": "Mozilla/5.0 (KodaQuant market_data fallback)"},
         )
