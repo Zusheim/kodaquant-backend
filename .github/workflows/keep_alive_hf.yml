@@ -1,0 +1,22 @@
+name: Keep-Alive HF Space - KodaQuant Backend
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-space:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping al Space para resetear el temporizador de sleep de HF
+        continue-on-error: true
+        run: |
+          # Sin -f: un 404/403 en el frontend del Space NO debe marcar fallo
+          # el workflow -- el objetivo es solo que el contenedor reciba el
+          # hit y resetee su temporizador de inactividad (48h), no validar
+          # el contenido de la respuesta. -L sigue redirects. continue-on-error
+          # a nivel step cubre además timeouts/errores de red genuinos.
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" -L \
+            --max-time 30 --retry 2 --retry-delay 5 \
+            "https://zusheim-kodaquant-backend.hf.space" || true
