@@ -61,6 +61,8 @@ jobs:
 
           # --- Mercado / Sentimiento ---
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
 
           # --- Seguridad interna ---
           API_SECRET_KEY: ${{ secrets.API_SECRET_KEY }}
