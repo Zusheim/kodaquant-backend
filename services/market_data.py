@@ -118,7 +118,7 @@ Data no cubre alguno de estos símbolos, corregí `MACRO_SYMBOL_MAP` antes
 de servir tráfico real — `resolve_macro_symbol()` sigue fallando ruidoso
 ante cualquier ticker fuera del diccionario, nunca adivina un símbolo.
 
---- ROOT CAUSE REAL DE "degradación total del radar" (FIX 2026-08-15) ---
+--- ROOT CAUSE REAL DE "degradación total del radar" (FIX 2026-08-15 — RONDA 1) ---
 El fix del 2026-08-15 de arriba (^GSPC/^VIX/DX-Y.NYB/^TNX directo a Stooq)
 resolvía el 404 de Twelve Data pero destapó el bug real, más grave:
 `services/prediccion._scan_universe` despacha los 10 tickers de
@@ -160,6 +160,95 @@ prediccion.py:
      evita la cascada total. Solo se lanza `RuntimeError` si JAMÁS hubo
      una descarga exitosa para ese símbolo (arranque en frío + ambos
      proveedores caídos a la vez, caso genuinamente irrecuperable).
+
+--- RONDA 2 (FIX 2026-08-15, mismo día — logs de producción posteriores) ---
+Los logs post-RONDA 1 muestran algo distinto de lo que la RONDA 1 asumía:
+el single-flight lock SÍ funcionó (ya no hay ráfaga — los intentos contra
+Stooq para '^spx' quedaron serializados, uno cada ~10s, uno por ticker del
+universo) y AÚN ASÍ los 10 fallan, siempre con el mismo error ("Stooq
+devolvió una respuesta sin columnas Close/Date"), incluso con reintentos y
+backoff. Un fallo que persiste 100% de las veces YA SERIALIZADO, request
+tras request, con el MISMO símbolo, deja de ser "ráfaga mal comportada" y
+pasa a ser evidencia de un bloqueo ESTRUCTURAL: Stooq es conocido por
+bloquear (servir HTML/CSV vacío con 200 OK en vez de datos reales) tráfico
+proveniente de rangos de IP de datacenter/cloud -- Hugging Face Spaces
+corre sobre infraestructura cloud (AWS/GCP/Azure), exactamente el patrón
+que ese bloqueo apunta. Los reintentos de la RONDA 1 no podían arreglar
+esto porque no es un glitch transitorio -- es un rechazo consistente del
+lado del proveedor para ESTA clase de tráfico, independientemente de
+cuántas veces se reintente.
+
+Auditoría de blast radius: `MACRO_TICKERS` tiene 5 entradas
+(^GSPC/^TNX/^VIX/GC=F/DX-Y.NYB) pero `fetch_feature_ohlcv` los recorre en
+un `for` secuencial que ABORTA en el primer `RuntimeError` -- como ^GSPC
+es el PRIMERO de la lista y el único que alcanzamos a ver fallar en los
+logs, los otros 3 símbolos ruteados directo a Stooq (^VIX, ^TNX,
+DX-Y.NYB, ver MACRO_SYMBOL_MAP de la RONDA 1) NUNCA llegaron a intentarse
+-- pero comparten el MISMO endpoint (`stooq.com/q/d/l/`) con el MISMO
+patrón de bloqueo, así que hay que asumir que fallarían igual si ^GSPC no
+abortara primero. Cuatro de los cinco macro tickers dependían de Stooq
+como única fuente real (`twelvedata: None`) -- ese es el problema de raíz,
+no la concurrencia (ya resuelta en RONDA 1).
+
+FIX DE RAÍZ -- dejar de depender de Stooq como fuente PRIMARIA para los
+macro tickers, reemplazándolo por proveedores que SÍ están probados como
+100% confiables en este mismo entorno (Twelve Data ya sirve AAPL/MSFT/
+TSLA/SPY/BTC-USD/... sin un solo fallo en los logs) o que son APIs reales
+diseñadas para tráfico programático (no scraping de un endpoint CSV
+público), en vez de reintentar contra un proveedor que rechaza el tráfico
+de forma sistemática. Los 5 macro tickers entran al tensor SOLO como
+log-return (ver auditoría más arriba) -- eso da libertad real para
+sustituir cada índice/futuro por un ETF/activo LÍQUIDO Y REAL que trackea
+la MISMA magnitud subyacente, con la MISMA garantía matemática ya
+establecida arriba (un factor de escala/tracking constante es invisible
+para el tensor; solo importa que el MOVIMIENTO diario sea el mismo
+activo real, cero simulación):
+
+  • ^GSPC (S&P 500 cash) -> **SPY** vía Twelve Data. SPY *es* el ETF que
+    trackea el S&P 500 -- no es un proxy aproximado, es prácticamente el
+    mismo activo con tracking error de puntos básicos. Ya está en
+    REGIME_TICKERS y se descarga con éxito en cada scan (ver logs) -- cero
+    riesgo de proveedor nuevo, cero costo extra relevante de créditos.
+
+  • ^VIX (CBOE Volatility Index) -> **VIXY** (ProShares VIX Short-Term
+    Futures ETF) vía Twelve Data. Proxy, no el índice exacto (roll
+    yield/contango del futuro de corto plazo introduce deriva de largo
+    plazo que el índice cash no tiene) -- mismo tipo de caveat ya aceptado
+    para GC=F/XAU-USD arriba, documentado igual acá. El día a día
+    (dirección e intensidad del shock de volatilidad, que es lo que
+    SENTIMENT_SCORE/el tensor realmente necesitan) sigue correlacionado.
+
+  • DX-Y.NYB (ICE US Dollar Index) -> **UUP** (Invesco DB US Dollar Index
+    Bullish Fund) vía Twelve Data. UUP está diseñado explícitamente para
+    trackear la MISMA canasta de divisas que el USDX -- proxy de alta
+    fidelidad, no una aproximación libre.
+
+  • GC=F (oro) -> SIN CAMBIO, ya vía Twelve Data (XAU/USD) desde la
+    migración original -- nunca dependió de Stooq como primaria, por eso
+    nunca apareció en los logs de fallo.
+
+  • ^TNX (rendimiento UST 10Y) -> este es el ÚNICO que NO se puede
+    resolver con un ETF de precio: un rendimiento (yield) y el precio de
+    un ETF de bonos se mueven en direcciones opuestas y con una escala
+    que depende de la duration del instrumento (NO es un factor constante
+    -- a diferencia de todos los casos de arriba, acá "precio de ETF" y
+    "yield" NO son la misma magnitud, son magnitudes relacionadas por una
+    transformación que varía en el tiempo). Inventar un signo/escala acá
+    violaría directamente "cero cifras inventadas". En vez de forzar un
+    proxy matemáticamente débil, se agrega **FRED** (Federal Reserve
+    Economic Data, `api.stlouisfed.org`, serie oficial `DGS10` = "10-Year
+    Treasury Constant Maturity Rate", el rendimiento UST10Y real y
+    oficial) como fuente PRIMARIA nueva -- 100% gratis (requiere API key
+    gratuita, sin tarjeta, alta de un minuto en
+    https://fred.stlouisfed.org/docs/api/api_key.html), y es una API REST
+    real diseñada para tráfico programático (no un endpoint de scraping
+    con protección anti-bot) -- no comparte el problema de Stooq. Stooq
+    (`10yusy.b`) queda como fallback secundario si `FRED_API_KEY` no está
+    configurada o la request a FRED falla puntualmente.
+
+Con esto, Stooq deja de ser la única fuente real de 4 de los 5 macro
+tickers y pasa a ser lo que su nombre siempre debió indicar: un fallback
+de ÚLTIMO recurso, nunca la primaria de nada crítico.
 """
 
 import io
@@ -184,6 +273,18 @@ TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
 TWELVE_DATA_BASE_URL = "https://api.twelvedata.com"
 TWELVE_DATA_TIMEOUT_S = 20.0
 
+# FRED (Federal Reserve Economic Data, api.stlouisfed.org) -- fuente
+# PRIMARIA nueva (RONDA 2) para ^TNX (serie oficial DGS10, rendimiento
+# UST10Y real). 100% gratis, sin tarjeta -- alta de la key en
+# https://fred.stlouisfed.org/docs/api/api_key.html. API REST real
+# diseñada para tráfico programático (no un endpoint de scraping con
+# protección anti-bot como Stooq) -- ver ROOT CAUSE RONDA 2 en el
+# docstring del módulo. Opcional: si no está configurada, ^TNX cae
+# directo al fallback Stooq (mismo comportamiento que antes de RONDA 2).
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "").strip()
+FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
+FRED_TIMEOUT_S = 15.0
+
 # ~2 años de sesiones diarias (mismo horizonte que el "period=2y" que usaba
 # yfinance) — suficiente burn-in para que RSI_14/EMA_20/MACD/MACD_SIGNAL
 # (todos IIR recursivos, `ewm(adjust=False)`) converjan al mismo estado que
@@ -199,6 +300,17 @@ if not TWELVE_DATA_API_KEY:
         "degradados hasta que se configure la key). Registrate gratis en "
         "https://twelvedata.com/pricing (plan Basic) y seteá la variable "
         "de entorno / Secret 'TWELVE_DATA_API_KEY'."
+    )
+
+if not FRED_API_KEY:
+    logger.warning(
+        "FRED_API_KEY no configurada -- '^TNX' (rendimiento UST10Y) cae "
+        "directo al fallback Stooq, que en este hosting viene demostrando "
+        "bloqueos sistemáticos (ver ROOT CAUSE RONDA 2 en el docstring del "
+        "módulo). Registrate gratis (sin tarjeta, ~1 minuto) en "
+        "https://fred.stlouisfed.org/docs/api/api_key.html y seteá la "
+        "variable de entorno / Secret 'FRED_API_KEY' para eliminar ese "
+        "último punto de falla."
     )
 
 # ---------------------------------------------------------------------------
@@ -359,49 +471,67 @@ _STOOQ_SYMBOL_MAP: dict[str, str] = {
 # Macro tickers -- auditado contra MACRO_TICKERS de train_kodaquant_v5.py
 # (línea 149: ^GSPC, ^TNX, ^VIX, GC=F, DX-Y.NYB) -- ver la sección
 # "AUDITORÍA DE PARIDAD TRAIN/SERVE" en el docstring del módulo para el
-# detalle matemático completo de cada fila. `twelvedata: None` significa
-# "este proveedor no lo cubre de forma confiable en el plan free -- se
-# sirve directo desde Stooq".
+# detalle matemático completo de cada fila.
+#
+# RONDA 2 (FIX 2026-08-15) -- ver "ROOT CAUSE RONDA 2" en el docstring del
+# módulo: Stooq demostró en producción (logs post-RONDA 1, requests YA
+# serializadas por el single-flight lock, con reintentos) un rechazo
+# CONSISTENTE, no transitorio, para tráfico desde este hosting -- dejó de
+# ser candidato a fuente PRIMARIA de nada crítico. `twelvedata`/`fred`
+# ahora cubren 4 de los 5 macro tickers como fuente real primaria; `stooq`
+# queda como fallback de último recurso en los 5 (nunca se elimina del
+# todo -- sigue siendo mejor que nada si Twelve Data/FRED tienen un
+# hiccup puntual). Orden de intento real, ver `_fetch_symbol_ohlcv`:
+# FRED (si hay `fred` Y `FRED_API_KEY` configurada) -> Twelve Data (si hay
+# `twelvedata`) -> Stooq (si hay `stooq`) -> caché stale -> falla ruidosa.
 MACRO_SYMBOL_MAP: dict[str, dict[str, Optional[str]]] = {
-    "^GSPC":    {"twelvedata": None,      "stooq": "^spx"},     # FIX 2026-08-15: Twelve Data devuelve
-                                                                  # 404 real en producción para "SPX"
-                                                                  # (time_series) -- índices cash NO
-                                                                  # están cubiertos de forma confiable
-                                                                  # en el plan Basic/free (mismo patrón
-                                                                  # públicamente documentado para VIX,
-                                                                  # ver soporte oficial TD). Se sirve
-                                                                  # SIEMPRE desde Stooq (mismo patrón
-                                                                  # que ya usa ^TNX abajo) -- no un
-                                                                  # 404 silencioso seguido de fallback
-                                                                  # lento, sino la ruta directa.
-    "^VIX":     {"twelvedata": None,      "stooq": "^vix"},     # FIX 2026-08-15: mismo caso -- VIX
-                                                                  # confirmado sin cobertura en TD free
-                                                                  # (documentado públicamente por TD).
-                                                                  # Directo a Stooq.
-    "GC=F":     {"twelvedata": "XAU/USD", "stooq": "xauusd"},   # Oro SPOT -- GC=F en entrenamiento
-                                                                  # es el FUTURO COMEX del contrato
-                                                                  # próximo. Verificado en vivo
-                                                                  # (ago-2026): mismo orden de
-                                                                  # magnitud, base variable en el
-                                                                  # tiempo (no una proporción fija) --
-                                                                  # proxy de mejor esfuerzo, NO
-                                                                  # corregible con un multiplicador
-                                                                  # constante. Ver docstring del módulo.
-    "DX-Y.NYB": {"twelvedata": None,      "stooq": "usdx.f"},   # FIX 2026-08-15: mismo caso -- índice
-                                                                  # ICE crudo, mismo patrón de
-                                                                  # no-cobertura en TD free que ^GSPC/
-                                                                  # ^VIX. Directo a Stooq.
-    "^TNX":     {"twelvedata": None,      "stooq": "10yusy.b"}, # Rendimiento UST 10Y, PORCENTAJE
-                                                                  # DIRECTO (4.558 = 4.558%) en AMBOS
-                                                                  # yfinance/Yahoo y Stooq -- verificado
-                                                                  # en vivo, ago-2026. CORRIGE una
-                                                                  # advertencia previa de este módulo
-                                                                  # que asumía, incorrectamente, la
-                                                                  # vieja convención CBOE "rendimiento
-                                                                  # ×10" -- esa convención NO aplica acá,
-                                                                  # sin transformación de escala. No
-                                                                  # cubierto por Twelve Data free -- se
-                                                                  # sirve siempre desde Stooq.
+    "^GSPC":    {"twelvedata": "SPY",   "stooq": "^spx",     "fred": None},
+    # RONDA 2: SPY *es* el ETF que trackea el S&P 500 (no un proxy
+    # aproximado) -- ya se descarga con éxito en cada scan del universo
+    # (está en REGIME_TICKERS), cero riesgo de proveedor nuevo. Stooq
+    # (^spx) queda como fallback si Twelve Data tuviera un hiccup puntual.
+
+    "^VIX":     {"twelvedata": "VIXY",  "stooq": "^vix",     "fred": None},
+    # RONDA 2: VIXY (ProShares VIX Short-Term Futures ETF) vía Twelve
+    # Data -- proxy de futuros de corto plazo, no el índice cash exacto
+    # (roll yield/contango introduce deriva de largo plazo que el índice
+    # no tiene), mismo tipo de caveat ya aceptado para GC=F/XAU-USD abajo.
+    # El shock día a día (lo que SENTIMENT_SCORE/el tensor necesitan)
+    # sigue correlacionado. Cubierto por el plan Basic gratuito de TD
+    # como cualquier ETF/equity normal (mismo trato que SPY/AAPL).
+
+    "GC=F":     {"twelvedata": "XAU/USD", "stooq": "xauusd", "fred": None},
+    # SIN CAMBIO en RONDA 2 -- ya vía Twelve Data desde la migración
+    # original, nunca dependió de Stooq como primaria (por eso nunca
+    # apareció en los logs de fallo). Oro SPOT -- GC=F en entrenamiento es
+    # el FUTURO COMEX del contrato próximo; verificado en vivo (ago-2026):
+    # mismo orden de magnitud, base variable en el tiempo (no una
+    # proporción fija) -- proxy de mejor esfuerzo, NO corregible con un
+    # multiplicador constante. Ver docstring del módulo.
+
+    "DX-Y.NYB": {"twelvedata": "UUP",   "stooq": "usdx.f",   "fred": None},
+    # RONDA 2: UUP (Invesco DB US Dollar Index Bullish Fund) vía Twelve
+    # Data -- diseñado explícitamente para trackear la MISMA canasta de
+    # divisas que el USDX, proxy de alta fidelidad (no una aproximación
+    # libre). Stooq (usdx.f) queda como fallback de último recurso.
+
+    "^TNX":     {"twelvedata": None,    "stooq": "10yusy.b", "fred": "DGS10"},
+    # RONDA 2: ÚNICO macro ticker donde NO hay un ETF de precio que sirva
+    # de proxy sin inventar un signo/escala -- un rendimiento (yield) y el
+    # precio de un ETF de bonos se mueven en direcciones opuestas con una
+    # escala que depende de la duration (no un factor CONSTANTE, a
+    # diferencia de todos los demás casos de esta tabla) -- forzar esa
+    # conversión violaría "cero cifras inventadas". En vez de eso: FRED
+    # (`api.stlouisfed.org`, serie oficial `DGS10` = rendimiento UST10Y
+    # real) como fuente PRIMARIA -- 100% gratis, API REST real diseñada
+    # para tráfico programático, no comparte el problema de bloqueo de
+    # Stooq. Requiere `FRED_API_KEY` (gratis, ver docstring del módulo);
+    # sin ella, cae directo a Stooq (mismo comportamiento que antes de
+    # RONDA 2, ya con las mejoras de resiliencia de RONDA 1 -- single-
+    # flight, reintentos, caché stale). Rendimiento UST 10Y, PORCENTAJE
+    # DIRECTO (4.558 = 4.558%) tanto en Stooq/yfinance/Yahoo como en FRED
+    # -- verificado en vivo, ago-2026, sin transformación de escala
+    # adicional necesaria entre proveedores.
 }
 
 
@@ -502,6 +632,64 @@ def _td_payload_to_df(payload: dict) -> Optional[pd.DataFrame]:
 
 
 # ---------------------------------------------------------------------------
+# FRED (Federal Reserve Economic Data) -- fuente PRIMARIA nueva (RONDA 2)
+# para ^TNX (serie DGS10). API REST oficial del gobierno de EE.UU.,
+# diseñada para tráfico programático -- ver ROOT CAUSE RONDA 2 en el
+# docstring del módulo. 100% gratis, requiere `FRED_API_KEY` (opcional: si
+# no está seteada, este proveedor se salta en silencio y el caller cae al
+# siguiente en la cadena, sin romper nada para quien no la configuró).
+# ---------------------------------------------------------------------------
+
+def _fred_series_daily(series_id: str, tail_days: int, attempts: int = 3) -> Optional[pd.Series]:
+    """
+    Devuelve una `pd.Series` de Close diario (valor de la serie FRED, ya en
+    la unidad publicada -- para DGS10, porcentaje directo, ej. 4.558 =
+    4.558%, misma convención que Stooq/yfinance ya documentada en
+    MACRO_SYMBOL_MAP). FRED marca los días sin observación (feriados,
+    fines de semana ya vienen excluidos por la API, pero algún feriado
+    bancario puntual puede venir como ".") con el string "." -- se
+    descartan como NaN, nunca se interpolan ni se inventan.
+    """
+    if not FRED_API_KEY:
+        return None
+
+    params = {
+        "series_id": series_id,
+        "api_key": FRED_API_KEY,
+        "file_type": "json",
+        "sort_order": "desc",
+        "limit": str(tail_days),
+    }
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            resp = requests.get(FRED_BASE_URL, params=params, timeout=FRED_TIMEOUT_S)
+            if resp.status_code == 429:
+                raise RuntimeError(f"FRED rate limit (429): {resp.text[:200]}")
+            resp.raise_for_status()
+            payload = resp.json()
+            observations = payload.get("observations") if isinstance(payload, dict) else None
+            if not observations:
+                return None
+
+            df = pd.DataFrame(observations)
+            if "date" not in df.columns or "value" not in df.columns:
+                return None
+            df["date"] = pd.to_datetime(df["date"])
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")  # "." (sin dato) -> NaN, nunca inventado
+            series = df.set_index("date").sort_index()["value"].dropna()
+            return series.tail(tail_days) if not series.empty else None
+        except Exception as exc:  # noqa: BLE001 -- reintentamos cualquier fallo transitorio
+            last_exc = exc
+            if attempt < attempts - 1:
+                time.sleep(1.5 * (attempt + 1))
+
+    logger.warning("FRED agotó reintentos para la serie '%s': %r", series_id, last_exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Stooq -- fallback CSV sin key (mismo endpoint que ya usaba quanti_engine.py)
 # ---------------------------------------------------------------------------
 
@@ -570,26 +758,45 @@ def _fetch_symbol_ohlcv(
     td_symbol: Optional[str],
     stooq_symbol: Optional[str],
     min_sessions: int,
+    fred_series_id: Optional[str] = None,
 ) -> pd.DataFrame:
     cached = _cache_get(f"ohlcv:{internal_key}")
     if cached is not None and len(cached) >= min(min_sessions, 30):
         return cached
 
-    # FIX 2026-08-15 -- SINGLE-FLIGHT (ver ROOT CAUSE en el docstring del
-    # módulo). El universo completo (10 tickers, escaneado en paralelo por
-    # `prediccion._scan_universe`) comparte los MISMOS 5 macro tickers: sin
-    # este lock, hasta 10 hilos pedían '^GSPC' (u otro macro ticker) a la
-    # red AL MISMO TIEMPO, disparando la ráfaga que Stooq interpreta como
-    # abuso. Con el lock, solo el primer hilo en tomarlo golpea la red; el
-    # resto espera y reusa lo que ese hilo deja en caché -- de ahí el
-    # segundo `_cache_get` adentro (double-checked): si otro hilo ya
-    # resolvió el símbolo mientras esperábamos el lock, no repetimos nada.
+    # FIX 2026-08-15 -- SINGLE-FLIGHT (ver ROOT CAUSE RONDA 1 en el
+    # docstring del módulo). El universo completo (10 tickers, escaneado en
+    # paralelo por `prediccion._scan_universe`) comparte los MISMOS 5 macro
+    # tickers: sin este lock, hasta 10 hilos pedían '^GSPC' (u otro macro
+    # ticker) a la red AL MISMO TIEMPO. Con el lock, solo el primer hilo en
+    # tomarlo golpea la red; el resto espera y reusa lo que ese hilo deja
+    # en caché -- de ahí el segundo `_cache_get` adentro (double-checked):
+    # si otro hilo ya resolvió el símbolo mientras esperábamos el lock, no
+    # repetimos nada.
     with _lock_for(internal_key):
         cached = _cache_get(f"ohlcv:{internal_key}")
         if cached is not None and len(cached) >= min(min_sessions, 30):
             return cached
 
-        df = _td_time_series(td_symbol, outputsize=DEFAULT_HISTORY_SESSIONS) if td_symbol else None
+        df: Optional[pd.DataFrame] = None
+
+        # RONDA 2 -- FRED primero si el símbolo lo tiene mapeado (hoy solo
+        # ^TNX, ver MACRO_SYMBOL_MAP). Es una API oficial diseñada para
+        # tráfico programático, no un endpoint de scraping con protección
+        # anti-bot como Stooq -- ver ROOT CAUSE RONDA 2. `_fred_series_daily`
+        # ya devuelve `None` sin tocar la red si `FRED_API_KEY` no está
+        # configurada, así que este bloque es un no-op limpio en ese caso.
+        if fred_series_id:
+            fred_series = _fred_series_daily(fred_series_id, tail_days=DEFAULT_HISTORY_SESSIONS + 30)
+            if fred_series is not None and not fred_series.empty:
+                df = pd.DataFrame({"close": fred_series})
+                df["open"] = df["close"]
+                df["high"] = df["close"]
+                df["low"] = df["close"]
+                df["volume"] = np.nan
+
+        if df is None or df.empty:
+            df = _td_time_series(td_symbol, outputsize=DEFAULT_HISTORY_SESSIONS) if td_symbol else None
 
         if df is None or df.empty:
             if stooq_symbol is not None:
@@ -604,24 +811,24 @@ def _fetch_symbol_ohlcv(
                         "'%s': sirviendo desde fallback Stooq -- solo Close real; "
                         "Open/High/Low replicados desde Close y Volume=NaN "
                         "(ATR_14/OBV_ROC_20/ADX_14/STOCH_K_14 quedan degradados para "
-                        "este ticker hasta que Twelve Data vuelva a responder).",
+                        "este ticker hasta que la fuente primaria vuelva a responder).",
                         internal_key,
                     )
 
             if df is None or df.empty:
                 # FIX 2026-08-15 -- CACHÉ STALE COMO ÚLTIMO RECURSO, antes de
-                # rendirse. Twelve Data Y Stooq fallaron los dos en vivo; en
-                # vez de lanzar de inmediato (y con eso tumbar los 10
+                # rendirse. TODAS las fuentes configuradas fallaron en vivo;
+                # en vez de lanzar de inmediato (y con eso tumbar los 10
                 # forecasts que dependen de este mismo macro ticker), se
                 # busca la última descarga exitosa en disco sin importar si
                 # el TTL de 6h venció. Solo si NUNCA hubo una descarga
-                # exitosa (arranque en frío + ambos proveedores caídos a la
+                # exitosa (arranque en frío + todas las fuentes caídas a la
                 # vez) se lanza el RuntimeError real.
                 stale = _cache_get(f"ohlcv:{internal_key}", ignore_ttl=True)
                 if stale is not None and not stale.empty:
                     stale_age_h = stale.attrs.get("_stale_age_hours")
                     logger.warning(
-                        "'%s': Twelve Data y Stooq fallaron los dos en vivo -- "
+                        "'%s': todas las fuentes en vivo configuradas fallaron -- "
                         "sirviendo caché STALE (%s hs de antigüedad) en vez de "
                         "tumbar el forecast completo. Reintentará una descarga "
                         "en vivo en la próxima llamada.",
@@ -629,16 +836,12 @@ def _fetch_symbol_ohlcv(
                     )
                     return stale
 
-                if stooq_symbol is None:
-                    raise RuntimeError(
-                        f"Sin datos para '{internal_key}': Twelve Data no respondió, "
-                        "no hay símbolo Stooq de fallback registrado para este "
-                        "ticker, y no hay caché previa (ni siquiera stale) que servir."
-                    )
+                fuentes = [n for n, v in (("FRED", fred_series_id), ("Twelve Data", td_symbol), ("Stooq", stooq_symbol)) if v]
                 raise RuntimeError(
-                    f"Sin datos para '{internal_key}': Twelve Data y Stooq "
-                    "fallaron ambos y no hay caché previa (ni siquiera stale) "
-                    "que servir -- radar degradado para este símbolo."
+                    f"Sin datos para '{internal_key}': todas las fuentes configuradas "
+                    f"({', '.join(fuentes) if fuentes else 'ninguna'}) fallaron y no hay "
+                    "caché previa (ni siquiera stale) que servir -- radar degradado "
+                    "para este símbolo."
                 )
 
         _cache_set(f"ohlcv:{internal_key}", df)
@@ -674,7 +877,8 @@ def fetch_feature_ohlcv(ticker: str, macro_tickers: list[str], min_sessions: int
     for macro_ticker in macro_tickers:
         mapping = resolve_macro_symbol(macro_ticker)
         macro_df = _fetch_symbol_ohlcv(
-            macro_ticker, mapping.get("twelvedata"), mapping.get("stooq"), min_sessions
+            macro_ticker, mapping.get("twelvedata"), mapping.get("stooq"), min_sessions,
+            fred_series_id=mapping.get("fred"),
         )
         out[macro_ticker] = macro_df["close"].reindex(out.index)
 
@@ -700,9 +904,11 @@ def fetch_close_history(internal_key: str, min_days: int) -> pd.Series:
     if internal_key in MACRO_SYMBOL_MAP:
         mapping = resolve_macro_symbol(internal_key)
         td_symbol, stooq_symbol = mapping.get("twelvedata"), mapping.get("stooq")
+        fred_series_id = mapping.get("fred")
     else:
         td_symbol = _resolve_td_symbol(internal_key)
         stooq_symbol = _resolve_stooq_symbol(internal_key)
+        fred_series_id = None
 
-    df = _fetch_symbol_ohlcv(internal_key, td_symbol, stooq_symbol, min_days)
+    df = _fetch_symbol_ohlcv(internal_key, td_symbol, stooq_symbol, min_days, fred_series_id=fred_series_id)
     return df["close"].dropna()
