@@ -15,7 +15,7 @@ modelo global, este script entrena DOS ciclos de optimización completamente
 independientes y secuenciales, uno por régimen:
 
     EQUITY  -> ['AAPL','MSFT','NVDA','TSLA','GOOGL','AMZN','META','SPY']
-    CRYPTO  -> ['BTC-USD', 'ETH-USD']
+    CRYPTO  -> ['BTC/USD', 'ETH/USD']  (V12: formato estándar, ver REGIMES)
 
 Cada especialista es una instancia SEPARADA de la MISMA arquitectura
 (invarianza topológica estricta, ver `build_model`): no se comparten pesos,
@@ -83,6 +83,28 @@ ningún remapeo — `quanti_engine.py` sigue leyendo `y_pred[:, 1]` tal cual):
        split de train (cero fuga hacia test). `equity_specialist`
        (8 tickers, volumen suficiente) queda con `oversample_factor=1.0`
        -> no-op exacto, cero cambio de comportamiento respecto a V5.
+
+NUEVO EN V12 — FIX CRASH `crypto_specialist` + ALINEACIÓN TEMPORAL DE NOTICIAS:
+    6) Universo cripto reexpresado en formato estándar `BTC/USD`/`ETH/USD`
+       (el guion `BTC-USD` era un artefacto propio del ticker de Yahoo
+       Finance; Twelve Data/Stooq no lo resuelven -> DataFrame vacío ->
+       `MinMaxScaler` colapsaba con shape (0, 17)).
+    7) Data Quality Check por activo (Fase A/2, Tolerancia a Fallos):
+       (a) `_fetch_all_symbols_flat` ya NO aborta la descarga completa si
+       un símbolo individual falla en ambos proveedores -- lo loguea y
+       continúa con el resto del universo; (b) `run_regime_pipeline`
+       valida, POR ACTIVO, presencia real de columnas OHLCV y un piso
+       matemático de filas post-limpieza (`MIN_ROWS_PER_ASSET`) antes de
+       tocar `build_asset_dataset`/el scaler -- un activo sin datos se
+       omite con `continue` y el régimen sigue con el resto, en vez de
+       colapsar el bucle de entrenamiento entero.
+    8) Alineación temporal `NEWS_SENTIMENT_SCORE` (`engineer_asset`): el
+       índice pasado a `get_daily_news_sentiment` se normaliza a tz-naive
+       y se trunca a medianoche ANTES del merge (mismo patrón defensivo
+       que `_cache_is_stale`), eliminando el desfase tz-aware/tz-naive o
+       datetime64/date que empujaba el `merge_asof` fuera de la tolerancia
+       de 10 días; se añade además un chequeo de cobertura post-alineación
+       que advierte si la señal sigue muerta.
 """
 
 from __future__ import annotations
@@ -165,7 +187,11 @@ REGIMES: dict[str, dict] = {
         "oversample_factor": 1.0,  # 8 tickers, volumen ya suficiente -> no-op exacto (idéntico a V5)
     },
     "crypto_specialist": {
-        "tickers": ["BTC-USD", "ETH-USD"],
+        # V12 FIX (CRASH CRÍTICO): "BTC-USD"/"ETH-USD" (guion) era el
+        # formato propio de yfinance -- Twelve Data/Stooq no lo resuelven,
+        # devuelven DataFrame vacío y el MinMaxScaler colapsaba con
+        # shape=(0, 17). Formato estándar de par cripto ("BASE/QUOTE").
+        "tickers": ["BTC/USD", "ETH/USD"],
         "oversample_factor": CRYPTO_OVERSAMPLE_FACTOR,
     },
 }
@@ -176,6 +202,14 @@ LOOKBACK = 60
 TRAIN_RATIO = 0.8
 SEED = 42
 ASSET_EMBED_DIM = 8
+
+# V12 (Requerimiento 1, Data Quality Check) -- piso matemático de filas
+# post-limpieza para que `build_asset_dataset` produzca AL MENOS 1 ventana
+# de train: split_idx=int(n*TRAIN_RATIO) debe superar LOOKBACK, o
+# `window_split` (=split_idx-LOOKBACK) cae negativo y corrompe en SILENCIO
+# el slicing train/test (Python indexa negativo desde el final) en vez de
+# fallar ruidosamente. Mejor rechazar el activo acá, explícito.
+MIN_ROWS_PER_ASSET = int(np.ceil((LOOKBACK + 1) / TRAIN_RATIO))
 
 SENTIMENT_LOOKBACK = 20         # ventana de la correlación móvil activo<->macro (V4)
 SENTIMENT_MACRO_PROXY = "^VIX"  # factor macro de referencia; fallback: MACRO_TICKERS[0]
@@ -451,10 +485,26 @@ def _fetch_all_symbols_flat(tickers: list[str], macro_tickers: list[str], period
     sessions = _period_to_sessions(period)
     pieces: list[pd.DataFrame] = []
 
+    # V12 (Requerimiento 1, Tolerancia a Fallos): un símbolo individual que
+    # falle en TODOS los proveedores (`_fetch_symbol_history` agota FRED/TD/
+    # Stooq y lanza RuntimeError) ya NO aborta la descarga COMPLETA del
+    # régimen -- se loguea y se omite del `pieces`, dejando que
+    # `run_regime_pipeline` lo detecte vía el Data Quality Check (columnas
+    # OHLCV ausentes) y siga con el resto del universo. Los factores macro
+    # (abajo) siguen siendo fatales a propósito: son features COMPARTIDOS
+    # por todos los activos del régimen, no hay "régimen parcial" posible
+    # sin ellos.
     for ticker in tickers:
-        df = _fetch_symbol_history(
-            ticker, _resolve_td_symbol(ticker), _resolve_stooq_symbol(ticker), sessions,
-        )
+        try:
+            df = _fetch_symbol_history(
+                ticker, _resolve_td_symbol(ticker), _resolve_stooq_symbol(ticker), sessions,
+            )
+        except RuntimeError as exc:
+            logger.error(
+                "[DQ] '%s': fallo TOTAL de descarga (Twelve Data + Stooq) -- %s -- "
+                "se OMITE del universo; el resto de la descarga continúa.", ticker, exc,
+            )
+            continue
         pieces.append(df[["open", "high", "low", "close", "volume"]].rename(columns={
             "open": f"{ticker}_Open", "high": f"{ticker}_High", "low": f"{ticker}_Low",
             "close": f"{ticker}_Close", "volume": f"{ticker}_Volume",
@@ -691,10 +741,46 @@ def engineer_asset(all_data: pd.DataFrame, ticker: str, macro_tickers: list[str]
     df["ADX_14"] = compute_adx(high, low, close)                    # ya acotado [0,100] — sin cambios
     df["STOCH_K_14"] = compute_stochastic_k(high, low, close)       # ya acotado [0,100] — sin cambios
 
-    # --- V5 (Requerimiento 1): NEWS_SENTIMENT_SCORE vía yfinance/Finnhub + FinBERT.
+    # --- V5 (Requerimiento 1): NEWS_SENTIMENT_SCORE vía Finnhub + FinBERT.
     # Se alinea temporalmente contra el índice YA depurado del activo, ANTES
     # de recortar filas por ffill/dropna final, igual que el resto de técnicos.
-    df["NEWS_SENTIMENT_SCORE"] = get_daily_news_sentiment(ticker, df.index)
+    #
+    # V12 FIX (Requerimiento 2, Alineación Temporal): `df.index` llega con
+    # timestamps heterogéneos entre proveedores tras el outer join de
+    # `_fetch_all_symbols_flat` -- Twelve Data puede devolver tz-aware
+    # (UTC), FRED/Stooq tz-naive (mismo patrón defensivo que
+    # `_cache_is_stale`, arriba). Sin normalizar, el merge_asof interno de
+    # `get_daily_news_sentiment` compara datetime64 tz-aware contra
+    # tz-naive/`date` y NINGUNA fecha cae dentro de la tolerancia (auditoría
+    # previa: NEWS_SENTIMENT_SCORE rank 17/17, atribución≈0.0) aunque el día
+    # calendario SÍ coincida. Se normaliza a un índice tz-naive truncado a
+    # medianoche -- el grano real, diario, de OHLCV y de los titulares --
+    # ANTES de pedir el score.
+    news_index = pd.DatetimeIndex(df.index)
+    if news_index.tz is not None:
+        news_index = news_index.tz_convert("UTC").tz_localize(None)
+    news_index = news_index.normalize()
+
+    news_scores = get_daily_news_sentiment(ticker, news_index)
+    # Asignación POSICIONAL (np.asarray), no por índice: `news_index` es una
+    # copia normalizada de `df.index`, no el mismo objeto -- asignar por
+    # label aquí produciría NaN en cada fila si la función respeta (como se
+    # espera) el índice recibido en vez de devolver un array plano.
+    df["NEWS_SENTIMENT_SCORE"] = np.asarray(news_scores, dtype=np.float64)
+
+    # Data Quality Check (Requerimiento 2) -- cobertura real de la señal:
+    # si tras la alineación la enorme mayoría de las filas quedó en 0.0 (sin
+    # match dentro de la tolerancia del merge_asof), el feature sigue vivo
+    # mecánicamente pero muerto en atribución -- se advierte temprano en vez
+    # de descubrirlo 100 épocas después en el ranking de gradiente.
+    news_coverage = float((df["NEWS_SENTIMENT_SCORE"] != 0.0).mean())
+    if news_coverage < 0.05:
+        logger.warning(
+            "[DQ] '%s': NEWS_SENTIMENT_SCORE con cobertura=%.1f%% tras la "
+            "alineación temporal (<5%% de filas con match real dentro de la "
+            "tolerancia) -- revisar ventana de noticias vs. histórico OHLCV "
+            "en data_pipeline.get_daily_news_sentiment.", ticker, news_coverage * 100,
+        )
 
     df = df.ffill().dropna()
 
@@ -1367,7 +1453,7 @@ def plot_regime_evaluation(results: dict[str, dict], regime_name: str, output_pa
 # ============================================================
 def run_regime_pipeline(regime_name: str, regime_cfg: dict) -> dict:
     """Ejecuta las Fases A-E completas para UN especialista y persiste sus artefactos."""
-    tickers = regime_cfg["tickers"]
+    configured_tickers = regime_cfg["tickers"]
     oversample_factor = float(regime_cfg.get("oversample_factor", 1.0))
     arch = REGIME_ARCHITECTURE[regime_name]
 
@@ -1376,26 +1462,60 @@ def run_regime_pipeline(regime_name: str, regime_cfg: dict) -> dict:
     # inferencia, idéntico en corrida local y en el cron de CI/CD.
     output_dir = MODELS_ROOT / regime_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    asset_to_id = {t: i for i, t in enumerate(tickers)}
+    # V12 (Requerimiento 1, Tolerancia a Fallos): el id de cada activo se
+    # fija sobre el universo CONFIGURADO (no el validado más abajo) -- un
+    # activo que el Data Quality Check descarte esta corrida simplemente
+    # deja su fila de `asset_embedding` sin entrenar (nunca recibe
+    # gradiente), en vez de forzar un re-mapeo de ids que correría el
+    # riesgo de desincronizar `asset_to_id` respecto al `scalers_dict.pkl`
+    # que ya consume `quanti_engine.py` en inferencia entre corridas.
+    asset_to_id = {t: i for i, t in enumerate(configured_tickers)}
 
     logger.info("=" * 78)
-    logger.info("REGIMEN: %s  |  Universo: %s  |  BiLSTM=%du  heads=%d  "
+    logger.info("REGIMEN: %s  |  Universo configurado: %s  |  BiLSTM=%du  heads=%d  "
                 "residual_extra=%s  dropout=%.2f  L2=%.0e",
-                regime_name, tickers, arch["lstm_units"], arch["mha_heads"],
+                regime_name, configured_tickers, arch["lstm_units"], arch["mha_heads"],
                 arch["extra_residual_block"], arch["dropout_rate"], arch["dense_l2_reg"])
     logger.info("=" * 78)
 
     logger.info("[1/5] Descargando %d activos (OHLCV) + %d factores macro (%s)...",
-                len(tickers), len(MACRO_TICKERS), PERIOD)
-    all_market_data = download_all(tickers, MACRO_TICKERS, PERIOD, cache_tag=regime_name)
+                len(configured_tickers), len(MACRO_TICKERS), PERIOD)
+    all_market_data = download_all(configured_tickers, MACRO_TICKERS, PERIOD, cache_tag=regime_name)
 
-    logger.info("[2/5] Ingeniería de features y construcción de dataset por activo...")
+    logger.info("[2/5] Data Quality Check + ingeniería de features + dataset por activo...")
     feature_scalers, target_scalers = {}, {}
     X_train_parts, y_train_parts, asset_id_train_parts = [], [], []
     test_sets = {}
+    tickers: list[str] = []  # universo VALIDADO -- se reconstruye activo por activo, abajo
 
-    for ticker in tickers:
+    for ticker in configured_tickers:
+        # --- DQ Check 1/2: ¿el activo tiene columnas OHLCV reales tras la
+        # descarga? (símbolo no resuelto por Twelve Data/Stooq -> ausentes,
+        # ver `_fetch_all_symbols_flat`) ---
+        required_raw_cols = {f"{ticker}_{field}" for field in ("Open", "High", "Low", "Close", "Volume")}
+        if not required_raw_cols.issubset(all_market_data.columns):
+            logger.error(
+                "[DQ] '%s': CERO columnas OHLCV en la descarga (símbolo no resuelto "
+                "por Twelve Data/Stooq) -- se OMITE del régimen '%s'; el resto del "
+                "universo continúa entrenando con normalidad.", ticker, regime_name,
+            )
+            continue
+
         df_asset = engineer_asset(all_market_data, ticker, MACRO_TICKERS)
+
+        # --- DQ Check 2/2: ¿sobreviven filas suficientes tras limpieza/
+        # alineación (ffill/dropna, merge de noticias) para al menos 1
+        # ventana de train? (raíz exacta del ValueError original:
+        # MinMaxScaler.fit sobre shape=(0, 17)) ---
+        if len(df_asset) < MIN_ROWS_PER_ASSET:
+            logger.error(
+                "[DQ] '%s': %d fila(s) utilizables tras limpieza/alineación temporal "
+                "(mínimo requerido=%d, LOOKBACK=%d) -- se OMITE del régimen '%s'; el "
+                "resto del universo continúa entrenando con normalidad.",
+                ticker, len(df_asset), MIN_ROWS_PER_ASSET, LOOKBACK, regime_name,
+            )
+            continue
+
         train, test, f_scaler, t_scaler = build_asset_dataset(
             df_asset, ticker, LOOKBACK, TRAIN_RATIO, asset_to_id
         )
@@ -1406,7 +1526,21 @@ def run_regime_pipeline(regime_name: str, regime_cfg: dict) -> dict:
         X_train_parts.append(train["X"])
         y_train_parts.append(train["y"])
         asset_id_train_parts.append(train["asset_id"])
+        tickers.append(ticker)
         logger.info("      %-10s train=%5d  test=%5d", ticker, len(train["X"]), len(test["X"]))
+
+    if not tickers:
+        raise RuntimeError(
+            f"Régimen '{regime_name}': el Data Quality Check descartó los "
+            f"{len(configured_tickers)} activos configurados {configured_tickers} -- "
+            f"cero muestras utilizables, imposible entrenar. Abortando el régimen."
+        )
+    if len(tickers) < len(configured_tickers):
+        omitted = [t for t in configured_tickers if t not in tickers]
+        logger.warning(
+            "[DQ] Régimen '%s' entrena con %d/%d activos -- omitidos por el Data "
+            "Quality Check: %s", regime_name, len(tickers), len(configured_tickers), omitted,
+        )
 
     X_train = np.concatenate(X_train_parts, axis=0)
     y_train = np.concatenate(y_train_parts, axis=0)
@@ -1433,7 +1567,7 @@ def run_regime_pipeline(regime_name: str, regime_cfg: dict) -> dict:
     n_fit_samples = int(len(X_train) * (1 - VALIDATION_SPLIT))
     steps_per_epoch = max(1, n_fit_samples // BATCH_SIZE)
     model, gamma_variable = build_model(
-        n_timesteps=LOOKBACK, n_features=N_FEATURES, n_assets=len(tickers),
+        n_timesteps=LOOKBACK, n_features=N_FEATURES, n_assets=len(configured_tickers),
         steps_per_epoch=steps_per_epoch, regime_name=regime_name,
         huber_delta=HUBER_DELTA, gamma_initial=GAMMA_INITIAL,
         variance_lambda=VARIANCE_LAMBDA, variance_cap=VARIANCE_CAP,
