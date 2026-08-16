@@ -105,6 +105,34 @@ NUEVO EN V12 — FIX CRASH `crypto_specialist` + ALINEACIÓN TEMPORAL DE NOTICIA
        datetime64/date que empujaba el `merge_asof` fuera de la tolerancia
        de 10 días; se añade además un chequeo de cobertura post-alineación
        que advierte si la señal sigue muerta.
+
+NUEVO EN V13 — FIX CRASH `crypto_specialist` (0 filas utilizables), CAUSA RAÍZ:
+V12 normalizaba el índice de noticias pero NO el índice OHLCV/macro que lo
+origina -- Twelve Data (tz-aware UTC) mezclado con FRED/Stooq (tz-naive) en
+el outer join de `_fetch_all_symbols_flat` producía DOS entradas de índice
+por día calendario, no comparables entre sí; sobre eso, un `ffill().dropna()`
+ciego en `engineer_asset` trataba cada NaN de fin de semana en las columnas
+macro (Treasuries/SPY/Oro/DXY, L-V) igual que un NaN real del propio OHLCV
+del activo, aniquilando ~2/7 del dataset por ronda en un activo 24/7 -- las
+dos fugas se componían hasta dejar 0 filas post-limpieza para BTC/USD y
+ETH/USD. Dos fixes, CERO cambios a Fase B/arquitectura:
+    9) `_normalize_daily_index`/`_to_naive_daily_index` (Requerimiento 2):
+       único punto de verdad de normalización temporal -- tz-naive,
+       truncado a medianoche -- aplicado a CADA pieza (activo y macro) de
+       `_fetch_all_symbols_flat` ANTES del outer join, y reutilizado (en
+       vez de duplicado) por la alineación de `NEWS_SENTIMENT_SCORE`.
+    10) `engineer_asset` (Requerimiento 1): `ffill(limit=4)` aplicado
+        SOLO a las columnas macro (nunca al OHLCV propio del activo)
+        seguido de `dropna(subset=OHLCV propio)` -- el viernes se proyecta
+        a sábado/domingo/feriados cortos para activos 24/7; para equity es
+        no-op exacto (sus propias columnas ya vienen NaN los fines de
+        semana, nada que rescatar).
+    11) `_resolve_stooq_symbol_safe` + `_CRYPTO_STOOQ_OVERRIDES`
+        (Requerimiento 3): Stooq no resuelve notación "BASE/QUOTE" --
+        mapeo local BTC/USD->btcusd.v, ETH/USD->ethusd.v para que el
+        fallback Stooq sea real si Twelve Data falla/agota cuota (mapeo
+        LOCAL a este script, market_data.py sigue siendo la única fuente
+        de verdad de proveedores para el resto del sistema).
 """
 
 from __future__ import annotations
@@ -472,6 +500,63 @@ def _fetch_symbol_history(internal_key: str, td_symbol: str | None, stooq_symbol
     return df
 
 
+# V13 FIX — MAPEO LOCAL DE CRIPTO PARA EL FALLBACK STOOQ (Requerimiento 3):
+# Stooq no resuelve pares en notación "BASE/QUOTE" (formato estándar que sí
+# entienden Twelve Data y el resto del pipeline) -- su convención propia
+# para moneda virtual es sufijo ".V" sobre el par sin separador
+# ("btcusd.v", "ethusd.v"). Sin este mapeo, `_resolve_stooq_symbol` devuelve
+# un símbolo que Stooq no resuelve -> Stooq deja de ser un fallback real
+# para cripto si Twelve Data falla/agota cuota. Mapeo LOCAL (no toca
+# market_data.py, single source of truth de proveedores que sigue sirviendo
+# quanti_engine.py en inferencia) -- aplica solo sobre el universo
+# `crypto_specialist` de este script.
+_CRYPTO_STOOQ_OVERRIDES: dict[str, str] = {
+    "BTC/USD": "btcusd.v",
+    "ETH/USD": "ethusd.v",
+}
+
+
+def _resolve_stooq_symbol_safe(ticker: str) -> str | None:
+    """`_resolve_stooq_symbol` (market_data.py) + override local de cripto (ver arriba)."""
+    override = _CRYPTO_STOOQ_OVERRIDES.get(ticker)
+    return override if override is not None else _resolve_stooq_symbol(ticker)
+
+
+def _to_naive_daily_index(idx: pd.Index) -> pd.DatetimeIndex:
+    """tz-aware (cualquier tz) o tz-naive -> SIEMPRE tz-naive, truncado a
+    medianoche. Único punto de verdad de normalización temporal del
+    módulo -- usado tanto para alinear OHLCV/macro (`_normalize_daily_index`)
+    como el índice de `NEWS_SENTIMENT_SCORE` en `engineer_asset`."""
+    idx = pd.DatetimeIndex(idx)
+    if idx.tz is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    return idx.normalize()
+
+
+def _normalize_daily_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    V13 FIX (Requerimiento 2, raíz COMÚN de la fuga de Timezones y de la
+    fuga Crypto vs Macro): Twelve Data devuelve índice tz-aware (UTC
+    explícito), FRED/Stooq tz-naive -- mezclar ambos en
+    `pd.concat(pieces, axis=1, join="outer")` produce DOS entradas de
+    índice distintas para el MISMO día calendario (tz-aware vs tz-naive NO
+    son comparables/equivalentes para pandas), así que un ffill/dropna
+    corriente abajo nunca ve ambas mitades como una sola fila -- la causa
+    real de que un ffill aparentemente correcto siguiera aniquilando el
+    dataset. Se normaliza CADA pieza (activo Y macro) al mismo grano --
+    tz-naive, medianoche -- ANTES de la unión, garantizando una sola fila
+    real por día calendario para todos los proveedores.
+    """
+    out = df.copy()
+    out.index = _to_naive_daily_index(out.index)
+    if out.index.has_duplicates:
+        # Colisión post-normalización (ej. dos timestamps intradía cayendo
+        # en la misma medianoche tras truncar) -- se conserva la ÚLTIMA
+        # observación real del día, nunca un promedio sintético.
+        out = out.groupby(level=0).last()
+    return out.sort_index()
+
+
 def _fetch_all_symbols_flat(tickers: list[str], macro_tickers: list[str], period: str) -> pd.DataFrame:
     """
     Reemplazo directo de `yf.download(all_symbols, period=period,
@@ -497,7 +582,7 @@ def _fetch_all_symbols_flat(tickers: list[str], macro_tickers: list[str], period
     for ticker in tickers:
         try:
             df = _fetch_symbol_history(
-                ticker, _resolve_td_symbol(ticker), _resolve_stooq_symbol(ticker), sessions,
+                ticker, _resolve_td_symbol(ticker), _resolve_stooq_symbol_safe(ticker), sessions,
             )
         except RuntimeError as exc:
             logger.error(
@@ -505,6 +590,7 @@ def _fetch_all_symbols_flat(tickers: list[str], macro_tickers: list[str], period
                 "se OMITE del universo; el resto de la descarga continúa.", ticker, exc,
             )
             continue
+        df = _normalize_daily_index(df)  # V13: grano diario tz-naive uniforme ANTES del outer join
         pieces.append(df[["open", "high", "low", "close", "volume"]].rename(columns={
             "open": f"{ticker}_Open", "high": f"{ticker}_High", "low": f"{ticker}_Low",
             "close": f"{ticker}_Close", "volume": f"{ticker}_Volume",
@@ -516,6 +602,7 @@ def _fetch_all_symbols_flat(tickers: list[str], macro_tickers: list[str], period
             macro_ticker, mapping.get("twelvedata"), mapping.get("stooq"), sessions,
             fred_series_id=mapping.get("fred"),
         )
+        df = _normalize_daily_index(df)  # V13: mismo grano que los activos -- ver arriba
         pieces.append(df[["close"]].rename(columns={"close": f"{macro_ticker}_Close"}))
 
     # outer join real por fecha -- preserva calendarios distintos entre
@@ -698,7 +785,35 @@ def engineer_asset(all_data: pd.DataFrame, ticker: str, macro_tickers: list[str]
     macro_close_cols = [f"{m}_Close" for m in macro_tickers]
 
     df = all_data[[close_col, high_col, low_col, vol_col] + macro_close_cols].copy()
-    df = df.ffill().dropna()
+
+    # V13 FIX (Requerimiento 1, Desalineación Crypto vs Macro): cripto opera
+    # 24/7, Treasuries/SPY/Oro/DXY solo L-V -- el outer join deja NaN en las
+    # columnas macro cada sábado/domingo. Un ffill/dropna CIEGO sobre TODO
+    # el subset trataba esos NaN de fin de semana igual que un NaN real del
+    # propio OHLCV del activo -> dropna() aniquilaba cada fila de fin de
+    # semana (~2/7 del dataset de un activo 24/7 por ronda) -- shape (0, 17)
+    # en el log original. Fix de dos pasos, cada uno sellando su propia fuga:
+    #   (a) ffill(limit=4) SOLO sobre las columnas macro -- proyecta el
+    #       último cierre de mercado (viernes) hacia sábado/domingo Y
+    #       feriados largos de hasta 3 días corridos de colchón; un límite
+    #       explícito evita arrastrar silenciosamente un hueco genuino de
+    #       proveedor durante semanas.
+    #   (b) dropna(subset=OHLCV propio) en vez de dropna() global -- la fila
+    #       sobrevive según si el ACTIVO operó ese día, no según si el macro
+    #       (ya proyectado en (a)) tiene dato; para equity (no 24/7) es un
+    #       no-op exacto vs. el comportamiento previo, ya que sus propias
+    #       columnas OHLCV ya vienen NaN los fines de semana.
+    own_ohlcv_cols = [close_col, high_col, low_col, vol_col]
+    macro_nan_before = int(df[macro_close_cols].isna().sum().sum())
+    df[macro_close_cols] = df[macro_close_cols].ffill(limit=4)
+    macro_nan_rescued = macro_nan_before - int(df[macro_close_cols].isna().sum().sum())
+    df = df.dropna(subset=own_ohlcv_cols)
+    if macro_nan_rescued > 0:
+        logger.info(
+            "[DQ] '%s': ffill(limit=4) de macro proyectó valores de viernes -> "
+            "%d celda(s) de fin de semana/feriado rescatadas -> %d filas 24/7 "
+            "retenidas tras dropna(OHLCV propio).", ticker, macro_nan_rescued, len(df),
+        )
 
     close, high, low, volume = df[close_col], df[high_col], df[low_col], df[vol_col]
 
@@ -756,10 +871,7 @@ def engineer_asset(all_data: pd.DataFrame, ticker: str, macro_tickers: list[str]
     # calendario SÍ coincida. Se normaliza a un índice tz-naive truncado a
     # medianoche -- el grano real, diario, de OHLCV y de los titulares --
     # ANTES de pedir el score.
-    news_index = pd.DatetimeIndex(df.index)
-    if news_index.tz is not None:
-        news_index = news_index.tz_convert("UTC").tz_localize(None)
-    news_index = news_index.normalize()
+    news_index = _to_naive_daily_index(df.index)  # V13: mismo primitivo que _normalize_daily_index
 
     news_scores = get_daily_news_sentiment(ticker, news_index)
     # Asignación POSICIONAL (np.asarray), no por índice: `news_index` es una
