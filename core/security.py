@@ -5,11 +5,9 @@ Valida el JWT de Supabase delegando la verificación criptográfica al propio
 backend de Supabase Auth (GoTrue) vía `supabase.auth.get_user()`. No existe
 bypass de desarrollo.
 """
-import asyncio
 import secrets
 import traceback
-import aiosmtplib
-from email.message import EmailMessage
+import httpx
 from core.config import settings
 from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException, Request, status
@@ -226,71 +224,61 @@ async def verify_api_credits(
 
 
 # ---------------------------------------------------------------------------
-# FIX — timeout de SMTP + envío no bloqueante
+# FIX DEFINITIVO — SMTP directo abandonado, migrado a API HTTPS (Resend)
 # ---------------------------------------------------------------------------
-# ROOT CAUSE de "el registro tarda demasiado" + `Timed out connecting to
-# smtp.gmail.com on port 587`:
-#   1) El puerto 587 (STARTTLS) sale bloqueado en el hosting actual (típico
-#      en entornos serverless/cloud que solo abren 443/465 salientes).
-#   2) `aiosmtplib.send(...)` se llamaba sin `timeout` explícito -> default
-#      de 60s. Esos 60s corrían DENTRO del request HTTP porque api/auth.py
-#      hacía `await send_verification_email(...)` en línea: el cliente
-#      esperaba el minuto completo antes de recibir el 201/200.
-# FIX: (a) puerto 465 (SSL implícito) como default -- ver core/config.py --
-# no depende de que 587 esté abierto; (b) techo duro de
-# settings.SMTP_TIMEOUT_SECONDS (15s) con asyncio.wait_for alrededor de TODO
-# el envío, no solo del `timeout` de socket de aiosmtplib; (c) los call
-# sites en api/auth.py ahora agendan send_verification_email /
-# send_password_reset_email como FastAPI BackgroundTask -- el cliente HTTP
-# ya no espera al SMTP en absoluto, ni aunque el techo de 15s se cumpla.
+# ROOT CAUSE real (confirmado con el traceback del segundo fallo): el
+# TimeoutError NO ocurre en el handshake TLS -- ocurre antes, dentro de
+# `aiosmtplib.smtp._create_connection` -> `asyncio.wait_for(connect_coro)`.
+# Es decir, el `CancelledError`/`TimeoutError` salta al intentar abrir la
+# conexión TCP misma, nunca llega a mandar un solo byte. Con 587 (STARTTLS)
+# colgaba igual y con 465 (SSL implícito, ya corregido en la iteración
+# anterior) cuelga exactamente igual: la variable en común no es el modo
+# TLS, es que Hugging Face Spaces filtra a nivel de firewall de red TODO el
+# egress saliente a puertos SMTP (25/465/587), sin importar el protocolo
+# de arriba. Nada configurable en aiosmtplib arregla un paquete que el
+# hosting nunca deja salir. Los mismos logs lo prueban: las llamadas a
+# Supabase (puerto 443/HTTPS) responden 200 OK sin problema -- 443 es el
+# único puerto saliente garantizado en este entorno.
 #
-# FIX #2 (root cause del warning cortado en seco: "... falló vía
-# smtp.gmail.com:465: " sin nada después de los dos puntos): el 465 es SSL
-# implícito -- exige `use_tls=True` / `start_tls=False`. El flag
-# `SMTP_USE_SSL` de settings ya defaultea a True, pero para no depender de
-# que nadie desalinee esa variable con el puerto real (ej. .env viejo con
-# SMTP_USE_SSL=false y SMTP_PORT=465), el modo TLS ahora se deriva del
-# puerto mismo cuando es uno de los dos estándar -- 465 o 587 -- e ignora
-# `SMTP_USE_SSL` en esos dos casos. Además, `except Exception as exc: ...
-# {exc}` en un error de conexión SSL crudo (ssl.SSLError / OSError de
-# socket) puede tener `str(exc)` vacío -- de ahí el log cortado -- así que
-# ahora se loguea `repr(exc)` (nunca vacío, incluye el tipo) + el
-# stacktrace completo.
-def _resolve_tls_mode() -> tuple[bool, bool]:
-    """(use_tls, start_tls) para aiosmtplib.send, derivados del puerto."""
-    if settings.SMTP_PORT == 465:
-        return True, False  # SSL implícito
-    if settings.SMTP_PORT == 587:
-        return False, True  # STARTTLS
-    return settings.SMTP_USE_SSL, not settings.SMTP_USE_SSL  # puerto no estándar
+# FIX: se abandona SMTP directo por completo y el envío se hace por HTTPS
+# vía la API REST de Resend (https://resend.com) -- mismo patrón que ya usa
+# este backend para hablar con Supabase (httpx sobre 443). Requiere UNA
+# variable nueva: RESEND_API_KEY (ver core/config.py). Pasos de una sola
+# vez en el dashboard de Resend: crear cuenta, verificar el dominio de
+# SMTP_FROM (o usar su dominio de pruebas mientras tanto), generar la API
+# key. Las variables SMTP_HOST/PORT/USER/PASSWORD/USE_SSL quedan sin uso
+# real -- no hace falta borrarlas del .env, simplemente no se leen más acá.
+_RESEND_API_URL = "https://api.resend.com/emails"
 
 
-async def _send_mail_message(message: EmailMessage, *, context: str) -> None:
-    """Envía un EmailMessage con techo duro de `settings.SMTP_TIMEOUT_SECONDS`.
-    Pensada para correr como BackgroundTask: cualquier excepción (timeout,
-    puerto bloqueado, credenciales, DNS, TLS) se loguea con repr() + stack
-    completo y se traga acá -- la respuesta HTTP al cliente ya se envió
-    antes de que esto se ejecute."""
-    use_tls, start_tls = _resolve_tls_mode()
+async def _send_mail_message(*, to: str, subject: str, html: str, text: str, context: str) -> None:
+    """Envía un correo vía la API HTTPS de Resend, con techo duro de
+    `settings.SMTP_TIMEOUT_SECONDS`. Pensada para correr como BackgroundTask:
+    cualquier fallo (timeout, 4xx/5xx de Resend, DNS) se loguea con repr() +
+    stack completo y se traga acá -- la respuesta HTTP al cliente ya se
+    envió antes de que esto se ejecute."""
+    if not settings.RESEND_API_KEY:
+        print(f"[WARN] Envío de correo ({context}) omitido: falta RESEND_API_KEY en el entorno.")
+        return
+
     try:
-        await asyncio.wait_for(
-            aiosmtplib.send(
-                message,
-                hostname=settings.SMTP_HOST,
-                port=settings.SMTP_PORT,
-                username=settings.SMTP_USER,
-                password=settings.SMTP_PASSWORD,
-                use_tls=use_tls,
-                start_tls=start_tls,
-                timeout=settings.SMTP_TIMEOUT_SECONDS,
-            ),
-            timeout=settings.SMTP_TIMEOUT_SECONDS,
-        )
+        async with httpx.AsyncClient(timeout=settings.SMTP_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                _RESEND_API_URL,
+                headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+                json={
+                    "from": settings.SMTP_FROM,
+                    "to": [to],
+                    "subject": subject,
+                    "html": html,
+                    "text": text,
+                },
+            )
+            response.raise_for_status()
     except Exception as exc:
         print(
-            f"[WARN] Envío de correo ({context}) falló vía "
-            f"{settings.SMTP_HOST}:{settings.SMTP_PORT} "
-            f"(use_tls={use_tls}, start_tls={start_tls}): {exc!r}"
+            f"[WARN] Envío de correo ({context}) falló vía Resend API "
+            f"(to={to}): {exc!r}"
         )
         traceback.print_exc()
 
@@ -347,14 +335,13 @@ async def send_verification_email(email_to: str, token: str) -> None:
 </html>
 """
 
-    message = EmailMessage()
-    message["From"] = settings.SMTP_FROM
-    message["To"] = email_to
-    message["Subject"] = "Verifica tu cuenta — KodaQuant Terminal"
-    message.set_content("Verifica tu cuenta visitando: " + verify_url)  # fallback texto plano
-    message.add_alternative(html, subtype="html")
-
-    await _send_mail_message(message, context="verification")
+    await _send_mail_message(
+        to=email_to,
+        subject="Verifica tu cuenta — KodaQuant Terminal",
+        html=html,
+        text="Verifica tu cuenta visitando: " + verify_url,  # fallback texto plano
+        context="verification",
+    )
 
 
 # --- Recuperación de contraseña ---
@@ -409,14 +396,13 @@ async def send_password_reset_email(email_to: str, token: str) -> None:
 </html>
 """
 
-    message = EmailMessage()
-    message["From"] = settings.SMTP_FROM
-    message["To"] = email_to
-    message["Subject"] = "Restablece tu contraseña — KodaQuant Terminal"
-    message.set_content("Restablece tu contraseña visitando: " + reset_url)
-    message.add_alternative(html, subtype="html")
-
-    await _send_mail_message(message, context="password-reset")
+    await _send_mail_message(
+        to=email_to,
+        subject="Restablece tu contraseña — KodaQuant Terminal",
+        html=html,
+        text="Restablece tu contraseña visitando: " + reset_url,
+        context="password-reset",
+    )
 
 
 # --- Correos transaccionales de suscripción (i18n) ---
@@ -538,14 +524,9 @@ async def send_subscription_upgrade_email(email_to: str, tier: str, language: st
     html = _render_subscription_email_html(copy["heading"], body, tier, language, copy["cta"])
     plain = f"{copy['heading']}. {body}".replace("<strong>", "").replace("</strong>", "")
 
-    message = EmailMessage()
-    message["From"] = settings.SMTP_FROM
-    message["To"] = email_to
-    message["Subject"] = subject
-    message.set_content(plain)
-    message.add_alternative(html, subtype="html")
-
-    await _send_mail_message(message, context="subscription-upgrade")
+    await _send_mail_message(
+        to=email_to, subject=subject, html=html, text=plain, context="subscription-upgrade"
+    )
 
 
 async def send_subscription_downgrade_email(email_to: str, tier: str, language: str = "en") -> None:
@@ -556,14 +537,9 @@ async def send_subscription_downgrade_email(email_to: str, tier: str, language: 
     html = _render_subscription_email_html(copy["heading"], body, tier, language, copy["cta"])
     plain = f"{copy['heading']}. {body}".replace("<strong>", "").replace("</strong>", "")
 
-    message = EmailMessage()
-    message["From"] = settings.SMTP_FROM
-    message["To"] = email_to
-    message["Subject"] = subject
-    message.set_content(plain)
-    message.add_alternative(html, subtype="html")
-
-    await _send_mail_message(message, context="subscription-downgrade")
+    await _send_mail_message(
+        to=email_to, subject=subject, html=html, text=plain, context="subscription-downgrade"
+    )
 
 
 async def send_subscription_cancel_email(email_to: str, language: str = "en") -> None:
@@ -572,11 +548,6 @@ async def send_subscription_cancel_email(email_to: str, language: str = "en") ->
     html = _render_subscription_email_html(copy["heading"], copy["body"], "FREE", language, copy["cta"])
     plain = f"{copy['heading']}. {copy['body']}".replace("<strong>", "").replace("</strong>", "")
 
-    message = EmailMessage()
-    message["From"] = settings.SMTP_FROM
-    message["To"] = email_to
-    message["Subject"] = copy["subject"]
-    message.set_content(plain)
-    message.add_alternative(html, subtype="html")
-
-    await _send_mail_message(message, context="subscription-cancel")
+    await _send_mail_message(
+        to=email_to, subject=copy["subject"], html=html, text=plain, context="subscription-cancel"
+    )

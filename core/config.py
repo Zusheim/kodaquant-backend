@@ -37,26 +37,30 @@ class Settings(BaseSettings):
     ENV: str = "development"
     DEBUG: bool = False
 
+    # FIX DEFINITIVO (root cause real, confirmado con traceback): Hugging
+    # Face Spaces bloquea a nivel de firewall de red TODO el egress saliente
+    # a puertos SMTP (25/465/587) -- ni 587/STARTTLS ni 465/SSL-implícito
+    # llegan siquiera a abrir la conexión TCP (el error saltaba en
+    # `_create_connection`, antes de cualquier byte de protocolo). Solo 443
+    # sale garantizado en este entorno. El envío de correo se migró de SMTP
+    # directo a la API HTTPS de Resend (ver core/security.py). Las variables
+    # SMTP_* de abajo ya NO se usan para enviar correo -- se dejan opcionales
+    # por si en el futuro corrés esto en un hosting que sí permita SMTP
+    # saliente. Lo único obligatorio ahora es RESEND_API_KEY.
     SMTP_HOST: str = "smtp.gmail.com"
-    # FIX (root cause de "Timed out connecting to smtp.gmail.com on port 587"):
-    # el hosting actual filtra el saliente en 587 (STARTTLS), típico en
-    # entornos serverless/cloud. 465 (SSL implícito) es el puerto alterno de
-    # Gmail para submission y suele quedar abierto donde 587 no. Si tu
-    # proveedor sí permite 587, sobreescribe SMTP_PORT=587 y
-    # SMTP_USE_SSL=false en el .env / panel de env vars — el resto del
-    # código en core/security.py ya respeta ambas variables.
     SMTP_PORT: int = 465
     SMTP_USE_SSL: bool = True
-    # Techo duro (segundos) para la operación SMTP completa. El envío corre
-    # como FastAPI BackgroundTask (ver api/auth.py) -- ya NO bloquea la
-    # respuesta HTTP al cliente -- así que ya no hace falta un techo
-    # agresivo de 3s. 3s se cortaba antes de completar DNS + handshake TLS
-    # en cold start desde entornos serverless; 15s da margen real sin
-    # arriesgar tareas colgadas indefinidamente. Ver
-    # core/security.py::_send_mail_message.
+    SMTP_USER: str | None = None
+    SMTP_PASSWORD: str | None = None
+    # Techo duro (segundos) para la llamada HTTPS a Resend. El envío corre
+    # como FastAPI BackgroundTask (ver api/auth.py) -- no bloquea la
+    # respuesta al cliente -- así que 15s da margen real sin arriesgar
+    # tareas colgadas indefinidamente. Ver core/security.py::_send_mail_message.
     SMTP_TIMEOUT_SECONDS: float = 15.0
-    SMTP_USER: str
-    SMTP_PASSWORD: str
+    # API key de Resend (https://resend.com/api-keys). Obligatoria para que
+    # el envío de correo funcione en este hosting -- sin ella, se loguea un
+    # warning y el correo simplemente no sale (no rompe el registro/login).
+    RESEND_API_KEY: str | None = None
     SMTP_FROM: str
     FRONTEND_URL: str = "https://kodaquant.web.app"
 
