@@ -253,10 +253,18 @@ _RESEND_API_URL = "https://api.resend.com/emails"
 
 async def _send_mail_message(*, to: str, subject: str, html: str, text: str, context: str) -> None:
     """Envía un correo vía la API HTTPS de Resend, con techo duro de
-    `settings.SMTP_TIMEOUT_SECONDS`. Pensada para correr como BackgroundTask:
-    cualquier fallo (timeout, 4xx/5xx de Resend, DNS) se loguea con repr() +
-    stack completo y se traga acá -- la respuesta HTTP al cliente ya se
-    envió antes de que esto se ejecute."""
+    `settings.SMTP_TIMEOUT_SECONDS`. Pensada para correr como BackgroundTask.
+
+    Loguea DOS clases de fallo por separado:
+      - Errores de red/timeout (DNS, conexión, techo de tiempo agotado).
+      - Rechazos de Resend (4xx/5xx) -- acá se imprime `response.text`
+        explícitamente porque httpx.HTTPStatusError / raise_for_status() NO
+        incluye el cuerpo de la respuesta en su mensaje por defecto, y ese
+        cuerpo es justo donde Resend explica el motivo real (dominio del
+        remitente sin verificar, restricción de sandbox al propio email de
+        la cuenta, API key inválida/revocada, etc.). Sin esto, un 403 se ve
+        genérico y no dice nada accionable -- que es exactamente lo que
+        pasó en el log anterior."""
     if not settings.RESEND_API_KEY:
         print(f"[WARN] Envío de correo ({context}) omitido: falta RESEND_API_KEY en el entorno.")
         return
@@ -274,13 +282,16 @@ async def _send_mail_message(*, to: str, subject: str, html: str, text: str, con
                     "text": text,
                 },
             )
-            response.raise_for_status()
     except Exception as exc:
-        print(
-            f"[WARN] Envío de correo ({context}) falló vía Resend API "
-            f"(to={to}): {exc!r}"
-        )
+        print(f"[WARN] Envío de correo ({context}) falló de red/timeout hacia Resend (to={to}): {exc!r}")
         traceback.print_exc()
+        return
+
+    if response.status_code >= 400:
+        print(
+            f"[WARN] Envío de correo ({context}) rechazado por Resend "
+            f"(HTTP {response.status_code}) to={to} from={settings.SMTP_FROM}: {response.text}"
+        )
 
 
 # --- Verificación de email ---
