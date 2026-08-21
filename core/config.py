@@ -47,12 +47,14 @@ class Settings(BaseSettings):
     # código en core/security.py ya respeta ambas variables.
     SMTP_PORT: int = 465
     SMTP_USE_SSL: bool = True
-    # Techo duro (segundos) para la operación SMTP completa. Antes no existía
-    # ningún límite explícito: aiosmtplib caía al timeout default (60s), y
-    # como el envío se hacía con `await` en línea dentro del endpoint, esos
-    # 60s los esperaba el cliente HTTP del registro/reset. Ver
+    # Techo duro (segundos) para la operación SMTP completa. El envío corre
+    # como FastAPI BackgroundTask (ver api/auth.py) -- ya NO bloquea la
+    # respuesta HTTP al cliente -- así que ya no hace falta un techo
+    # agresivo de 3s. 3s se cortaba antes de completar DNS + handshake TLS
+    # en cold start desde entornos serverless; 15s da margen real sin
+    # arriesgar tareas colgadas indefinidamente. Ver
     # core/security.py::_send_mail_message.
-    SMTP_TIMEOUT_SECONDS: float = 3.0
+    SMTP_TIMEOUT_SECONDS: float = 15.0
     SMTP_USER: str
     SMTP_PASSWORD: str
     SMTP_FROM: str
