@@ -5,6 +5,7 @@ Valida el JWT de Supabase delegando la verificación criptográfica al propio
 backend de Supabase Auth (GoTrue) vía `supabase.auth.get_user()`. No existe
 bypass de desarrollo.
 """
+import asyncio
 import secrets
 import aiosmtplib
 from email.message import EmailMessage
@@ -222,6 +223,51 @@ async def verify_api_credits(
 
     return current_user
 
+
+# ---------------------------------------------------------------------------
+# FIX — timeout de SMTP + envío no bloqueante
+# ---------------------------------------------------------------------------
+# ROOT CAUSE de "el registro tarda demasiado" + `Timed out connecting to
+# smtp.gmail.com on port 587`:
+#   1) El puerto 587 (STARTTLS) sale bloqueado en el hosting actual (típico
+#      en entornos serverless/cloud que solo abren 443/465 salientes).
+#   2) `aiosmtplib.send(...)` se llamaba sin `timeout` explícito -> default
+#      de 60s. Esos 60s corrían DENTRO del request HTTP porque api/auth.py
+#      hacía `await send_verification_email(...)` en línea: el cliente
+#      esperaba el minuto completo antes de recibir el 201/200.
+# FIX: (a) puerto 465 (SSL implícito) como default -- ver core/config.py --
+# no depende de que 587 esté abierto; (b) techo duro de
+# settings.SMTP_TIMEOUT_SECONDS (3s) con asyncio.wait_for alrededor de TODO
+# el envío, no solo del `timeout` de socket de aiosmtplib; (c) los call
+# sites en api/auth.py ahora agendan send_verification_email /
+# send_password_reset_email como FastAPI BackgroundTask -- el cliente HTTP
+# ya no espera al SMTP en absoluto, ni aunque el techo de 3s se cumpla.
+async def _send_mail_message(message: EmailMessage, *, context: str) -> None:
+    """Envía un EmailMessage con techo duro de `settings.SMTP_TIMEOUT_SECONDS`.
+    Pensada para correr como BackgroundTask: cualquier excepción (timeout,
+    puerto bloqueado, credenciales, DNS) se loguea y se traga acá -- la
+    respuesta HTTP al cliente ya se envió antes de que esto se ejecute."""
+    try:
+        await asyncio.wait_for(
+            aiosmtplib.send(
+                message,
+                hostname=settings.SMTP_HOST,
+                port=settings.SMTP_PORT,
+                username=settings.SMTP_USER,
+                password=settings.SMTP_PASSWORD,
+                use_tls=settings.SMTP_USE_SSL,
+                start_tls=not settings.SMTP_USE_SSL,
+                timeout=settings.SMTP_TIMEOUT_SECONDS,
+            ),
+            timeout=settings.SMTP_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        print(
+            f"[WARN] Envío de correo ({context}) falló vía "
+            f"{settings.SMTP_HOST}:{settings.SMTP_PORT}: {exc}"
+        )
+
+
 # --- Verificación de email ---
 def generate_verification_token() -> tuple[str, datetime]:
     """Token de verificación, válido 24h."""
@@ -231,7 +277,9 @@ def generate_verification_token() -> tuple[str, datetime]:
 
 
 async def send_verification_email(email_to: str, token: str) -> None:
-    """Envía el correo de verificación vía SMTP (Gmail) sin bloquear el event loop."""
+    """Construye y envía el correo de verificación. Diseñada para ser
+    agendada como BackgroundTask desde api/auth.py -- nunca debe hacer
+    esperar al cliente HTTP (ver _send_mail_message)."""
     verify_url = f"{settings.FRONTEND_URL}/verify?token={token}"
 
     html = f"""\
@@ -279,14 +327,7 @@ async def send_verification_email(email_to: str, token: str) -> None:
     message.set_content("Verifica tu cuenta visitando: " + verify_url)  # fallback texto plano
     message.add_alternative(html, subtype="html")
 
-    await aiosmtplib.send(
-        message,
-        hostname=settings.SMTP_HOST,
-        port=settings.SMTP_PORT,
-        username=settings.SMTP_USER,
-        password=settings.SMTP_PASSWORD,
-        start_tls=True,
-    )
+    await _send_mail_message(message, context="verification")
 
 
 # --- Recuperación de contraseña ---
@@ -299,7 +340,8 @@ def generate_password_reset_token() -> tuple[str, datetime]:
 
 
 async def send_password_reset_email(email_to: str, token: str) -> None:
-    """Envía el correo de restablecimiento de contraseña vía SMTP, sin bloquear el event loop."""
+    """Construye y envía el correo de restablecimiento. Diseñada para ser
+    agendada como BackgroundTask desde api/auth.py (ver _send_mail_message)."""
     reset_url = f"{settings.FRONTEND_URL}/update-password?token={token}"
 
     html = f"""\
@@ -347,14 +389,7 @@ async def send_password_reset_email(email_to: str, token: str) -> None:
     message.set_content("Restablece tu contraseña visitando: " + reset_url)
     message.add_alternative(html, subtype="html")
 
-    await aiosmtplib.send(
-        message,
-        hostname=settings.SMTP_HOST,
-        port=settings.SMTP_PORT,
-        username=settings.SMTP_USER,
-        password=settings.SMTP_PASSWORD,
-        start_tls=True,
-    )
+    await _send_mail_message(message, context="password-reset")
 
 
 # --- Correos transaccionales de suscripción (i18n) ---
@@ -483,14 +518,7 @@ async def send_subscription_upgrade_email(email_to: str, tier: str, language: st
     message.set_content(plain)
     message.add_alternative(html, subtype="html")
 
-    await aiosmtplib.send(
-        message,
-        hostname=settings.SMTP_HOST,
-        port=settings.SMTP_PORT,
-        username=settings.SMTP_USER,
-        password=settings.SMTP_PASSWORD,
-        start_tls=True,
-    )
+    await _send_mail_message(message, context="subscription-upgrade")
 
 
 async def send_subscription_downgrade_email(email_to: str, tier: str, language: str = "en") -> None:
@@ -508,14 +536,7 @@ async def send_subscription_downgrade_email(email_to: str, tier: str, language: 
     message.set_content(plain)
     message.add_alternative(html, subtype="html")
 
-    await aiosmtplib.send(
-        message,
-        hostname=settings.SMTP_HOST,
-        port=settings.SMTP_PORT,
-        username=settings.SMTP_USER,
-        password=settings.SMTP_PASSWORD,
-        start_tls=True,
-    )
+    await _send_mail_message(message, context="subscription-downgrade")
 
 
 async def send_subscription_cancel_email(email_to: str, language: str = "en") -> None:
@@ -531,11 +552,4 @@ async def send_subscription_cancel_email(email_to: str, language: str = "en") ->
     message.set_content(plain)
     message.add_alternative(html, subtype="html")
 
-    await aiosmtplib.send(
-        message,
-        hostname=settings.SMTP_HOST,
-        port=settings.SMTP_PORT,
-        username=settings.SMTP_USER,
-        password=settings.SMTP_PASSWORD,
-        start_tls=True,
-    )
+    await _send_mail_message(message, context="subscription-cancel")

@@ -38,7 +38,21 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     SMTP_HOST: str = "smtp.gmail.com"
-    SMTP_PORT: int = 587
+    # FIX (root cause de "Timed out connecting to smtp.gmail.com on port 587"):
+    # el hosting actual filtra el saliente en 587 (STARTTLS), típico en
+    # entornos serverless/cloud. 465 (SSL implícito) es el puerto alterno de
+    # Gmail para submission y suele quedar abierto donde 587 no. Si tu
+    # proveedor sí permite 587, sobreescribe SMTP_PORT=587 y
+    # SMTP_USE_SSL=false en el .env / panel de env vars — el resto del
+    # código en core/security.py ya respeta ambas variables.
+    SMTP_PORT: int = 465
+    SMTP_USE_SSL: bool = True
+    # Techo duro (segundos) para la operación SMTP completa. Antes no existía
+    # ningún límite explícito: aiosmtplib caía al timeout default (60s), y
+    # como el envío se hacía con `await` en línea dentro del endpoint, esos
+    # 60s los esperaba el cliente HTTP del registro/reset. Ver
+    # core/security.py::_send_mail_message.
+    SMTP_TIMEOUT_SECONDS: float = 3.0
     SMTP_USER: str
     SMTP_PASSWORD: str
     SMTP_FROM: str

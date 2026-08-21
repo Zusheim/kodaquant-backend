@@ -18,7 +18,7 @@ from core.security import (
     generate_password_reset_token,
     send_password_reset_email,
 )
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from core.supabase_client import supabase, supabase_admin
 from core.rate_limiter import enforce_rate_limit
@@ -94,7 +94,9 @@ class UserRegisterResponse(BaseModel):
     summary="Registrar un nuevo usuario",
     description="Crea una nueva cuenta de usuario en Supabase Auth para KodaQuant Terminal.",
 )
-async def register_user(payload: UserRegisterRequest, request: Request) -> UserRegisterResponse:
+async def register_user(
+    payload: UserRegisterRequest, request: Request, background_tasks: BackgroundTasks
+) -> UserRegisterResponse:
     """
     Registra un nuevo usuario en Supabase Auth.
 
@@ -195,10 +197,16 @@ async def register_user(payload: UserRegisterRequest, request: Request) -> UserR
             ),
         ) from exc
 
-    try:
-        await send_verification_email(payload.email, token)
-    except Exception as exc:
-        print(f"[WARN] Falló envío de email de verificación: {exc}")
+    # FIX (root cause de "el registro tarda demasiado" / SMTP timeout en
+    # línea): antes esto era `await send_verification_email(...)` dentro de
+    # un try/except -- el cliente HTTP esperaba a que el SMTP conectara (o
+    # tronara) ANTES de recibir el 201. Con el puerto bloqueado y sin timeout
+    # explícito eso eran hasta 60s de espera real por request. Ahora se
+    # agenda como BackgroundTask: la respuesta 201 sale apenas termina lo de
+    # arriba, y el envío corre después, con su propio techo de 3s
+    # (core/security.py::_send_mail_message) que nunca vuelve a tocar este
+    # request.
+    background_tasks.add_task(send_verification_email, payload.email, token)
 
     return UserRegisterResponse(
         id=user.id,
@@ -277,7 +285,7 @@ class ForgotPasswordRequest(BaseModel):
 
 
 @router.post("/forgot-password")
-async def forgot_password(payload: ForgotPasswordRequest, request: Request):
+async def forgot_password(payload: ForgotPasswordRequest, request: Request, background_tasks: BackgroundTasks):
     """
     Inicia el flujo de recuperación de contraseña.
 
@@ -310,10 +318,10 @@ async def forgot_password(payload: ForgotPasswordRequest, request: Request):
         "password_reset_token_expires_at": expires_at.isoformat(),
     }).eq("id", profile["id"]).execute()
 
-    try:
-        await send_password_reset_email(payload.email, token)
-    except Exception as exc:
-        print(f"[WARN] Falló envío de email de reset: {exc}")
+    # Mismo fix que en /register: agendado como BackgroundTask para que la
+    # respuesta genérica (anti-enumeración) salga de inmediato, sin esperar
+    # al SMTP. Ver core/security.py::_send_mail_message para el techo de 3s.
+    background_tasks.add_task(send_password_reset_email, payload.email, token)
 
     return generic_response
 

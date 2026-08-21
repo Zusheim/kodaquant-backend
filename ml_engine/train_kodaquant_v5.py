@@ -1,5 +1,5 @@
 # %%
-#!pip install nltk -q
+#!pip install yfinance nltk -q
 
 """
 train_kodaquant_v5.py — KodaQuant V5: Enrutamiento de Modelos Especialistas
@@ -15,7 +15,7 @@ modelo global, este script entrena DOS ciclos de optimización completamente
 independientes y secuenciales, uno por régimen:
 
     EQUITY  -> ['AAPL','MSFT','NVDA','TSLA','GOOGL','AMZN','META','SPY']
-    CRYPTO  -> ['BTC/USD', 'ETH/USD']  (V12: formato estándar, ver REGIMES)
+    CRYPTO  -> ['BTC-USD', 'ETH-USD']
 
 Cada especialista es una instancia SEPARADA de la MISMA arquitectura
 (invarianza topológica estricta, ver `build_model`): no se comparten pesos,
@@ -83,56 +83,6 @@ ningún remapeo — `quanti_engine.py` sigue leyendo `y_pred[:, 1]` tal cual):
        split de train (cero fuga hacia test). `equity_specialist`
        (8 tickers, volumen suficiente) queda con `oversample_factor=1.0`
        -> no-op exacto, cero cambio de comportamiento respecto a V5.
-
-NUEVO EN V12 — FIX CRASH `crypto_specialist` + ALINEACIÓN TEMPORAL DE NOTICIAS:
-    6) Universo cripto reexpresado en formato estándar `BTC/USD`/`ETH/USD`
-       (el guion `BTC-USD` era un artefacto propio del ticker de Yahoo
-       Finance; Twelve Data/Stooq no lo resuelven -> DataFrame vacío ->
-       `MinMaxScaler` colapsaba con shape (0, 17)).
-    7) Data Quality Check por activo (Fase A/2, Tolerancia a Fallos):
-       (a) `_fetch_all_symbols_flat` ya NO aborta la descarga completa si
-       un símbolo individual falla en ambos proveedores -- lo loguea y
-       continúa con el resto del universo; (b) `run_regime_pipeline`
-       valida, POR ACTIVO, presencia real de columnas OHLCV y un piso
-       matemático de filas post-limpieza (`MIN_ROWS_PER_ASSET`) antes de
-       tocar `build_asset_dataset`/el scaler -- un activo sin datos se
-       omite con `continue` y el régimen sigue con el resto, en vez de
-       colapsar el bucle de entrenamiento entero.
-    8) Alineación temporal `NEWS_SENTIMENT_SCORE` (`engineer_asset`): el
-       índice pasado a `get_daily_news_sentiment` se normaliza a tz-naive
-       y se trunca a medianoche ANTES del merge (mismo patrón defensivo
-       que `_cache_is_stale`), eliminando el desfase tz-aware/tz-naive o
-       datetime64/date que empujaba el `merge_asof` fuera de la tolerancia
-       de 10 días; se añade además un chequeo de cobertura post-alineación
-       que advierte si la señal sigue muerta.
-
-NUEVO EN V13 — FIX CRASH `crypto_specialist` (0 filas utilizables), CAUSA RAÍZ:
-V12 normalizaba el índice de noticias pero NO el índice OHLCV/macro que lo
-origina -- Twelve Data (tz-aware UTC) mezclado con FRED/Stooq (tz-naive) en
-el outer join de `_fetch_all_symbols_flat` producía DOS entradas de índice
-por día calendario, no comparables entre sí; sobre eso, un `ffill().dropna()`
-ciego en `engineer_asset` trataba cada NaN de fin de semana en las columnas
-macro (Treasuries/SPY/Oro/DXY, L-V) igual que un NaN real del propio OHLCV
-del activo, aniquilando ~2/7 del dataset por ronda en un activo 24/7 -- las
-dos fugas se componían hasta dejar 0 filas post-limpieza para BTC/USD y
-ETH/USD. Dos fixes, CERO cambios a Fase B/arquitectura:
-    9) `_normalize_daily_index`/`_to_naive_daily_index` (Requerimiento 2):
-       único punto de verdad de normalización temporal -- tz-naive,
-       truncado a medianoche -- aplicado a CADA pieza (activo y macro) de
-       `_fetch_all_symbols_flat` ANTES del outer join, y reutilizado (en
-       vez de duplicado) por la alineación de `NEWS_SENTIMENT_SCORE`.
-    10) `engineer_asset` (Requerimiento 1): `ffill(limit=4)` aplicado
-        SOLO a las columnas macro (nunca al OHLCV propio del activo)
-        seguido de `dropna(subset=OHLCV propio)` -- el viernes se proyecta
-        a sábado/domingo/feriados cortos para activos 24/7; para equity es
-        no-op exacto (sus propias columnas ya vienen NaN los fines de
-        semana, nada que rescatar).
-    11) `_resolve_stooq_symbol_safe` + `_CRYPTO_STOOQ_OVERRIDES`
-        (Requerimiento 3): Stooq no resuelve notación "BASE/QUOTE" --
-        mapeo local BTC/USD->btcusd.v, ETH/USD->ethusd.v para que el
-        fallback Stooq sea real si Twelve Data falla/agota cuota (mapeo
-        LOCAL a este script, market_data.py sigue siendo la única fuente
-        de verdad de proveedores para el resto del sistema).
 """
 
 from __future__ import annotations
@@ -153,38 +103,50 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import requests
+import yfinance as yf
 from keras import layers
 from scipy.interpolate import CubicSpline
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
-# data_pipeline.py vive junto a este script (o en services/, ver sys.path
-# más abajo) — Requerimiento 1: pipeline NLP de sentimiento de noticias.
-sys.path.append(str(Path(__file__).resolve().parent))
-# services/ vive un nivel arriba (ver MODELS_ROOT más abajo) — ahí vive
-# market_data.py, single source of truth de proveedores/mapeo de símbolo
-# (Twelve Data + FRED + Stooq) que ya sirve el radar en producción.
-sys.path.append(str(Path(__file__).resolve().parent.parent / "services"))
-from data_pipeline import get_daily_news_sentiment  # noqa: E402
+# --- RESOLUCIÓN ABSOLUTA DE IMPORTS (Directiva 2 — fin al Import Hell) ----
+# Este script vive en `ml_engine/`, junto a `data_pipeline.py` y a
+# `kodaquant_core.py` (Directiva 1: SINGLE SOURCE OF TRUTH, sin copias
+# duplicadas). Sube desde este archivo hasta encontrar la raíz del proyecto
+# -- el primer ancestro que contiene TANTO `ml_engine/` como `services/`
+# como subdirectorios -- y la inserta en `sys.path[0]`. A partir de ahí,
+# `ml_engine` y `services` son paquetes válidos sin importar el cwd desde
+# el que se invoque `python ml_engine/train_kodaquant_v5.py`. Reemplaza por
+# completo el patrón try/except dual + copias duplicadas de
+# `kodaquant_core.py`/`data_pipeline.py` que causaba
+# `ModuleNotFoundError`/`ImportError` al invocar desde la raíz del repo.
+def _bootstrap_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for ancestor in (here.parent, *here.parents):
+        if (ancestor / "ml_engine").is_dir() and (ancestor / "services").is_dir():
+            return ancestor
+    # Fallback determinista: este archivo vive en ml_engine/, por lo que su
+    # abuelo es la raíz del proyecto por construcción, incluso si `services/`
+    # todavía no existe en el entorno actual (ej. checkout parcial/CI).
+    return here.parent.parent
 
-# V11 (FIX 2026-08-15) — yfinance RETIRADO por completo (ver requirements.txt).
-# Reemplazo: los mismos proveedores/mapeos de símbolo de
-# services/market_data.py (Twelve Data primaria, FRED para ^TNX, Stooq como
-# último recurso) — cero mapeo de símbolo paralelo/duplicado. Se importan los
-# primitivos de BAJO nivel (parametrizados por tamaño de historial) en vez
-# del wrapper `fetch_feature_ohlcv`/`_fetch_symbol_ohlcv`: ese wrapper está
-# tuneado para la ventana CORTA de inferencia que consume quanti_engine.py
-# (`DEFAULT_HISTORY_SESSIONS`, ~2y) — el entrenamiento necesita el historial
-# COMPLETO de `PERIOD` (10y) para construir el dataset supervisado.
-from market_data import (  # noqa: E402
-    FRED_API_KEY,
-    TWELVE_DATA_API_KEY,
-    _fred_series_daily,
-    _resolve_stooq_symbol,
-    _resolve_td_symbol,
-    _stooq_daily_close,
-    _td_time_series,
-    resolve_macro_symbol,
+
+_PROJECT_ROOT = _bootstrap_project_root()
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Requerimiento 1: pipeline NLP de sentimiento de noticias. Import absoluto
+# y directo -- ya no depende de que `ml_engine/` esté implícitamente en
+# sys.path por ser el directorio del script.
+from ml_engine.data_pipeline import get_daily_news_sentiment  # noqa: E402
+
+# Núcleo compartido train/inferencia -- SINGLE SOURCE OF TRUTH en
+# `ml_engine/kodaquant_core.py` (Directiva 1). Import directo y absoluto,
+# sin fallback dual: con la raíz del proyecto ya en sys.path, esta ruta
+# resuelve siempre, sin importar el cwd de invocación.
+from ml_engine.kodaquant_core import (  # noqa: E402
+    CacheManager, FredClient, normalize_daily_index, project_macro_frame,
 )
 
 logging.basicConfig(
@@ -215,11 +177,17 @@ REGIMES: dict[str, dict] = {
         "oversample_factor": 1.0,  # 8 tickers, volumen ya suficiente -> no-op exacto (idéntico a V5)
     },
     "crypto_specialist": {
-        # V12 FIX (CRASH CRÍTICO): "BTC-USD"/"ETH-USD" (guion) era el
-        # formato propio de yfinance -- Twelve Data/Stooq no lo resuelven,
-        # devuelven DataFrame vacío y el MinMaxScaler colapsaba con
-        # shape=(0, 17). Formato estándar de par cripto ("BASE/QUOTE").
-        "tickers": ["BTC/USD", "ETH/USD"],
+        # V19: vuelta a 2 tickers a pedido explícito -- BTC-USD/ETH-USD
+        # solos midieron 46.8%/48.1% en la corrida de 5 activos (V18,
+        # consistente con las dos mediciones previas de solo-2: 47-50%).
+        # Ampliar a 5 NO los movió a ellos -- lo que cambió fue el
+        # agregado (arrastrado por XRP/BCH, más nuevos y volátiles).
+        # Volver a 2 no resuelve por sí solo que BTC/ETH crucen 50%: el
+        # número individual de cada uno sigue siendo el mismo problema de
+        # fondo, y con n=8 el IC 95% vuelve a ser demasiado ancho para
+        # distinguir "sin edge" de "no hay muestra suficiente" (ver
+        # walk_forward_eval.py). Documentado, no oculto.
+        "tickers": ["BTC-USD", "ETH-USD"],
         "oversample_factor": CRYPTO_OVERSAMPLE_FACTOR,
     },
 }
@@ -230,14 +198,6 @@ LOOKBACK = 60
 TRAIN_RATIO = 0.8
 SEED = 42
 ASSET_EMBED_DIM = 8
-
-# V12 (Requerimiento 1, Data Quality Check) -- piso matemático de filas
-# post-limpieza para que `build_asset_dataset` produzca AL MENOS 1 ventana
-# de train: split_idx=int(n*TRAIN_RATIO) debe superar LOOKBACK, o
-# `window_split` (=split_idx-LOOKBACK) cae negativo y corrompe en SILENCIO
-# el slicing train/test (Python indexa negativo desde el final) en vez de
-# fallar ruidosamente. Mejor rechazar el activo acá, explícito.
-MIN_ROWS_PER_ASSET = int(np.ceil((LOOKBACK + 1) / TRAIN_RATIO))
 
 SENTIMENT_LOOKBACK = 20         # ventana de la correlación móvil activo<->macro (V4)
 SENTIMENT_MACRO_PROXY = "^VIX"  # factor macro de referencia; fallback: MACRO_TICKERS[0]
@@ -271,21 +231,15 @@ OBV_ROC_CLIP = 3.0           # ±300% — techo defensivo ante denominadores (OB
 TECH_COLS = [
     "RSI_14", "EMA20_DEV_PCT", "MACD_PCT", "MACD_SIGNAL_PCT", "SENTIMENT_SCORE",
     "ATR_PCT", "BB_WIDTH_20", "OBV_ROC_20", "ADX_14", "STOCH_K_14",
-    "NEWS_SENTIMENT_SCORE",
+    "NEWS_SENTIMENT_SCORE", "FEAR_GREED_INDEX",
 ]
-N_FEATURES = 1 + len(TECH_COLS) + len(MACRO_TICKERS)  # LOG_RETURN_1D + técnicos + macro (mismo conteo: 17)
+N_FEATURES = 1 + len(TECH_COLS) + len(MACRO_TICKERS)  # LOG_RETURN_1D + técnicos + macro (18 con FEAR_GREED_INDEX)
 
 # --- Hiperparámetros de entrenamiento (idénticos a V4 — invarianza matemática) ---
 BATCH_SIZE = 64
 EPOCHS = 100
 VALIDATION_SPLIT = 0.1
 HUBER_DELTA = 1.0
-
-# Lote para inferencia final masiva (predict + GradientTape en evaluate_asset,
-# extract_temporal_attention y compute_feature_attribution). Acota el pico de RAM
-# del backward pass de EinsumDense en el runner CPU de CI (~7GB) sin tocar la
-# lógica matemática: es puramente una estrategia de inyección al modelo.
-EVAL_BATCH_SIZE = 256
 
 GAMMA_INITIAL = 0.0
 GAMMA_MAX = 1.5
@@ -327,6 +281,7 @@ REGIME_ARCHITECTURE: dict[str, dict] = {
         "dropout_rate": 0.60,
         "dense_l2_reg": 3e-5,
         "extra_residual_block": True,
+        "tcn_filters": 64,          # V15 — rama TCN paralela, ver build_model
     },
     "crypto_specialist": {
         "lstm_units": 64,
@@ -336,8 +291,26 @@ REGIME_ARCHITECTURE: dict[str, dict] = {
         "dropout_rate": 0.45,
         "dense_l2_reg": 1e-5,
         "extra_residual_block": False,
+        "tcn_filters": 32,          # V15 — rama TCN paralela, ver build_model
     },
 }
+
+# V15 — Directiva 4 (evolución matemática direccional). Rama TCN (Temporal
+# Convolutional Network, Bai/Kolter/Koltun 2018) PARALELA a la rama
+# BiLSTM+MultiHeadAttention+BahdanauAttention existente (que YA logra
+# 52.8%/51.3% de DirAcc validado, ver docstring de `REGIME_ARCHITECTURE`
+# arriba) -- no la reemplaza, la complementa: convoluciones causales
+# dilatadas capturan patrones locales/multi-escala de forma NO
+# recurrente (sin el sesgo de recencia del último estado oculto de un
+# LSTM), robustas a ruido de alta frecuencia por el propio ensanchamiento
+# del campo receptivo con la dilatación. Fusionada por concatenación con
+# el contexto de Bahdanau antes de `asset_embed` -- aditiva y reversible:
+# `KODAQUANT_ENABLE_TCN=0` colapsa el grafo a la topología V10 anterior,
+# bit a bit, para poder comparar A/B contra la arquitectura ya validada
+# antes de promoverla a producción.
+ENABLE_TCN_BRANCH = os.getenv("KODAQUANT_ENABLE_TCN", "1").strip().lower() not in ("0", "false", "no")
+TCN_KERNEL_SIZE = 3
+TCN_DILATIONS = (1, 2, 4, 8)   # campo receptivo ~ kernel*sum(dilations) > LOOKBACK=60 con margen
 
 # V5.1: CosineDecayRestarts reemplaza a ReduceLROnPlateau — un schedule
 # recalcula el LR por *step*, así que combinarlo con un callback que también
@@ -388,14 +361,8 @@ keras.utils.set_random_seed(SEED)
 # ============================================================
 # FASE A: ETL — DESCARGA UNIFICADA (OHLCV) + FEATURE ENGINEERING POR ACTIVO
 # ============================================================
-# V11 -- sesiones/año objetivo para dimensionar `outputsize`/`tail_days` de
-# Twelve Data/Stooq/FRED según `PERIOD` ("10y") -- reemplaza a
-# MAX_DOWNLOAD_RETRIES/BACKOFF_BASE_SECONDS (yfinance): los reintentos ahora
-# viven DENTRO de cada primitivo de market_data.py (`_td_time_series`,
-# `_stooq_daily_close`, `_fred_series_daily`), no hace falta una capa extra acá.
-_HISTORY_SESSIONS_PER_YEAR = 252
-_HISTORY_BUFFER_SESSIONS = 60      # feriados / años bisiestos -- margen defensivo
-_TD_MAX_OUTPUTSIZE = 5000          # tope real del plan Basic de Twelve Data (ver market_data.py)
+MAX_DOWNLOAD_RETRIES = 5
+BACKOFF_BASE_SECONDS = 2.0
 # Smart Cache Invalidation — antigüedad máxima tolerada del .parquet cacheado
 # ANTES de forzarse la caché era válida indefinidamente mientras compilara el
 # set de columnas requeridas (ver `download_all`), sin importar cuán vieja
@@ -422,269 +389,213 @@ _CACHE_MAX_AGE_HOURS = 48
 FORCE_FRESH_DATA = os.getenv("KODAQUANT_FORCE_FRESH_DATA", "1").strip().lower() not in ("0", "false", "no")
 
 
+# --- CONSOLIDACIÓN DEL CORE (Directiva 1) -----------------------------------
+# `_ohlcv_cache` reemplaza el parquet ad-hoc anterior: MISMA clase
+# (`kodaquant_core.CacheManager`) que usaría el lado de inferencia para su
+# propio caché en `services/`, cada uno con su `cache_dir` independiente.
+_ohlcv_cache = CacheManager(DATA_DIR, default_max_age_hours=_CACHE_MAX_AGE_HOURS)
+# `_fred_client` reemplaza el acceso exclusivo-a-inferencia que tenía FRED
+# en `market_data.py` -- ahora el entrenamiento resuelve ^TNX con la MISMA
+# fuente primaria (serie oficial DGS10) que ve el modelo en producción,
+# vía FredClient. Solo ^TNX tiene serie FRED equivalente 1:1 (rendimiento,
+# no precio de instrumento) -- el resto de MACRO_TICKERS (^GSPC/^VIX/GC=F/
+# DX-Y.NYB) se mantiene en yfinance, ver `_fetch_all_symbols_flat`.
+_fred_client = FredClient(api_key=os.getenv("FRED_API_KEY", ""))
+_FRED_MACRO_SERIES_MAP: dict[str, str] = {"^TNX": "DGS10"}
+
+
 def purge_data_cache(data_dir: Path = DATA_DIR) -> None:
     """
-    Purgado Total (V9): vacía programáticamente `data_dir` de cualquier
-    .parquet cacheado. Se invoca EXACTAMENTE UNA VEZ por corrida de
-    entrenamiento, en `__main__`, ANTES del bucle de regímenes -- nunca
-    dentro de `download_all` (llamada una vez POR régimen): purgar ahí
-    borraría, en la segunda llamada, el .parquet que el régimen anterior
-    de la MISMA corrida acaba de escribir para consumo posterior (Requerimiento
-    3: el .parquet debe sobrevivir intacto al final de la corrida).
+    Purgado Total (V9): vacía `data_dir` de cualquier caché (.json/.parquet)
+    vía `CacheManager.purge_all` -- se invoca EXACTAMENTE UNA VEZ por
+    corrida de entrenamiento, en `__main__`, ANTES del bucle de regímenes
+    -- nunca dentro de `_fetch_all_symbols_flat` (llamada una vez POR
+    régimen): purgar ahí borraría, en la segunda llamada, el artefacto que
+    el régimen anterior de la MISMA corrida acaba de escribir para consumo
+    posterior (Requerimiento 3: el caché debe sobrevivir intacto al final
+    de la corrida).
     """
-    removed = list(data_dir.glob("*.parquet"))
-    for f in removed:
-        f.unlink(missing_ok=True)
+    cache = _ohlcv_cache if data_dir == DATA_DIR else CacheManager(data_dir, default_max_age_hours=_CACHE_MAX_AGE_HOURS)
+    removed = cache.purge_all()
     if removed:
-        logger.warning(
-            "[purga CI/CD] FORCE_FRESH_DATA=True -> %d archivo(s) .parquet "
-            "purgado(s) de %s (Data Drift prevention).", len(removed), data_dir,
-        )
+        logger.warning("[purga CI/CD] FORCE_FRESH_DATA=True -> %d archivo(s) purgado(s) de %s (Data Drift prevention).",
+                        removed, data_dir)
     else:
         logger.info("[purga CI/CD] FORCE_FRESH_DATA=True -> %s ya estaba vacío.", data_dir)
 
 
-def _period_to_sessions(period: str) -> int:
-    """'10y' / '6mo' / '400d' -> nº de sesiones diarias objetivo, con margen."""
-    p = period.strip().lower()
-    if p.endswith("y"):
-        years = float(p[:-1])
-    elif p.endswith("mo"):
-        years = float(p[:-2]) / 12.0
-    elif p.endswith("d"):
-        years = float(p[:-1]) / 365.0
-    else:
-        raise ValueError(f"Formato de 'period' no soportado: '{period}'")
-    return int(round(years * _HISTORY_SESSIONS_PER_YEAR)) + _HISTORY_BUFFER_SESSIONS
+def _download_with_backoff(symbols: list[str], period: str,
+                            max_retries: int = MAX_DOWNLOAD_RETRIES,
+                            backoff_base: float = BACKOFF_BASE_SECONDS,
+                            min_coverage: float = 0.5) -> pd.DataFrame:
+    """Reintenta la descarga con backoff exponencial ante 429/timeouts transitorios,
+    Y ANTE FALLOS PARCIALES -- yfinance a veces devuelve un batch "no vacío" en
+    general pero con UN símbolo puntual ~100% NaN (rate-limit silencioso por-símbolo,
+    típico al encadenar descargas rápidas -- causa real observada: '^TNX_Close' con
+    0.7% de cobertura en una corrida de crypto_specialist lanzada 12s después de
+    equity_specialist). Antes, esa caída parcial pasaba el chequeo de "no vacío",
+    quedaba en caché, y solo se detectaba 700+ líneas más abajo cuando
+    `engineer_asset` colapsaba el dataset a 0 filas. Ahora se valida cobertura
+    por-símbolo ACÁ, en el mismo bucle de reintento -- Equities/cripto: SIEMPRE
+    yfinance (Directiva 3)."""
+    import time
 
-
-def _fetch_symbol_history(internal_key: str, td_symbol: str | None, stooq_symbol: str | None,
-                           sessions: int, fred_series_id: str | None = None) -> pd.DataFrame:
-    """
-    Historial COMPLETO (no la ventana corta de inferencia) para `internal_key`,
-    vía la MISMA cascada de proveedores que `market_data._fetch_symbol_ohlcv`
-    (FRED -> Twelve Data -> Stooq), pero con `sessions` real (10y) en vez del
-    `DEFAULT_HISTORY_SESSIONS` (~2y) fijo que ese wrapper usa para servir el
-    radar -- de ahí que acá se llame directo a los primitivos de bajo nivel.
-    """
-    df: pd.DataFrame | None = None
-
-    if fred_series_id and FRED_API_KEY:
-        fred_series = _fred_series_daily(fred_series_id, tail_days=sessions)
-        if fred_series is not None and not fred_series.empty:
-            df = pd.DataFrame({"close": fred_series})
-            df["open"] = df["high"] = df["low"] = df["close"]
-            df["volume"] = np.nan
-
-    if (df is None or df.empty) and td_symbol and TWELVE_DATA_API_KEY:
-        df = _td_time_series(td_symbol, outputsize=min(sessions, _TD_MAX_OUTPUTSIZE))
-
-    if (df is None or df.empty) and stooq_symbol:
-        series = _stooq_daily_close(stooq_symbol, tail_days=sessions)
-        if series is not None and not series.empty:
-            df = pd.DataFrame({"close": series})
-            df["open"] = df["high"] = df["low"] = df["close"]
-            df["volume"] = np.nan
-            logger.warning(
-                "'%s': historial de entrenamiento servido desde fallback Stooq -- "
-                "Open/High/Low replicados desde Close, Volume=NaN.", internal_key,
-            )
-
-    if df is None or df.empty:
-        fuentes = [n for n, v in (("FRED", fred_series_id), ("Twelve Data", td_symbol),
-                                   ("Stooq", stooq_symbol)) if v]
-        raise RuntimeError(
-            f"Sin historial de entrenamiento para '{internal_key}': todas las fuentes "
-            f"configuradas ({', '.join(fuentes) if fuentes else 'ninguna'}) fallaron."
-        )
-    return df
-
-
-# V13 FIX — MAPEO LOCAL DE CRIPTO PARA EL FALLBACK STOOQ (Requerimiento 3):
-# Stooq no resuelve pares en notación "BASE/QUOTE" (formato estándar que sí
-# entienden Twelve Data y el resto del pipeline) -- su convención propia
-# para moneda virtual es sufijo ".V" sobre el par sin separador
-# ("btcusd.v", "ethusd.v"). Sin este mapeo, `_resolve_stooq_symbol` devuelve
-# un símbolo que Stooq no resuelve -> Stooq deja de ser un fallback real
-# para cripto si Twelve Data falla/agota cuota. Mapeo LOCAL (no toca
-# market_data.py, single source of truth de proveedores que sigue sirviendo
-# quanti_engine.py en inferencia) -- aplica solo sobre el universo
-# `crypto_specialist` de este script.
-_CRYPTO_STOOQ_OVERRIDES: dict[str, str] = {
-    "BTC/USD": "btcusd.v",
-    "ETH/USD": "ethusd.v",
-}
-
-
-def _resolve_stooq_symbol_safe(ticker: str) -> str | None:
-    """`_resolve_stooq_symbol` (market_data.py) + override local de cripto (ver arriba)."""
-    override = _CRYPTO_STOOQ_OVERRIDES.get(ticker)
-    return override if override is not None else _resolve_stooq_symbol(ticker)
-
-
-def _to_naive_daily_index(idx: pd.Index) -> pd.DatetimeIndex:
-    """tz-aware (cualquier tz) o tz-naive -> SIEMPRE tz-naive, truncado a
-    medianoche. Único punto de verdad de normalización temporal del
-    módulo -- usado tanto para alinear OHLCV/macro (`_normalize_daily_index`)
-    como el índice de `NEWS_SENTIMENT_SCORE` en `engineer_asset`."""
-    idx = pd.DatetimeIndex(idx)
-    if idx.tz is not None:
-        idx = idx.tz_convert("UTC").tz_localize(None)
-    return idx.normalize()
-
-
-def _normalize_daily_index(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    V13 FIX (Requerimiento 2, raíz COMÚN de la fuga de Timezones y de la
-    fuga Crypto vs Macro): Twelve Data devuelve índice tz-aware (UTC
-    explícito), FRED/Stooq tz-naive -- mezclar ambos en
-    `pd.concat(pieces, axis=1, join="outer")` produce DOS entradas de
-    índice distintas para el MISMO día calendario (tz-aware vs tz-naive NO
-    son comparables/equivalentes para pandas), así que un ffill/dropna
-    corriente abajo nunca ve ambas mitades como una sola fila -- la causa
-    real de que un ffill aparentemente correcto siguiera aniquilando el
-    dataset. Se normaliza CADA pieza (activo Y macro) al mismo grano --
-    tz-naive, medianoche -- ANTES de la unión, garantizando una sola fila
-    real por día calendario para todos los proveedores.
-    """
-    out = df.copy()
-    out.index = _to_naive_daily_index(out.index)
-    if out.index.has_duplicates:
-        # Colisión post-normalización (ej. dos timestamps intradía cayendo
-        # en la misma medianoche tras truncar) -- se conserva la ÚLTIMA
-        # observación real del día, nunca un promedio sintético.
-        out = out.groupby(level=0).last()
-    return out.sort_index()
-
-
-def _fetch_all_symbols_flat(tickers: list[str], macro_tickers: list[str], period: str) -> pd.DataFrame:
-    """
-    Reemplazo directo de `yf.download(all_symbols, period=period,
-    auto_adjust=True)`: ensambla el MISMO layout ancho que ya consumía
-    `engineer_asset` -- `{ticker}_Open/High/Low/Close/Volume` por cada ticker
-    operable, `{macro}_Close` por cada factor macro (único campo que
-    `engineer_asset` lee de un macro ticker) -- vía Twelve Data/FRED/Stooq,
-    MISMOS mapeos de símbolo que sirven el radar en producción
-    (services/market_data.py, single source of truth).
-    """
-    sessions = _period_to_sessions(period)
-    pieces: list[pd.DataFrame] = []
-
-    # V12 (Requerimiento 1, Tolerancia a Fallos): un símbolo individual que
-    # falle en TODOS los proveedores (`_fetch_symbol_history` agota FRED/TD/
-    # Stooq y lanza RuntimeError) ya NO aborta la descarga COMPLETA del
-    # régimen -- se loguea y se omite del `pieces`, dejando que
-    # `run_regime_pipeline` lo detecte vía el Data Quality Check (columnas
-    # OHLCV ausentes) y siga con el resto del universo. Los factores macro
-    # (abajo) siguen siendo fatales a propósito: son features COMPARTIDOS
-    # por todos los activos del régimen, no hay "régimen parcial" posible
-    # sin ellos.
-    for ticker in tickers:
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
         try:
-            df = _fetch_symbol_history(
-                ticker, _resolve_td_symbol(ticker), _resolve_stooq_symbol_safe(ticker), sessions,
-            )
-        except RuntimeError as exc:
-            logger.error(
-                "[DQ] '%s': fallo TOTAL de descarga (Twelve Data + Stooq) -- %s -- "
-                "se OMITE del universo; el resto de la descarga continúa.", ticker, exc,
-            )
-            continue
-        df = _normalize_daily_index(df)  # V13: grano diario tz-naive uniforme ANTES del outer join
-        pieces.append(df[["open", "high", "low", "close", "volume"]].rename(columns={
-            "open": f"{ticker}_Open", "high": f"{ticker}_High", "low": f"{ticker}_Low",
-            "close": f"{ticker}_Close", "volume": f"{ticker}_Volume",
-        }))
+            data = yf.download(symbols, period=period, auto_adjust=True, progress=False)
+            if data is None or data.empty:
+                raise ValueError("yfinance devolvió un DataFrame vacío")
 
-    for macro_ticker in macro_tickers:
-        mapping = resolve_macro_symbol(macro_ticker)
-        df = _fetch_symbol_history(
-            macro_ticker, mapping.get("twelvedata"), mapping.get("stooq"), sessions,
-            fred_series_id=mapping.get("fred"),
-        )
-        df = _normalize_daily_index(df)  # V13: mismo grano que los activos -- ver arriba
-        pieces.append(df[["close"]].rename(columns={"close": f"{macro_ticker}_Close"}))
-
-    # outer join real por fecha -- preserva calendarios distintos entre
-    # cripto (24/7) y equity/macro (días hábiles), igual que el índice
-    # combinado que yf.download devolvía para un batch multi-símbolo.
-    flat = pd.concat(pieces, axis=1, join="outer").sort_index()
-    if flat.empty:
-        raise ValueError("Descarga completa vacía tras ensamblar el universo (Twelve Data/FRED/Stooq).")
-    return flat
+            close = (data["Close"] if isinstance(data.columns, pd.MultiIndex)
+                     else data[["Close"]].rename(columns={"Close": symbols[0]}))
+            missing = [s for s in symbols if s not in close.columns]
+            starved = [s for s in symbols if s in close.columns and close[s].notna().mean() < min_coverage]
+            if missing or starved:
+                raise ValueError(
+                    f"cobertura insuficiente tras la descarga -- ausentes={missing} "
+                    f"con <{min_coverage:.0%} de datos reales={starved}"
+                )
+            return data
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt == max_retries:
+                break
+            wait_s = backoff_base * (2 ** (attempt - 1))
+            logger.warning("Descarga falló (intento %d/%d): %r — reintentando en %.0fs",
+                           attempt, max_retries, exc, wait_s)
+            time.sleep(wait_s)
+    raise RuntimeError(f"No se pudo descargar {symbols} tras {max_retries} intentos") from last_exc
 
 
-def _cache_is_stale(cached: pd.DataFrame, max_age_hours: int = _CACHE_MAX_AGE_HOURS) -> bool:
+def _fetch_all_symbols_flat(tickers: list[str], macro_tickers: list[str], period: str,
+                             cache_tag: str, force_refresh: bool | None = None) -> pd.DataFrame:
     """
-    True si la fecha MÁS RECIENTE del índice cacheado tiene más de
-    `max_age_hours` de antigüedad respecto a `datetime.now()` -- la caché
-    debe descartarse y recargarse fresca desde la API (ver `download_all`).
-    """
-    if cached.empty:
-        return True
+    Reemplazo canónico de `download_all` (alias más abajo, compatibilidad
+    hacia atrás con `train_pipeline.py`). Devuelve OHLCV completo de
+    `tickers` (`{ticker}_{Open,High,Low,Close,Volume}`) + Close de
+    `macro_tickers` (`{macro}_Close`), SIN ffill/dropna -- esa
+    responsabilidad sigue siendo exclusiva de `engineer_asset`.
 
-    max_date = pd.Timestamp(cached.index.max())
-    # Normaliza a tz-aware UTC ANTES de restar contra `datetime.now(utc)` --
-    # el índice cacheado puede venir tz-naive (Stooq/FRED) o tz-aware
-    # (Twelve Data, `timezone=UTC` explícito), según proveedor/símbolo;
-    # mismo patrón defensivo que `get_daily_news_sentiment` en data_pipeline.py.
-    max_date = max_date.tz_localize("UTC") if max_date.tzinfo is None else max_date.tz_convert("UTC")
-    age = datetime.now(timezone.utc) - max_date.to_pydatetime()
-    return age > timedelta(hours=max_age_hours)
+    Directiva 1 (caché): unificada vía `CacheManager` (`_ohlcv_cache`,
+    antes parquet ad-hoc acá / JSON ad-hoc en inferencia), mismo
+    `_CACHE_MAX_AGE_HOURS`/`FORCE_FRESH_DATA` de siempre.
 
+    Directiva 2 (fuga de datos / alineación 24/7 vs 5/7): cada serie macro
+    se proyecta contra el calendario REAL del universo de `tickers` de
+    este régimen vía `kodaquant_core.project_macro_frame` (upsample a
+    calendario diario corrido + ffill ANTES del merge) -- misma lógica,
+    ya no un `.ffill()` ciego sobre el frame combinado dentro de
+    `engineer_asset` cruzando dedos con el orden de columnas.
 
-def download_all(tickers: list[str], macro_tickers: list[str], period: str,
-                  cache_tag: str, force_refresh: bool | None = None) -> pd.DataFrame:
-    """
-    Descarga OHLCV completo de `tickers` + Close de `macro_tickers`, con
-    cache local en parquet + Smart Cache Invalidation: una caché con el set
-    de columnas requerido YA NO se reutiliza a ciegas -- si su fecha más
-    reciente tiene más de `_CACHE_MAX_AGE_HOURS` de antigüedad, se descarta,
-    se advierte en el log, y se dispara una descarga fresca que sobrescribe
-    el .parquet viejo (garantiza sincronía temporal con
-    NEWS_SENTIMENT_SCORE, que siempre usa titulares de HOY).
-
-    `force_refresh` (V9, CI/CD): None (default) delega al flag global
-    `FORCE_FRESH_DATA` -- True/False lo anula puntualmente para esta
-    llamada. Con force_refresh activo se ignora CUALQUIER .parquet
-    cacheado (staleness irrelevante, ni siquiera se lee) y se va directo a
-    la descarga fresca; el .parquet se sigue escribiendo al final
-    igual que siempre.
+    Directiva 3 (alineación train/inferencia): ^TNX se resuelve vía
+    `FredClient`/serie oficial DGS10 -- LA MISMA fuente primaria que
+    `market_data.py` ya usa en inferencia para ese mismo factor -- con
+    fallback automático a yfinance si `FRED_API_KEY` no está configurada
+    o la request falla puntualmente. El resto de `macro_tickers` y TODO
+    el universo de `tickers` (equities + cripto) permanece en yfinance,
+    concurrente, sin cambios.
     """
     effective_force_refresh = FORCE_FRESH_DATA if force_refresh is None else force_refresh
-    all_symbols = list(dict.fromkeys(tickers + macro_tickers))
+    cache_key = f"ohlcv_{cache_tag}_{period}"
     fields = ["Open", "High", "Low", "Close", "Volume"]
-    cache_path = DATA_DIR / f"all_ohlcv_{cache_tag}_{period}.parquet"
-
-    required_cols = set()
-    for t in tickers:
-        required_cols.update(f"{t}_{f}" for f in fields)
-    for m in macro_tickers:
-        required_cols.add(f"{m}_Close")
+    required_cols = {f"{t}_{f}" for t in tickers for f in fields} | {f"{m}_Close" for m in macro_tickers}
 
     if effective_force_refresh:
-        logger.info(
-            "[cache local] FORCE_FRESH_DATA activo -> se ignora cualquier "
-            "%s cacheado, descarga 100%% fresca.", cache_path.name,
-        )
-    elif cache_path.exists():
-        logger.info("[cache local] leyendo %s", cache_path.name)
-        cached = pd.read_parquet(cache_path)
-        if required_cols.issubset(set(cached.columns)):
-            if not _cache_is_stale(cached):
-                return cached
+        logger.info("[CacheManager] FORCE_FRESH_DATA activo -> se ignora cualquier %s cacheado, descarga 100%% fresca.", cache_key)
+    else:
+        cached = _ohlcv_cache.get_dataframe(cache_key, required_columns=required_cols)
+        if cached is not None:
+            logger.info("[CacheManager] leyendo %s (fresco).", cache_key)
+            return cached
+
+    # --- Precio equities/cripto: yfinance, concurrente (Directiva 3) ------
+    raw = _download_with_backoff(tickers, period)
+    flat = pd.DataFrame(index=raw.index)
+    available_fields = set(raw.columns.get_level_values(0)) if isinstance(raw.columns, pd.MultiIndex) else set(raw.columns)
+    for field in fields:
+        if field not in available_fields:
+            continue
+        sub = raw[field] if isinstance(raw.columns, pd.MultiIndex) else raw[[field]].rename(columns={field: tickers[0]})
+        for sym in tickers:
+            if sym in sub.columns:
+                flat[f"{sym}_{field}"] = sub[sym]
+    flat.index = normalize_daily_index(pd.DatetimeIndex(flat.index))
+    flat = flat[~flat.index.duplicated(keep="last")].sort_index()
+
+    # --- Factores macro: FRED (^TNX) -> yfinance (resto + fallback) -------
+    macro_closes: dict[str, pd.Series] = {}
+    macro_via_yf: list[str] = []
+    for m in macro_tickers:
+        fred_series_id = _FRED_MACRO_SERIES_MAP.get(m)
+        # V20: tail_days=520 (~1.4 años) era el bug real detrás del
+        # "19.9%/0.7% de cobertura" que veníamos viendo en '^TNX_Close' en
+        # TODAS las corridas -- incluso con FRED_API_KEY correctamente
+        # configurada. No era Yahoo Finance fallando: era esta llamada
+        # pidiéndole a FRED muchísimos menos días de los que cubre
+        # PERIOD="10y" para el resto del pipeline (equities/otros macro
+        # vía yfinance). 520/~2600 días de trading ≈ 20% -- coincide exacto
+        # con el número de cobertura que se repitió en cada corrida.
+        # 3700 días cubre 10y + margen (fines de semana/feriados incluidos
+        # en el conteo corrido de FRED).
+        series = _fred_client.daily_series(fred_series_id, tail_days=3700) if fred_series_id else None
+        if series is not None and not series.empty:
+            macro_closes[m] = series
+        else:
+            macro_via_yf.append(m)
+
+    if macro_via_yf:
+        macro_raw = _download_with_backoff(macro_via_yf, period)
+        if isinstance(macro_raw.columns, pd.MultiIndex):
+            macro_available = set(macro_raw.columns.get_level_values(0))
+            if "Close" in macro_available:
+                macro_close_block = macro_raw["Close"]
+                for m in macro_via_yf:
+                    if m in macro_close_block.columns:
+                        macro_closes[m] = macro_close_block[m].dropna()
+        elif "Close" in macro_raw.columns and len(macro_via_yf) == 1:
+            macro_closes[macro_via_yf[0]] = macro_raw["Close"].dropna()
+
+    macro_frame = project_macro_frame(macro_closes, flat.index) if macro_closes else pd.DataFrame(index=flat.index)
+    for m in macro_tickers:
+        flat[f"{m}_Close"] = macro_frame[m] if m in macro_frame.columns else np.nan
+
+    # --- Diagnóstico de cobertura (NO altera el pipeline, solo visibilidad) --
+    # V16: un macro ticker con cobertura ~0% (símbolo roto/deslistado en
+    # Yahoo Finance -- "DX-Y.NYB" es un caso conocido de esto) hace que
+    # `engineer_asset` -- que exige TODAS las columnas macro no-nulas antes
+    # de aceptar una fila, sin cambios de política -- termine con 0 filas
+    # para el activo: un `ValueError` de sklearn ~700 líneas más abajo, sin
+    # ninguna pista de la causa real. Este bloque deja explícito en el log,
+    # ACÁ mismo, qué columna es la culpable, antes de que el pipeline siga.
+    for col in sorted(required_cols):
+        if col not in flat.columns:
+            logger.warning("[Diagnóstico cobertura] '%s' NO llegó a descargarse (columna ausente).", col)
+            continue
+        coverage_pct = 100.0 * flat[col].notna().mean() if len(flat) else 0.0
+        if coverage_pct < 50.0:
             logger.warning(
-                "[cache local] %s obsoleta -- fecha más reciente %s tiene más "
-                "de %dh de antigüedad -> Caché obsoleta, forzando recarga.",
-                cache_path.name, cached.index.max(), _CACHE_MAX_AGE_HOURS,
+                "[Diagnóstico cobertura] '%s': solo %.1f%% de filas con dato real "
+                "en todo el rango descargado -- candidato directo a colapsar "
+                "`engineer_asset` (exige TODAS las columnas no-nulas por fila). "
+                "Si es un macro ticker, lo más probable es que Yahoo Finance haya "
+                "dejado de servirlo con este período/granularidad -- considerar "
+                "migrarlo a Twelve Data, igual que ya se hizo en "
+                "services/market_data.py para ^GSPC/^VIX/GC=F/DX-Y.NYB.",
+                col, coverage_pct,
             )
 
-    flat = _fetch_all_symbols_flat(tickers, macro_tickers, period)
-
-    flat.to_parquet(cache_path)
-    logger.info("[cache local] guardado en %s (sincronizada, fecha más reciente %s)",
-                cache_path.name, flat.index.max() if not flat.empty else "N/A")
+    _ohlcv_cache.set_dataframe(cache_key, flat)
+    logger.info("[CacheManager] %s guardado (sincronizado, fecha más reciente %s).",
+                cache_key, flat.index.max() if not flat.empty else "N/A")
     return flat
+
+
+# Alias de compatibilidad hacia atrás: `download_all` era el nombre previo
+# a la consolidación del core; `train_pipeline.py` (MLOps incremental) y
+# cualquier caller externo que aún lo referencie siguen funcionando sin
+# ningún cambio de firma.
+download_all = _fetch_all_symbols_flat
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -766,6 +677,30 @@ def compute_stochastic_k(high: pd.Series, low: pd.Series, close: pd.Series, peri
     return stoch_k.fillna(50.0)
 
 
+def _fetch_fear_greed_index(tail_days: int) -> Optional[pd.Series]:
+    """Serie diaria del Crypto Fear & Greed Index (alternative.me, endpoint
+    público, SIN key) -- 0=miedo extremo, 100=codicia extrema, 50=neutro.
+    A diferencia de FUNDING_RATE (revertido, derivado de precio/leverage --
+    correlacionado con lo que ya veían RSI/ATR/BB_WIDTH), esto es un
+    agregado de PSICOLOGÍA de mercado (volatilidad, momentum, redes
+    sociales, dominancia BTC) -- categoría de señal distinta, no probada
+    antes. Historia disponible desde feb-2018 -- fechas anteriores quedan
+    en 50.0 (neutro) por default en `engineer_asset`, nunca NaN."""
+    try:
+        resp = requests.get("https://api.alternative.me/fng/", params={"limit": 0, "format": "json"}, timeout=10.0)
+        resp.raise_for_status()
+        records = resp.json().get("data", [])
+    except Exception as exc:  # noqa: BLE001 -- proveedor opcional, jamás tumba el pipeline
+        logger.debug("Fear & Greed Index falló: %r", exc)
+        return None
+    if not records:
+        return None
+    fg = pd.DataFrame(records)
+    fg["date"] = pd.to_datetime(pd.to_numeric(fg["timestamp"]), unit="s").dt.normalize()
+    fg["value"] = pd.to_numeric(fg["value"], errors="coerce")
+    return fg.groupby("date")["value"].mean()
+
+
 def engineer_asset(all_data: pd.DataFrame, ticker: str, macro_tickers: list[str]) -> pd.DataFrame:
     """
     Frame de features de UN activo — V6, estacionariedad estricta. El precio
@@ -777,6 +712,14 @@ def engineer_asset(all_data: pd.DataFrame, ticker: str, macro_tickers: list[str]
     reconstruir `last_price`/el target de log-return. Los factores macro
     siguen transformándose a log-return ANTES del feature_scaler (V4,
     sin cambios).
+
+    V15 (consolidación del core): `all_data` ya llega con los macro
+    tickers pre-alineados al calendario real del régimen (24/7 cripto o
+    5/7 equity) por `_fetch_all_symbols_flat`/`kodaquant_core.
+    project_macro_frame` -- el `.ffill().dropna()` de abajo ya NO es la
+    única defensa contra el hueco de fin de semana/feriado (esa lógica
+    vive ahora en una única fuente de verdad, compartida con inferencia),
+    solo limpia remanentes menores (ej. el burn-in inicial de indicadores).
     """
     close_col = f"{ticker}_Close"
     high_col = f"{ticker}_High"
@@ -785,34 +728,32 @@ def engineer_asset(all_data: pd.DataFrame, ticker: str, macro_tickers: list[str]
     macro_close_cols = [f"{m}_Close" for m in macro_tickers]
 
     df = all_data[[close_col, high_col, low_col, vol_col] + macro_close_cols].copy()
+    rows_before = len(df)
+    df = df.ffill().dropna()
 
-    # V13 FIX (Requerimiento 1, Desalineación Crypto vs Macro): cripto opera
-    # 24/7, Treasuries/SPY/Oro/DXY solo L-V -- el outer join deja NaN en las
-    # columnas macro cada sábado/domingo. Un ffill/dropna CIEGO sobre TODO
-    # el subset trataba esos NaN de fin de semana igual que un NaN real del
-    # propio OHLCV del activo -> dropna() aniquilaba cada fila de fin de
-    # semana (~2/7 del dataset de un activo 24/7 por ronda) -- shape (0, 17)
-    # en el log original. Fix de dos pasos, cada uno sellando su propia fuga:
-    #   (a) ffill(limit=4) SOLO sobre las columnas macro -- proyecta el
-    #       último cierre de mercado (viernes) hacia sábado/domingo Y
-    #       feriados largos de hasta 3 días corridos de colchón; un límite
-    #       explícito evita arrastrar silenciosamente un hueco genuino de
-    #       proveedor durante semanas.
-    #   (b) dropna(subset=OHLCV propio) en vez de dropna() global -- la fila
-    #       sobrevive según si el ACTIVO operó ese día, no según si el macro
-    #       (ya proyectado en (a)) tiene dato; para equity (no 24/7) es un
-    #       no-op exacto vs. el comportamiento previo, ya que sus propias
-    #       columnas OHLCV ya vienen NaN los fines de semana.
-    own_ohlcv_cols = [close_col, high_col, low_col, vol_col]
-    macro_nan_before = int(df[macro_close_cols].isna().sum().sum())
-    df[macro_close_cols] = df[macro_close_cols].ffill(limit=4)
-    macro_nan_rescued = macro_nan_before - int(df[macro_close_cols].isna().sum().sum())
-    df = df.dropna(subset=own_ohlcv_cols)
-    if macro_nan_rescued > 0:
-        logger.info(
-            "[DQ] '%s': ffill(limit=4) de macro proyectó valores de viernes -> "
-            "%d celda(s) de fin de semana/feriado rescatadas -> %d filas 24/7 "
-            "retenidas tras dropna(OHLCV propio).", ticker, macro_nan_rescued, len(df),
+    if df.empty:
+        # Diagnóstico específico (V16): reemplaza el `ValueError` críptico de
+        # sklearn en `build_asset_dataset` (~700 líneas más abajo, "Found
+        # array with 0 sample(s)") por un mensaje que apunta directo a la
+        # columna responsable -- causa más común: un macro ticker sin UN
+        # SOLO dato real en todo `all_data` (símbolo roto/deslistado en
+        # Yahoo Finance), que el `dropna()` de arriba (exige TODAS las
+        # columnas no-nulas por fila, sin cambios de política) vacía por
+        # completo. Cero impacto en el pipeline cuando `df` no queda vacío.
+        raw = all_data[[close_col, high_col, low_col, vol_col] + macro_close_cols]
+        fully_nan_cols = [c for c in raw.columns if raw[c].isna().all()]
+        raise ValueError(
+            f"'{ticker}': el DataFrame de features quedó VACÍO tras "
+            f"ffill().dropna() ({rows_before} fila(s) antes -> 0 después). "
+            + (f"Columna(s) 100% NaN en TODO el historial descargado: "
+               f"{fully_nan_cols} -- revisá esa fuente (ver también el "
+               "'[Diagnóstico cobertura]' logueado por _fetch_all_symbols_flat "
+               "más arriba en esta misma corrida)."
+               if fully_nan_cols else
+               "Ninguna columna individual está 100% NaN -- es un problema de "
+               "SUPERPOSICIÓN de fechas entre columnas (ej. un macro ticker con "
+               "historial mucho más corto que el resto, sin fechas en común "
+               "con el activo objetivo).")
         )
 
     close, high, low, volume = df[close_col], df[high_col], df[low_col], df[vol_col]
@@ -856,43 +797,30 @@ def engineer_asset(all_data: pd.DataFrame, ticker: str, macro_tickers: list[str]
     df["ADX_14"] = compute_adx(high, low, close)                    # ya acotado [0,100] — sin cambios
     df["STOCH_K_14"] = compute_stochastic_k(high, low, close)       # ya acotado [0,100] — sin cambios
 
-    # --- V5 (Requerimiento 1): NEWS_SENTIMENT_SCORE vía Finnhub + FinBERT.
+    # --- V5 (Requerimiento 1): NEWS_SENTIMENT_SCORE vía yfinance/Finnhub + FinBERT.
     # Se alinea temporalmente contra el índice YA depurado del activo, ANTES
     # de recortar filas por ffill/dropna final, igual que el resto de técnicos.
-    #
-    # V12 FIX (Requerimiento 2, Alineación Temporal): `df.index` llega con
-    # timestamps heterogéneos entre proveedores tras el outer join de
-    # `_fetch_all_symbols_flat` -- Twelve Data puede devolver tz-aware
-    # (UTC), FRED/Stooq tz-naive (mismo patrón defensivo que
-    # `_cache_is_stale`, arriba). Sin normalizar, el merge_asof interno de
-    # `get_daily_news_sentiment` compara datetime64 tz-aware contra
-    # tz-naive/`date` y NINGUNA fecha cae dentro de la tolerancia (auditoría
-    # previa: NEWS_SENTIMENT_SCORE rank 17/17, atribución≈0.0) aunque el día
-    # calendario SÍ coincida. Se normaliza a un índice tz-naive truncado a
-    # medianoche -- el grano real, diario, de OHLCV y de los titulares --
-    # ANTES de pedir el score.
-    news_index = _to_naive_daily_index(df.index)  # V13: mismo primitivo que _normalize_daily_index
+    df["NEWS_SENTIMENT_SCORE"] = get_daily_news_sentiment(ticker, df.index)
 
-    news_scores = get_daily_news_sentiment(ticker, news_index)
-    # Asignación POSICIONAL (np.asarray), no por índice: `news_index` es una
-    # copia normalizada de `df.index`, no el mismo objeto -- asignar por
-    # label aquí produciría NaN en cada fila si la función respeta (como se
-    # espera) el índice recibido en vez de devolver un array plano.
-    df["NEWS_SENTIMENT_SCORE"] = np.asarray(news_scores, dtype=np.float64)
-
-    # Data Quality Check (Requerimiento 2) -- cobertura real de la señal:
-    # si tras la alineación la enorme mayoría de las filas quedó en 0.0 (sin
-    # match dentro de la tolerancia del merge_asof), el feature sigue vivo
-    # mecánicamente pero muerto en atribución -- se advierte temprano en vez
-    # de descubrirlo 100 épocas después en el ranking de gradiente.
-    news_coverage = float((df["NEWS_SENTIMENT_SCORE"] != 0.0).mean())
-    if news_coverage < 0.05:
-        logger.warning(
-            "[DQ] '%s': NEWS_SENTIMENT_SCORE con cobertura=%.1f%% tras la "
-            "alineación temporal (<5%% de filas con match real dentro de la "
-            "tolerancia) -- revisar ventana de noticias vs. histórico OHLCV "
-            "en data_pipeline.get_daily_news_sentiment.", ticker, news_coverage * 100,
-        )
+# --- V21: FEAR_GREED_INDEX (cripto) -- ver `_fetch_fear_greed_index` arriba
+    # de esta función. Señal de PSICOLOGÍA de mercado, categoría distinta a
+    # FUNDING_RATE (revertido en V17). Para tickers NO-cripto la columna
+    # queda en 50.0 (neutro) constante -- CERO impacto en equity_specialist.
+    if ticker in REGIMES["crypto_specialist"]["tickers"]:
+        cache_key = "fear_greed_index"
+        cached_fg = _ohlcv_cache.get_dataframe(cache_key)
+        fg_series = cached_fg.iloc[:, 0] if cached_fg is not None and not cached_fg.empty else None
+        if fg_series is None:
+            fg_series = _fetch_fear_greed_index(tail_days=3700)
+            if fg_series is not None and not fg_series.empty:
+                _ohlcv_cache.set_dataframe(cache_key, fg_series.to_frame("fg"))
+        if fg_series is not None and not fg_series.empty:
+            fg_series.index = normalize_daily_index(pd.DatetimeIndex(fg_series.index))
+            df["FEAR_GREED_INDEX"] = fg_series.reindex(df.index).ffill().fillna(50.0)
+        else:
+            df["FEAR_GREED_INDEX"] = 50.0
+    else:
+        df["FEAR_GREED_INDEX"] = 50.0
 
     df = df.ffill().dropna()
 
@@ -1270,6 +1198,33 @@ class DynamicGammaCallback(keras.callbacks.Callback):
             logger.info("[DynamicGamma] epoch=%3d  gamma=%.4f%s", epoch, new_gamma, tag)
 
 
+def _build_tcn_branch(seq_input, filters: int, l2reg, dropout_rate: float,
+                       kernel_size: int = TCN_KERNEL_SIZE, dilations=TCN_DILATIONS,
+                       name_prefix: str = "tcn"):
+    """
+    Bloque TCN (V15, Directiva 4): pila de convoluciones causales 1D
+    dilatadas con conexión residual por bloque (patrón estándar Bai et al.
+    2018), seguida de GlobalAveragePooling1D para colapsar a un vector de
+    contexto del mismo rol que `BahdanauAttention` -- ambos se concatenan
+    aguas abajo en `build_model`. `padding="causal"` es obligatorio: sin
+    causalidad el filtro vería pasos FUTUROS de la ventana, fuga de
+    información hacia el propio target que se intenta predecir.
+    """
+    x = seq_input
+    for i, dilation in enumerate(dilations):
+        residual = x
+        conv = layers.Conv1D(
+            filters, kernel_size, padding="causal", dilation_rate=dilation,
+            activation="relu", kernel_regularizer=l2reg, name=f"{name_prefix}_conv_{i}_d{dilation}",
+        )(x)
+        conv = layers.Dropout(dropout_rate * 0.3, name=f"{name_prefix}_dropout_{i}")(conv)
+        if residual.shape[-1] != filters:
+            residual = layers.Conv1D(filters, 1, padding="same", name=f"{name_prefix}_proj_{i}")(residual)
+        x = layers.Add(name=f"{name_prefix}_residual_add_{i}")([residual, conv])
+        x = layers.LayerNormalization(name=f"{name_prefix}_ln_{i}")(x)
+    return layers.GlobalAveragePooling1D(name=f"{name_prefix}_global_pool")(x)
+
+
 def build_model(n_timesteps: int, n_features: int, n_assets: int,
                  steps_per_epoch: int, regime_name: str,
                  embed_dim: int = ASSET_EMBED_DIM,
@@ -1303,6 +1258,7 @@ def build_model(n_timesteps: int, n_features: int, n_assets: int,
     dropout_rate = arch["dropout_rate"]
     dense_l2_reg = arch["dense_l2_reg"]
     extra_residual_block = arch["extra_residual_block"]
+    tcn_filters = arch.get("tcn_filters", lstm_units // 2)
     if model_name is None:
         model_name = f"KodaQuant_{regime_name}_V5"
 
@@ -1334,7 +1290,20 @@ def build_model(n_timesteps: int, n_features: int, n_assets: int,
     asset_embed = layers.Flatten(name="asset_embedding_flat")(asset_embed)
 
     context_vector = layers.Dropout(dropout_rate * 0.5, name="dropout_post_bahdanau")(context_vector)
-    fused = layers.Concatenate(name="fusion_attn_asset")([context_vector, asset_embed])
+
+    # --- V15 (Directiva 4) — rama TCN paralela, fusionada por concat -----
+    # Opera sobre `seq_input` CRUDO (no sobre `attn_block`): busca patrones
+    # temporales complementarios a los que ya extrae BiLSTM+MHA+Bahdanau,
+    # no refinar la misma representación dos veces. `ENABLE_TCN_BRANCH=0`
+    # deja el grafo IDÉNTICO a la topología V10 (invarianza reversible).
+    if ENABLE_TCN_BRANCH:
+        tcn_context = _build_tcn_branch(seq_input, tcn_filters, l2, dropout_rate)
+        tcn_context = layers.Dropout(dropout_rate * 0.5, name="dropout_post_tcn")(tcn_context)
+        fusion_inputs = [context_vector, tcn_context, asset_embed]
+    else:
+        fusion_inputs = [context_vector, asset_embed]
+
+    fused = layers.Concatenate(name="fusion_attn_asset")(fusion_inputs)
     fused = layers.Dropout(dropout_rate, name="dropout_regularizer")(fused)
 
     # --- Bloque residual profundo adicional (perfil equity_specialist) —
@@ -1430,10 +1399,9 @@ def train_model(model: keras.Model, X_train, asset_id_train, y_train,
 # ============================================================
 # FASE D: EVALUACIÓN — RECONSTRUCCIÓN DE PRECIOS + DIRECTIONAL ACCURACY
 # ============================================================
-def evaluate_asset(model: keras.Model, test: dict, ticker: str, target_scaler: StandardScaler,
-                    batch_size: int = EVAL_BATCH_SIZE) -> dict:
+def evaluate_asset(model: keras.Model, test: dict, ticker: str, target_scaler: StandardScaler) -> dict:
     asset_id_col = test["asset_id"].reshape(-1, 1)
-    y_pred_scaled = model.predict([test["X"], asset_id_col], verbose=0, batch_size=batch_size)
+    y_pred_scaled = model.predict([test["X"], asset_id_col], verbose=0)
     mu_scaled = y_pred_scaled[:, 0:1]
     r_hat = target_scaler.inverse_transform(mu_scaled).flatten()
     r_true = target_scaler.inverse_transform(test["y"]).flatten()
@@ -1456,68 +1424,35 @@ FEATURE_NAMES = ["LOG_RETURN_1D"] + TECH_COLS + MACRO_TICKERS  # orden exacto de
 
 
 def compute_feature_attribution(model: keras.Model, X_test: np.ndarray, asset_id_test: np.ndarray,
-                                  feature_names: list[str] = FEATURE_NAMES,
-                                  batch_size: int = EVAL_BATCH_SIZE) -> pd.Series:
+                                  feature_names: list[str] = FEATURE_NAMES) -> pd.Series:
     """
     Atribución por gradiente |∂ŷ/∂x| promediada sobre timesteps y muestras. NO son los pesos
     de BahdanauAttention (esos ponderan PASOS TEMPORALES, no canales de feature) — esta es la
     métrica correcta para cuantificar cuánto responde la salida a NEWS_SENTIMENT_SCORE frente
     a las otras 16 variables del tensor.
-
-    Batch inference (Requisito de Oro): el forward+backward de EinsumDense sobre las >4000
-    muestras de X_test_all en un solo pase saturaba la RAM del runner CPU (ResourceExhaustedError).
-    Aquí se trocea X_test en chunks lógicos de `batch_size` filas, se abre un GradientTape
-    independiente por chunk y se ACUMULA la suma (no el promedio) de |∂ŷ/∂x| sobre
-    (muestras, timesteps). Al final se normaliza dividiendo por (N_muestras * T_timesteps),
-    que es exactamente la misma normalización que keras.ops.mean(axis=(0,1)) aplicaba sobre
-    el tensor completo. Resultado matemáticamente idéntico al cálculo en un solo batch —ningún
-    dato se trunca ni se descarta—, salvo el reordenamiento de sumas de punto flotante inherente
-    a cualquier reducción por chunks (diferencia en el orden de ~1e-7, irrelevante en magnitud
-    frente a los propios gradientes).
     """
     import tensorflow as tf
 
-    n_samples, n_timesteps = X_test.shape[0], X_test.shape[1]
-    n_channels = X_test.shape[2]
-    grad_abs_sum = np.zeros(n_channels, dtype=np.float64)
+    x_tensor = tf.convert_to_tensor(X_test, dtype=tf.float32)
+    asset_tensor = tf.convert_to_tensor(asset_id_test.reshape(-1, 1), dtype=tf.int32)
 
-    for start in range(0, n_samples, batch_size):
-        end = min(start + batch_size, n_samples)
+    with tf.GradientTape() as tape:
+        tape.watch(x_tensor)
+        preds = model([x_tensor, asset_tensor], training=False)
+    grads = tape.gradient(preds, x_tensor)
 
-        x_chunk = tf.convert_to_tensor(X_test[start:end], dtype=tf.float32)
-        asset_chunk = tf.convert_to_tensor(
-            asset_id_test[start:end].reshape(-1, 1), dtype=tf.int32
-        )
-
-        with tf.GradientTape() as tape:
-            tape.watch(x_chunk)
-            preds_chunk = model([x_chunk, asset_chunk], training=False)
-        grads_chunk = tape.gradient(preds_chunk, x_chunk)
-
-        # Suma parcial (sin promediar todavía) sobre (muestras, timesteps) del chunk.
-        chunk_sum = keras.ops.convert_to_numpy(
-            keras.ops.sum(keras.ops.abs(grads_chunk), axis=(0, 1))
-        )
-        grad_abs_sum += chunk_sum.astype(np.float64)
-
-        # Libera explícitamente activaciones/gradientes del chunk antes del siguiente lote.
-        del x_chunk, asset_chunk, preds_chunk, grads_chunk, tape
-
-    mean_abs_grad = grad_abs_sum / (n_samples * n_timesteps)
+    mean_abs_grad = keras.ops.convert_to_numpy(keras.ops.mean(keras.ops.abs(grads), axis=(0, 1)))
     return pd.Series(mean_abs_grad, index=feature_names, name="mean_abs_gradient").sort_values(ascending=False)
 
 
-def extract_temporal_attention(model: keras.Model, X_test: np.ndarray, asset_id_test: np.ndarray,
-                                 batch_size: int = EVAL_BATCH_SIZE) -> np.ndarray:
+def extract_temporal_attention(model: keras.Model, X_test: np.ndarray, asset_id_test: np.ndarray) -> np.ndarray:
     """Pesos reales de BahdanauAttention por PASO TEMPORAL (diagnóstico complementario, no por feature)."""
     attention_extractor = keras.Model(
         inputs=model.inputs,
         outputs=model.get_layer("bahdanau_attention").output[1],
         name="attention_extractor",
     )
-    weights = attention_extractor.predict(
-        [X_test, asset_id_test.reshape(-1, 1)], verbose=0, batch_size=batch_size
-    )
+    weights = attention_extractor.predict([X_test, asset_id_test.reshape(-1, 1)], verbose=0)
     return weights.squeeze(-1)
 
 
@@ -1565,7 +1500,7 @@ def plot_regime_evaluation(results: dict[str, dict], regime_name: str, output_pa
 # ============================================================
 def run_regime_pipeline(regime_name: str, regime_cfg: dict) -> dict:
     """Ejecuta las Fases A-E completas para UN especialista y persiste sus artefactos."""
-    configured_tickers = regime_cfg["tickers"]
+    tickers = regime_cfg["tickers"]
     oversample_factor = float(regime_cfg.get("oversample_factor", 1.0))
     arch = REGIME_ARCHITECTURE[regime_name]
 
@@ -1574,60 +1509,26 @@ def run_regime_pipeline(regime_name: str, regime_cfg: dict) -> dict:
     # inferencia, idéntico en corrida local y en el cron de CI/CD.
     output_dir = MODELS_ROOT / regime_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    # V12 (Requerimiento 1, Tolerancia a Fallos): el id de cada activo se
-    # fija sobre el universo CONFIGURADO (no el validado más abajo) -- un
-    # activo que el Data Quality Check descarte esta corrida simplemente
-    # deja su fila de `asset_embedding` sin entrenar (nunca recibe
-    # gradiente), en vez de forzar un re-mapeo de ids que correría el
-    # riesgo de desincronizar `asset_to_id` respecto al `scalers_dict.pkl`
-    # que ya consume `quanti_engine.py` en inferencia entre corridas.
-    asset_to_id = {t: i for i, t in enumerate(configured_tickers)}
+    asset_to_id = {t: i for i, t in enumerate(tickers)}
 
     logger.info("=" * 78)
-    logger.info("REGIMEN: %s  |  Universo configurado: %s  |  BiLSTM=%du  heads=%d  "
+    logger.info("REGIMEN: %s  |  Universo: %s  |  BiLSTM=%du  heads=%d  "
                 "residual_extra=%s  dropout=%.2f  L2=%.0e",
-                regime_name, configured_tickers, arch["lstm_units"], arch["mha_heads"],
+                regime_name, tickers, arch["lstm_units"], arch["mha_heads"],
                 arch["extra_residual_block"], arch["dropout_rate"], arch["dense_l2_reg"])
     logger.info("=" * 78)
 
     logger.info("[1/5] Descargando %d activos (OHLCV) + %d factores macro (%s)...",
-                len(configured_tickers), len(MACRO_TICKERS), PERIOD)
-    all_market_data = download_all(configured_tickers, MACRO_TICKERS, PERIOD, cache_tag=regime_name)
+                len(tickers), len(MACRO_TICKERS), PERIOD)
+    all_market_data = download_all(tickers, MACRO_TICKERS, PERIOD, cache_tag=regime_name)
 
-    logger.info("[2/5] Data Quality Check + ingeniería de features + dataset por activo...")
+    logger.info("[2/5] Ingeniería de features y construcción de dataset por activo...")
     feature_scalers, target_scalers = {}, {}
     X_train_parts, y_train_parts, asset_id_train_parts = [], [], []
     test_sets = {}
-    tickers: list[str] = []  # universo VALIDADO -- se reconstruye activo por activo, abajo
 
-    for ticker in configured_tickers:
-        # --- DQ Check 1/2: ¿el activo tiene columnas OHLCV reales tras la
-        # descarga? (símbolo no resuelto por Twelve Data/Stooq -> ausentes,
-        # ver `_fetch_all_symbols_flat`) ---
-        required_raw_cols = {f"{ticker}_{field}" for field in ("Open", "High", "Low", "Close", "Volume")}
-        if not required_raw_cols.issubset(all_market_data.columns):
-            logger.error(
-                "[DQ] '%s': CERO columnas OHLCV en la descarga (símbolo no resuelto "
-                "por Twelve Data/Stooq) -- se OMITE del régimen '%s'; el resto del "
-                "universo continúa entrenando con normalidad.", ticker, regime_name,
-            )
-            continue
-
+    for ticker in tickers:
         df_asset = engineer_asset(all_market_data, ticker, MACRO_TICKERS)
-
-        # --- DQ Check 2/2: ¿sobreviven filas suficientes tras limpieza/
-        # alineación (ffill/dropna, merge de noticias) para al menos 1
-        # ventana de train? (raíz exacta del ValueError original:
-        # MinMaxScaler.fit sobre shape=(0, 17)) ---
-        if len(df_asset) < MIN_ROWS_PER_ASSET:
-            logger.error(
-                "[DQ] '%s': %d fila(s) utilizables tras limpieza/alineación temporal "
-                "(mínimo requerido=%d, LOOKBACK=%d) -- se OMITE del régimen '%s'; el "
-                "resto del universo continúa entrenando con normalidad.",
-                ticker, len(df_asset), MIN_ROWS_PER_ASSET, LOOKBACK, regime_name,
-            )
-            continue
-
         train, test, f_scaler, t_scaler = build_asset_dataset(
             df_asset, ticker, LOOKBACK, TRAIN_RATIO, asset_to_id
         )
@@ -1638,21 +1539,7 @@ def run_regime_pipeline(regime_name: str, regime_cfg: dict) -> dict:
         X_train_parts.append(train["X"])
         y_train_parts.append(train["y"])
         asset_id_train_parts.append(train["asset_id"])
-        tickers.append(ticker)
         logger.info("      %-10s train=%5d  test=%5d", ticker, len(train["X"]), len(test["X"]))
-
-    if not tickers:
-        raise RuntimeError(
-            f"Régimen '{regime_name}': el Data Quality Check descartó los "
-            f"{len(configured_tickers)} activos configurados {configured_tickers} -- "
-            f"cero muestras utilizables, imposible entrenar. Abortando el régimen."
-        )
-    if len(tickers) < len(configured_tickers):
-        omitted = [t for t in configured_tickers if t not in tickers]
-        logger.warning(
-            "[DQ] Régimen '%s' entrena con %d/%d activos -- omitidos por el Data "
-            "Quality Check: %s", regime_name, len(tickers), len(configured_tickers), omitted,
-        )
 
     X_train = np.concatenate(X_train_parts, axis=0)
     y_train = np.concatenate(y_train_parts, axis=0)
@@ -1679,7 +1566,7 @@ def run_regime_pipeline(regime_name: str, regime_cfg: dict) -> dict:
     n_fit_samples = int(len(X_train) * (1 - VALIDATION_SPLIT))
     steps_per_epoch = max(1, n_fit_samples // BATCH_SIZE)
     model, gamma_variable = build_model(
-        n_timesteps=LOOKBACK, n_features=N_FEATURES, n_assets=len(configured_tickers),
+        n_timesteps=LOOKBACK, n_features=N_FEATURES, n_assets=len(tickers),
         steps_per_epoch=steps_per_epoch, regime_name=regime_name,
         huber_delta=HUBER_DELTA, gamma_initial=GAMMA_INITIAL,
         variance_lambda=VARIANCE_LAMBDA, variance_cap=VARIANCE_CAP,
@@ -1714,7 +1601,7 @@ def run_regime_pipeline(regime_name: str, regime_cfg: dict) -> dict:
 
     X_test_all = np.concatenate([test_sets[t]["X"] for t in tickers], axis=0)
     asset_id_test_all = np.concatenate([test_sets[t]["asset_id"] for t in tickers], axis=0)
-    attribution = compute_feature_attribution(model, X_test_all, asset_id_test_all, batch_size=EVAL_BATCH_SIZE)
+    attribution = compute_feature_attribution(model, X_test_all, asset_id_test_all)
     logger.info("      Atribución por gradiente (|∂ŷ/∂x|) — top 5 de 17 variables:")
     for feat, val in attribution.head(5).items():
         marker = "  <- NEWS_SENTIMENT_SCORE" if feat == "NEWS_SENTIMENT_SCORE" else ""

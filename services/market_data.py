@@ -252,9 +252,9 @@ de ÚLTIMO recurso, nunca la primaria de nada crítico.
 """
 
 import io
-import json
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -265,6 +265,50 @@ import pandas as pd
 import requests
 
 logger = logging.getLogger("kodaquant.market_data")
+
+# --- RESOLUCIÓN ABSOLUTA DE IMPORTS (Directiva 2 — fin al Import Hell) ----
+# Este archivo vive en `services/`, hermano de `ml_engine/` (donde vive
+# `kodaquant_core.py`, SINGLE SOURCE OF TRUTH -- Directiva 1). Sube desde
+# este archivo hasta encontrar la raíz del proyecto -- el primer ancestro
+# que contiene TANTO `ml_engine/` como `services/` como subdirectorios -- y
+# la inserta en `sys.path[0]`. A partir de ahí, `ml_engine` es un paquete
+# válido sin importar el cwd desde el que se invoque el proceso que importa
+# este módulo (uvicorn, `services.quanti_engine`, un test, etc.).
+def _bootstrap_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for ancestor in (here.parent, *here.parents):
+        if (ancestor / "ml_engine").is_dir() and (ancestor / "services").is_dir():
+            return ancestor
+    # Fallback determinista: este archivo vive en services/, por lo que su
+    # abuelo es la raíz del proyecto por construcción, incluso si
+    # `ml_engine/` todavía no existe en el entorno actual (ej. checkout
+    # parcial/CI).
+    return here.parent.parent
+
+
+_PROJECT_ROOT = _bootstrap_project_root()
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Migración de Directiva 4: este módulo ya NO define su propia lógica de
+# caché en disco ni su propio cliente FRED -- ambos vivían acá duplicados
+# (con semántica ligeramente distinta) respecto de lo que ya usaba
+# `train_kodaquant_v5.py`. Delegan por completo en el núcleo compartido
+# `ml_engine/kodaquant_core.py`:
+#   - `CacheManager`            -> reemplaza `_cache_get`/`_cache_set`/
+#     `_cache_path`/`_CACHE_LOCK` (mismo formato JSON on-disk, incluye
+#     soporte nativo para `ignore_ttl=True` y `_stale_age_hours`).
+#   - `FredClient`              -> reemplaza `_fred_series_daily` (mismo
+#     endpoint/retry/backoff 1:1).
+#   - `normalize_daily_index`   -> reemplaza `_normalize_daily_index`.
+#   - `align_macro_to_calendar` -> reemplaza `_macro_close_ffilled_to_daily_calendar`
+#     (idéntica lógica: upsample a calendario diario corrido + ffill, sin
+#     bfill, ANTES de reindexar contra el calendario del activo objetivo).
+# Toda la lógica NO relacionada con ingesta macro/caché (Twelve Data, Stooq,
+# rate limiting, single-flight, mapeo de símbolos) permanece intacta abajo.
+from ml_engine.kodaquant_core import (  # noqa: E402
+    CacheManager, FredClient, align_macro_to_calendar, normalize_daily_index,
+)
 
 # ---------------------------------------------------------------------------
 # Config / credenciales
@@ -281,9 +325,11 @@ TWELVE_DATA_TIMEOUT_S = 20.0
 # protección anti-bot como Stooq) -- ver ROOT CAUSE RONDA 2 en el
 # docstring del módulo. Opcional: si no está configurada, ^TNX cae
 # directo al fallback Stooq (mismo comportamiento que antes de RONDA 2).
+# Directiva 4: el cliente HTTP/retry/backoff vive ahora en
+# `kodaquant_core.FredClient` -- `FredClient` ya loguea su propio warning
+# si `api_key` viene vacía, así que no se duplica acá.
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "").strip()
-FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
-FRED_TIMEOUT_S = 15.0
+_fred_client = FredClient(api_key=FRED_API_KEY)
 
 # ~2 años de sesiones diarias (mismo horizonte que el "period=2y" que usaba
 # yfinance) — suficiente burn-in para que RSI_14/EMA_20/MACD/MACD_SIGNAL
@@ -302,16 +348,9 @@ if not TWELVE_DATA_API_KEY:
         "de entorno / Secret 'TWELVE_DATA_API_KEY'."
     )
 
-if not FRED_API_KEY:
-    logger.warning(
-        "FRED_API_KEY no configurada -- '^TNX' (rendimiento UST10Y) cae "
-        "directo al fallback Stooq, que en este hosting viene demostrando "
-        "bloqueos sistemáticos (ver ROOT CAUSE RONDA 2 en el docstring del "
-        "módulo). Registrate gratis (sin tarjeta, ~1 minuto) en "
-        "https://fred.stlouisfed.org/docs/api/api_key.html y seteá la "
-        "variable de entorno / Secret 'FRED_API_KEY' para eliminar ese "
-        "último punto de falla."
-    )
+# (Warning de FRED_API_KEY ausente: ahora lo emite `FredClient.__init__`
+# en `kodaquant_core.py`, ver instanciación de `_fred_client` arriba --
+# se evita duplicar el mismo log dos veces.)
 
 # ---------------------------------------------------------------------------
 # Rate limiter -- ventana deslizante de 60s, 7 requests (margen de
@@ -392,59 +431,24 @@ def _throttle() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Caché en disco (JSON, TTL) -- clave = ticker INTERNO (AAPL, BTC-USD,
-# ^VIX, ...), nunca el símbolo externo, así todo el motor comparte una
-# única entrada de caché por activo sin importar qué proveedor lo sirvió.
-# ---------------------------------------------------------------------------
+# Caché en disco -- clave = ticker INTERNO (AAPL, BTC-USD, ^VIX, ...),
+# nunca el símbolo externo, así todo el motor comparte una única entrada de
+# caché por activo sin importar qué proveedor lo sirvió.
+#
+# Directiva 4: delega por completo en `kodaquant_core.CacheManager`
+# (`get_json`/`set_json`, modo JSON de TTL absoluto -- mismo modo/formato
+# on-disk que ya usaba este módulo, `{"_kind": ..., "data": ..., "_cached_at":
+# ...}`, con soporte NATIVO para `ignore_ttl=True`/`_stale_age_hours`, ver
+# `_fetch_symbol_ohlcv` más abajo). Subcarpeta `v2/` explícita: separa el
+# formato unificado de `CacheManager` de cualquier entrada preexistente en
+# `_CACHE_DIR` escrita por la caché JSON ad-hoc anterior (formato sin
+# `"_kind"`) -- evita que una entrada vieja en disco se lea como dato crudo
+# en vez de DataFrame durante el primer deploy post-migración. Se puede
+# purgar `_CACHE_DIR` original manualmente una vez migrado; no es necesario
+# para operar.
 _CACHE_DIR = Path(os.environ.get("KODAQUANT_DATA_CACHE_DIR", "/tmp/kodaquant_market_cache"))
 _CACHE_TTL_S = int(os.environ.get("KODAQUANT_DATA_CACHE_TTL_SECONDS", str(6 * 3600)))
-_CACHE_LOCK = threading.Lock()
-
-
-def _cache_path(cache_key: str) -> Path:
-    safe = cache_key.replace("/", "_").replace(":", "_").replace("^", "caret_")
-    return _CACHE_DIR / f"{safe}.json"
-
-
-def _cache_get(cache_key: str, ignore_ttl: bool = False) -> Optional[pd.DataFrame]:
-    """
-    `ignore_ttl=True` -- FIX 2026-08-15, ver ROOT CAUSE en el docstring del
-    módulo: devuelve lo último cacheado en disco SIN importar si el TTL de
-    6h ya venció. Uso exclusivo del fallback de última instancia en
-    `_fetch_symbol_ohlcv` cuando Twelve Data Y Stooq fallan los dos en
-    vivo -- para un macro factor que entra al tensor como log-return
-    diario, un dato de ayer sigue siendo estrictamente mejor que tumbar el
-    universo entero. El camino normal (`ignore_ttl=False`, default) NO
-    cambia de comportamiento.
-    """
-    path = _cache_path(cache_key)
-    try:
-        with _CACHE_LOCK:
-            if not path.exists():
-                return None
-            payload = json.loads(path.read_text())
-        age_s = time.time() - payload.get("_cached_at", 0)
-        if not ignore_ttl and age_s > _CACHE_TTL_S:
-            return None
-        df = pd.read_json(io.StringIO(payload["data"]), orient="split")
-        df.index = pd.to_datetime(df.index)
-        if ignore_ttl and age_s > _CACHE_TTL_S:
-            df.attrs["_stale_age_hours"] = round(age_s / 3600, 1)
-        return df
-    except Exception as exc:  # noqa: BLE001 -- caché corrupta/ilegible jamás tumba el fetch real
-        logger.debug("Caché ilegible para %s (%r) -- se ignora y se re-descarga.", cache_key, exc)
-        return None
-
-
-def _cache_set(cache_key: str, df: pd.DataFrame) -> None:
-    path = _cache_path(cache_key)
-    payload = {"data": df.to_json(orient="split", date_format="iso"), "_cached_at": time.time()}
-    try:
-        with _CACHE_LOCK:
-            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload))
-    except Exception as exc:  # noqa: BLE001 -- falla de disco (fs read-only, etc.) jamás tumba el boot
-        logger.debug("No se pudo escribir caché para %s (%r).", cache_key, exc)
+_market_cache = CacheManager(_CACHE_DIR / "v2", default_ttl_seconds=_CACHE_TTL_S)
 
 
 # ---------------------------------------------------------------------------
@@ -633,61 +637,11 @@ def _td_payload_to_df(payload: dict) -> Optional[pd.DataFrame]:
 
 # ---------------------------------------------------------------------------
 # FRED (Federal Reserve Economic Data) -- fuente PRIMARIA nueva (RONDA 2)
-# para ^TNX (serie DGS10). API REST oficial del gobierno de EE.UU.,
-# diseñada para tráfico programático -- ver ROOT CAUSE RONDA 2 en el
-# docstring del módulo. 100% gratis, requiere `FRED_API_KEY` (opcional: si
-# no está seteada, este proveedor se salta en silencio y el caller cae al
-# siguiente en la cadena, sin romper nada para quien no la configuró).
+# para ^TNX (serie DGS10). Directiva 4: cliente HTTP/retry/backoff migrado
+# 1:1 a `kodaquant_core.FredClient` (`_fred_client`, instanciado arriba) --
+# ya no vive inline en este módulo. `FredClient.daily_series(series_id,
+# tail_days)` reemplaza directamente a la vieja `_fred_series_daily`.
 # ---------------------------------------------------------------------------
-
-def _fred_series_daily(series_id: str, tail_days: int, attempts: int = 3) -> Optional[pd.Series]:
-    """
-    Devuelve una `pd.Series` de Close diario (valor de la serie FRED, ya en
-    la unidad publicada -- para DGS10, porcentaje directo, ej. 4.558 =
-    4.558%, misma convención que Stooq/yfinance ya documentada en
-    MACRO_SYMBOL_MAP). FRED marca los días sin observación (feriados,
-    fines de semana ya vienen excluidos por la API, pero algún feriado
-    bancario puntual puede venir como ".") con el string "." -- se
-    descartan como NaN, nunca se interpolan ni se inventan.
-    """
-    if not FRED_API_KEY:
-        return None
-
-    params = {
-        "series_id": series_id,
-        "api_key": FRED_API_KEY,
-        "file_type": "json",
-        "sort_order": "desc",
-        "limit": str(tail_days),
-    }
-
-    last_exc: Optional[Exception] = None
-    for attempt in range(attempts):
-        try:
-            resp = requests.get(FRED_BASE_URL, params=params, timeout=FRED_TIMEOUT_S)
-            if resp.status_code == 429:
-                raise RuntimeError(f"FRED rate limit (429): {resp.text[:200]}")
-            resp.raise_for_status()
-            payload = resp.json()
-            observations = payload.get("observations") if isinstance(payload, dict) else None
-            if not observations:
-                return None
-
-            df = pd.DataFrame(observations)
-            if "date" not in df.columns or "value" not in df.columns:
-                return None
-            df["date"] = pd.to_datetime(df["date"])
-            df["value"] = pd.to_numeric(df["value"], errors="coerce")  # "." (sin dato) -> NaN, nunca inventado
-            series = df.set_index("date").sort_index()["value"].dropna()
-            return series.tail(tail_days) if not series.empty else None
-        except Exception as exc:  # noqa: BLE001 -- reintentamos cualquier fallo transitorio
-            last_exc = exc
-            if attempt < attempts - 1:
-                time.sleep(1.5 * (attempt + 1))
-
-    logger.warning("FRED agotó reintentos para la serie '%s': %r", series_id, last_exc)
-    return None
-
 
 # ---------------------------------------------------------------------------
 # Stooq -- fallback CSV sin key (mismo endpoint que ya usaba quanti_engine.py)
@@ -760,7 +714,7 @@ def _fetch_symbol_ohlcv(
     min_sessions: int,
     fred_series_id: Optional[str] = None,
 ) -> pd.DataFrame:
-    cached = _cache_get(f"ohlcv:{internal_key}")
+    cached = _market_cache.get_json(f"ohlcv:{internal_key}")
     if cached is not None and len(cached) >= min(min_sessions, 30):
         return cached
 
@@ -774,7 +728,7 @@ def _fetch_symbol_ohlcv(
     # si otro hilo ya resolvió el símbolo mientras esperábamos el lock, no
     # repetimos nada.
     with _lock_for(internal_key):
-        cached = _cache_get(f"ohlcv:{internal_key}")
+        cached = _market_cache.get_json(f"ohlcv:{internal_key}")
         if cached is not None and len(cached) >= min(min_sessions, 30):
             return cached
 
@@ -783,11 +737,11 @@ def _fetch_symbol_ohlcv(
         # RONDA 2 -- FRED primero si el símbolo lo tiene mapeado (hoy solo
         # ^TNX, ver MACRO_SYMBOL_MAP). Es una API oficial diseñada para
         # tráfico programático, no un endpoint de scraping con protección
-        # anti-bot como Stooq -- ver ROOT CAUSE RONDA 2. `_fred_series_daily`
-        # ya devuelve `None` sin tocar la red si `FRED_API_KEY` no está
+        # anti-bot como Stooq -- ver ROOT CAUSE RONDA 2. `_fred_client`
+        # ya devuelve `None` sin tocar la red si no hay `api_key`
         # configurada, así que este bloque es un no-op limpio en ese caso.
         if fred_series_id:
-            fred_series = _fred_series_daily(fred_series_id, tail_days=DEFAULT_HISTORY_SESSIONS + 30)
+            fred_series = _fred_client.daily_series(fred_series_id, tail_days=DEFAULT_HISTORY_SESSIONS + 30)
             if fred_series is not None and not fred_series.empty:
                 df = pd.DataFrame({"close": fred_series})
                 df["open"] = df["close"]
@@ -824,7 +778,7 @@ def _fetch_symbol_ohlcv(
                 # el TTL de 6h venció. Solo si NUNCA hubo una descarga
                 # exitosa (arranque en frío + todas las fuentes caídas a la
                 # vez) se lanza el RuntimeError real.
-                stale = _cache_get(f"ohlcv:{internal_key}", ignore_ttl=True)
+                stale = _market_cache.get_json(f"ohlcv:{internal_key}", ignore_ttl=True)
                 if stale is not None and not stale.empty:
                     stale_age_h = stale.attrs.get("_stale_age_hours")
                     logger.warning(
@@ -844,7 +798,7 @@ def _fetch_symbol_ohlcv(
                     "para este símbolo."
                 )
 
-        _cache_set(f"ohlcv:{internal_key}", df)
+        _market_cache.set_json(f"ohlcv:{internal_key}", df)
         return df
 
 
@@ -852,63 +806,12 @@ def _fetch_symbol_ohlcv(
 # API pública -- consumida por services/quanti_engine.py
 # ---------------------------------------------------------------------------
 
-def _normalize_daily_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    """
-    FIX 2026-08-15 (alineación 24/7 vs 5/5) -- normaliza un índice de
-    fechas a tz-naive con la hora puesta a medianoche.
-
-    Las 3 fuentes de este módulo NO garantizan el mismo dtype de índice:
-    Twelve Data (`_td_time_series`) pide `"timezone": "UTC"` y puede
-    devolver timestamps CON offset explícito (tz-aware) según el símbolo/
-    intervalo, mientras que FRED (`_fred_series_daily`) y Stooq
-    (`_stooq_daily_close`) siempre devuelven `pd.to_datetime(...)`
-    tz-naive. Un solo símbolo (target O macro) tz-aware colisionando
-    contra el otro tz-naive hace que `.reindex()` entre ambos falle en
-    TODAS las fechas (no solo fines de semana) -- indistinguible, en el
-    mensaje de error final, de un genuino hueco de historia. Se normaliza
-    ACÁ, en el borde de ingesta de cada símbolo, para que ninguna
-    comparación de índices aguas abajo pueda volver a pisar este bug.
-    """
-    if index.tz is not None:
-        index = index.tz_localize(None)
-    return index.normalize()
-
-
-def _macro_close_ffilled_to_daily_calendar(macro_close: pd.Series, upto: pd.Timestamp) -> pd.Series:
-    """
-    FIX 2026-08-15 (alineación 24/7 vs 5/5) -- CAUSA RAÍZ real de
-    "ventana de features vacía" para BTC-USD/ETH-USD.
-
-    Cripto cotiza 24/7; los macro tickers (SPY/DGS10/XAU-USD/VIXY/UUP,
-    todos vía bolsas tradicionales) cotizan 5/5. El código anterior hacía
-    `macro_df["close"].reindex(out.index)` -- un reindex DIRECTO contra el
-    calendario de 7 días de cripto, que deja NaN en cada sábado/domingo
-    (el macro ticker simplemente no tiene fila esos días). El `.ffill()`
-    posterior sobre el DataFrame COMBINADO alcanza a tapar la mayoría de
-    esos huecos, pero CUALQUIER fila líder de `out.index` anterior a la
-    primera fecha del macro ticker (o cualquier huequito interno que el
-    ffill combinado no alcance a cubrir de forma determinista según el
-    orden de columnas) sobrevive como NaN -- y `dropna()` sobre el frame
-    completo basta para vaciarlo entero si eso golpea suficientes filas.
-
-    Fix real: upsamplear la serie del macro ticker a un calendario DIARIO
-    CORRIDO (freq="D", fin de semana incluido) y hacer forward-fill DENTRO
-    de esa serie -- ANTES de reindexarla contra el calendario 24/7 del
-    ticker objetivo. Así, el valor de un viernes de bolsa queda disponible
-    como el macro-input válido para sábado y domingo de cripto, sin
-    depender del orden ni de la suerte del ffill final sobre el frame ya
-    combinado. Nunca se hace `bfill` (relleno hacia atrás): eso sería fuga
-    de información (un valor FUTURO del macro ticker "explicando" un día
-    pasado) -- el único costo real de este fix es que los primeros días,
-    anteriores al primer dato macro disponible, siguen sin cobertura y se
-    recortan más abajo, exactamente igual que antes.
-    """
-    if macro_close.empty:
-        return macro_close
-    macro_close = macro_close[~macro_close.index.duplicated(keep="last")].sort_index()
-    calendar_end = max(macro_close.index.max(), upto)
-    daily_calendar = pd.date_range(macro_close.index.min(), calendar_end, freq="D")
-    return macro_close.reindex(daily_calendar).ffill()
+# Directiva 4: `_normalize_daily_index`/`_macro_close_ffilled_to_daily_calendar`
+# migraron 1:1 a `kodaquant_core.normalize_daily_index`/`align_macro_to_calendar`
+# (import al inicio del módulo) -- misma lógica exacta (upsample a
+# calendario diario corrido + ffill, nunca bfill, ANTES de reindexar contra
+# el calendario del activo objetivo), ahora compartida con
+# `train_kodaquant_v5.py` en vez de vivir duplicada acá.
 
 
 def fetch_feature_ohlcv(ticker: str, macro_tickers: list[str], min_sessions: int = DEFAULT_HISTORY_SESSIONS) -> pd.DataFrame:
@@ -923,7 +826,7 @@ def fetch_feature_ohlcv(ticker: str, macro_tickers: list[str], min_sessions: int
         out[f"{ticker}_Volume"]  -- Volume diario (requerido por OBV_ROC_20)
         out[macro_ticker]        -- Close diario de cada factor macro
 
-    Ver `_macro_close_ffilled_to_daily_calendar` para el fix de alineación
+    Ver `kodaquant_core.align_macro_to_calendar` para el fix de alineación
     24/7 (cripto) vs 5/5 (macro tickers) -- antes de esta fecha, este
     mismo merge era la causa raíz real de
     "'BTC-USD'/'ETH-USD': ventana de features vacía tras alinear con los
@@ -933,14 +836,14 @@ def fetch_feature_ohlcv(ticker: str, macro_tickers: list[str], min_sessions: int
     stooq_symbol = _resolve_stooq_symbol(ticker)
     target_df = _fetch_symbol_ohlcv(ticker, td_symbol, stooq_symbol, min_sessions)
 
-    target_index = _normalize_daily_index(target_df.index)
+    target_index = normalize_daily_index(target_df.index)
     target_index = target_index[~target_index.duplicated(keep="last")]
     # Puede desordenar la serie si la fuente ya venía ordenada pero con
     # timestamps tz-aware cuya normalización cambia el orden relativo en
     # un caso límite (feriados con horario de cierre distinto) -- sort
     # explícito, nunca asumido.
     target_df = target_df.loc[~target_df.index.duplicated(keep="last")].copy()
-    target_df.index = _normalize_daily_index(target_df.index)
+    target_df.index = normalize_daily_index(target_df.index)
     target_df = target_df.sort_index()
 
     out = pd.DataFrame(index=target_df.index)
@@ -958,8 +861,8 @@ def fetch_feature_ohlcv(ticker: str, macro_tickers: list[str], min_sessions: int
             fred_series_id=mapping.get("fred"),
         )
         macro_close = macro_df["close"].copy()
-        macro_close.index = _normalize_daily_index(macro_close.index)
-        macro_close_daily = _macro_close_ffilled_to_daily_calendar(macro_close, target_last_date)
+        macro_close.index = normalize_daily_index(macro_close.index)
+        macro_close_daily = align_macro_to_calendar(macro_close, target_last_date)
         out[macro_ticker] = macro_close_daily.reindex(out.index)
 
     out = out.sort_index()

@@ -16,15 +16,21 @@ ya no los referencia en absoluto.
 
 DISEÑO — DECISIONES CRÍTICAS
 -----------------------------
-1. CERO reimplementación paralela del feature engineering. `engineer_asset`,
-   `TECH_COLS`, `N_FEATURES`, `REGIMES`, `MACRO_TICKERS`, `LOOKBACK` y la
-   arquitectura/pérdida (`BahdanauAttention`, `DirectionalHuberLoss`,
-   `directional_accuracy_metric`) se importan DIRECTAMENTE desde
-   `train_kodaquant_v5.py` — el mismo módulo que ejecuta el full-retrain.
-   `engineer_asset` a su vez invoca `data_pipeline.get_daily_news_sentiment`
-   internamente, así que las 17 features (PRICE + 11 técnicos incl.
-   NEWS_SENTIMENT_SCORE/ADX_14/STOCH_K_14 + 5 macro) llegan sin
-   reimplementar nada y sin riesgo de "training/fine-tuning skew".
+1. CERO reimplementación paralela del feature engineering NI del proveedor
+   de datos de mercado. `engineer_asset`, `TECH_COLS`, `N_FEATURES`,
+   `REGIMES`, `MACRO_TICKERS`, `LOOKBACK`, `_fetch_all_symbols_flat` y la
+   arquitectura/pérdida (`BahdanauAttention`, `DirectionalGaussianNLL`,
+   `mu_mae_metric`, `directional_accuracy_metric`) se importan DIRECTAMENTE
+   desde `train_kodaquant_v5.py` — el mismo módulo que ejecuta el
+   full-retrain. `engineer_asset` a su vez invoca
+   `data_pipeline.get_daily_news_sentiment` internamente y
+   `_fetch_all_symbols_flat` ya resuelve Twelve Data/FRED/Stooq con
+   normalización tz-naive diaria (`market_data.py`, única fuente de verdad
+   de proveedores desde V11) — así que las 17 features (LOG_RETURN_1D +
+   11 técnicos incl. NEWS_SENTIMENT_SCORE/ADX_14/STOCH_K_14 + 5 macro)
+   llegan sin reimplementar nada, sin riesgo de "training/fine-tuning
+   skew" y sin una segunda ruta de descarga (yfinance) desincronizada de la
+   que ya usa `train_kodaquant_v5.py` en producción.
 
 2. Los `feature_scalers` / `target_scalers` de cada especialista NUNCA se
    re-ajustan (`.fit`) aquí — solo `.transform()` / `.inverse_transform()`.
@@ -42,10 +48,10 @@ DISEÑO — DECISIONES CRÍTICAS
 4. RUTEO DINÁMICO equity <-> crypto (Requerimiento 3). `_resolve_regime()`
    determina a qué especialista pertenece un ticker: primero contra el
    mapeo real ya entrenado (`REGIMES`), con fallback heurístico por sufijo
-   estilo Yahoo Finance (`-USD`, `-USDT`, ...) para tickers que aún no
-   pasaron por un full retrain. Un ticker fuera del `asset_to_id` ya
-   entrenado del especialista NO puede fine-tunearse (el embedding no tiene
-   fila para él) — se omite con un aviso explícito pidiendo un full retrain.
+   para tickers que aún no pasaron por un full retrain. Un ticker fuera del
+   `asset_to_id` ya entrenado del especialista NO puede fine-tunearse (el
+   embedding no tiene fila para él) — se omite con un aviso explícito
+   pidiendo un full retrain.
 
 5. Ningún workaround de "dropout congelado" (`_make_trainable_graph` de la
    versión V3/V4). Ese parche existía únicamente en el *bridge* de
@@ -55,16 +61,58 @@ DISEÑO — DECISIONES CRÍTICAS
    `Dropout` se comporta de forma estándar: activo en `.fit()`, apagado en
    `.evaluate()`/`.predict()`, sin reconstrucción de grafo necesaria.
 
+NUEVO EN V14.1 — SINCRONIZACIÓN CON `train_kodaquant_v5.py` (V6+) Y
+ELIMINACIÓN DE YFINANCE (auditoría de compatibilidad al recibir los
+módulos reales `market_data.py`/`data_pipeline.py`, antes ausentes):
+    a) `train_kodaquant_v5.py` migró, desde su V6, la cabeza de salida del
+       modelo de un único escalar a un head dual `Dense(2)` = [mu,
+       log_var], entrenado con `DirectionalGaussianNLL` (no
+       `DirectionalHuberLoss`, que el propio módulo deja "sin uso, como
+       referencia histórica"). Esta versión de `train_pipeline.py`
+       compilaba el Challenger con `DirectionalHuberLoss` sobre un modelo
+       de 2 columnas de salida (mismatch de forma silencioso: Huber
+       elemento-a-elemento entre `y_true` (N,1) y `y_pred` (N,2) nunca
+       levanta un error claro, corrompe el gradiente) y extraía
+       predicciones con `.reshape(-1, 1)` sobre un array (N, 2) -- eso NO
+       selecciona la columna `mu`, INTERCALA mu y log_var en una sola
+       columna de longitud 2N. Fix: import de `DirectionalGaussianNLL`/
+       `mu_mae_metric` (idénticos hiperparámetros que produce el
+       especialista Champion) y `y_pred[:, 0:1]` explícito en cada punto
+       donde se extraía `mu` de una predicción cruda.
+    b) `_download_regime_history` llamaba `yf.download` directo -- la
+       fuente que TODO el resto del sistema retiró explícitamente
+       (`market_data.py`: "Reemplaza por completo yfinance ... bloqueos
+       recurrentes de Yahoo Finance / errores Proxy CONNECT aborted en
+       producción"; `data_pipeline.py`: "yfinance retirado por completo").
+       Además hacía un `.ffill().dropna(how="all")` CIEGO sobre el frame
+       combinado ANTES de pasarlo a `engineer_asset` -- exactamente el
+       patrón que la auditoría V13 de `train_kodaquant_v5.py` identificó
+       como la causa raíz de aniquilar ~2/7 de un dataset 24/7 (cripto)
+       al tratar NaN de fin de semana en columnas macro igual que un NaN
+       real del propio activo. Fix: reemplazado por
+       `_fetch_all_symbols_flat` (importado de `train_kodaquant_v5.py`,
+       misma normalización tz-naive + outer join que usa el full-retrain),
+       SIN ffill/dropna adicional -- ese trabajo es responsabilidad
+       exclusiva de `engineer_asset`, que ya lo hace bien.
+    c) Universo cripto reexpresado en formato estándar `BASE/QUOTE`
+       (`BTC/USD`, ver V12 de `train_kodaquant_v5.py`) -- el heurístico de
+       ruteo dinámico (`_CRYPTO_SUFFIXES`) y el `--tickers` de CLI seguían
+       documentados/testeados contra el viejo sufijo `-USD` de yfinance.
+       Se añade `_normalize_ticker_symbol` (acepta ambas notaciones en el
+       input del usuario, normaliza a `/` antes de rutear) para no romper
+       silenciosamente el ruteo si alguien pasa `BTC-USD` por costumbre.
+
 Requisitos: mismos que `train_kodaquant_v5.py` (`keras`, `tensorflow`,
-`pandas`, `numpy`, `yfinance`, `scikit-learn`, `nltk` para `data_pipeline`)
-más `scipy` para el test estadístico Champion vs. Challenger. Debe vivir en
-el mismo directorio que `train_kodaquant_v5.py` y `data_pipeline.py`.
+`pandas`, `numpy`, `scikit-learn`, `nltk`/`requests` para `data_pipeline`,
+`requests` para `market_data`) más `scipy` para el test estadístico
+Champion vs. Challenger. Debe vivir en el mismo directorio que
+`train_kodaquant_v5.py`, `market_data.py` y `data_pipeline.py`.
 
 Uso:
-    python train_pipeline.py                            # ambos regímenes, respeta drift
-    python train_pipeline.py --force-retrain             # fuerza fine-tuning en ambos regímenes
+    python train_pipeline.py                             # ambos regímenes, respeta drift
+    python train_pipeline.py --force-retrain              # fuerza fine-tuning en ambos regímenes
     python train_pipeline.py --regimes crypto_specialist --months 12 --lr 5e-6
-    python train_pipeline.py --tickers TSLA,BTC-USD       # rutea dinámicamente y corre solo esos especialistas
+    python train_pipeline.py --tickers TSLA,BTC/USD        # rutea dinámicamente y corre solo esos especialistas
 """
 
 from __future__ import annotations
@@ -85,7 +133,6 @@ from typing import Any
 import keras
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 try:
@@ -107,33 +154,39 @@ if str(_THIS_DIR) not in sys.path:
 try:
     from train_kodaquant_v5 import (  # noqa: E402
         BahdanauAttention,
-        DirectionalHuberLoss,
+        DirectionalGaussianNLL,
         GAMMA_MAX,
+        GAUSSIAN_NLL_BETA,
         GRAD_CLIPNORM,
-        HUBER_DELTA,
+        LOG_VAR_BARRIER_LAMBDA,
+        LOG_VAR_L2_LAMBDA,
+        LOG_VAR_MAX,
+        LOG_VAR_MIN,
         MACRO_TICKERS,
         MODELS_ROOT,
         N_FEATURES,
         REGIMES,
         TECH_COLS,
-        VARIANCE_CAP,
-        VARIANCE_LAMBDA,
+        _fetch_all_symbols_flat,
         directional_accuracy_metric,
         engineer_asset,
+        mu_mae_metric,
     )
 except ImportError as exc:  # noqa: BLE001
     raise ImportError(
         "No se pudo importar train_kodaquant_v5.py. train_pipeline.py debe "
-        "vivir en el mismo directorio que train_kodaquant_v5.py y "
-        f"data_pipeline.py, con Keras 3 disponible ahí. Detalle: {exc!r}"
+        "vivir en el mismo directorio que train_kodaquant_v5.py, "
+        "market_data.py y data_pipeline.py, con Keras 3 disponible ahí. "
+        f"Detalle: {exc!r}"
     ) from exc
 
 # Requerimiento 1 — integración 100% explícita con el pipeline NLP de
 # sentimiento. No se llama directamente en este módulo (ya la invoca
 # `engineer_asset` internamente), pero el import se deja EXPLÍCITO y a nivel
-# de módulo para que un `data_pipeline.py` roto (nltk/VADER faltante, etc.)
-# falle aquí, de inmediato, en vez de a mitad de una descarga yfinance de
-# varios minutos dentro del ciclo de fine-tuning.
+# de módulo para que un `data_pipeline.py` roto (nltk/VADER/Finnhub faltante,
+# etc.) falle aquí, de inmediato, en vez de a mitad de una descarga
+# multi-proveedor (Twelve Data/FRED/Stooq) de varios minutos dentro del
+# ciclo de fine-tuning.
 try:
     from data_pipeline import get_daily_news_sentiment  # noqa: F401,E402
 except ImportError as exc:  # noqa: BLE001
@@ -151,7 +204,29 @@ TICKER_TO_REGIME: dict[str, str] = {
     for regime_name, cfg in REGIMES.items()
     for ticker in cfg["tickers"]
 }
-_CRYPTO_SUFFIXES = ("-USD", "-USDT", "-USDC", "-BTC", "-ETH")
+# V14.1 — universo cripto real vive en notación "BASE/QUOTE" (`BTC/USD`, ver
+# V12 de train_kodaquant_v5.py: el guion `BTC-USD` era un artefacto propio
+# del ticker de yfinance, ya retirado). `_CRYPTO_QUOTE_SUFFIXES` alimenta
+# tanto el heurístico de fallback (activo nuevo, aún sin full retrain) como
+# `_normalize_ticker_symbol` (abajo), que acepta la notación legacy con
+# guion en el input del usuario/CLI y la reescribe a `/` antes de rutear.
+_CRYPTO_QUOTE_SUFFIXES = ("USD", "USDT", "USDC", "BTC", "ETH")
+
+
+def _normalize_ticker_symbol(ticker: str) -> str:
+    """
+    `BTC-USD`/`btc-usd` (notación legacy de yfinance, aún común en input
+    humano/scripts viejos) -> `BTC/USD` (notación real del universo
+    entrenado). No-op para cualquier ticker que ya venga en formato
+    estándar (equity plano o cripto con `/`) o que no calce el patrón
+    `BASE-QUOTE` de un par cripto reconocido.
+    """
+    t = ticker.strip().upper()
+    if "-" in t and "/" not in t:
+        base, _, quote = t.partition("-")
+        if quote in _CRYPTO_QUOTE_SUFFIXES:
+            return f"{base}/{quote}"
+    return t
 
 
 def _resolve_regime(ticker: str) -> str:
@@ -159,12 +234,14 @@ def _resolve_regime(ticker: str) -> str:
     Decide a qué especialista V5 pertenece un ticker. Prioriza el universo
     REAL ya entrenado (`REGIMES`); si el ticker es nuevo (aún no pasó por un
     full retrain de `train_kodaquant_v5.py`), cae a una heurística de sufijo
-    estilo Yahoo Finance para pares cripto (`BTC-USD`, `SOL-USDT`, ...).
+    para pares cripto (`BTC/USD`, `SOL/USDT`, ...; también acepta el guion
+    legacy vía `_normalize_ticker_symbol`).
     """
-    ticker_upper = ticker.upper()
-    if ticker_upper in TICKER_TO_REGIME:
-        return TICKER_TO_REGIME[ticker_upper]
-    if ticker_upper.endswith(_CRYPTO_SUFFIXES) and "crypto_specialist" in REGIMES:
+    ticker_norm = _normalize_ticker_symbol(ticker)
+    if ticker_norm in TICKER_TO_REGIME:
+        return TICKER_TO_REGIME[ticker_norm]
+    if "/" in ticker_norm and ticker_norm.split("/")[-1] in _CRYPTO_QUOTE_SUFFIXES \
+            and "crypto_specialist" in REGIMES:
         return "crypto_specialist"
     return "equity_specialist" if "equity_specialist" in REGIMES else next(iter(REGIMES))
 
@@ -309,7 +386,8 @@ class KodaQuantV5MLOps:
             str(model_path),
             custom_objects={
                 "BahdanauAttention": BahdanauAttention,
-                "DirectionalHuberLoss": DirectionalHuberLoss,
+                "DirectionalGaussianNLL": DirectionalGaussianNLL,
+                "mu_mae_metric": mu_mae_metric,
                 "directional_accuracy_metric": directional_accuracy_metric,
             },
             compile=False,
@@ -323,55 +401,42 @@ class KodaQuantV5MLOps:
         self, tickers: list[str], macro_tickers: list[str], months: int
     ) -> pd.DataFrame:
         """
-        Descarga OHLCV fresca (SIN cache — a diferencia de `download_all` de
-        train_kodaquant_v5.py, un ciclo incremental necesita el dato del día,
-        nunca un parquet potencialmente viejo) para todos los tickers del
-        régimen + macro factores, en UNA sola llamada `yf.download`.
+        Descarga OHLCV fresca (SIN cache local en parquet — a diferencia de
+        `download_all` de train_kodaquant_v5.py, un ciclo incremental
+        necesita el dato del día, nunca un artefacto potencialmente viejo)
+        para todos los tickers del régimen + macro factores.
+
+        V14.1 — reemplaza `yf.download` (yfinance, retirado en TODO el
+        resto del sistema por bloqueos/inestabilidad recurrentes, ver
+        `market_data.py`) por `_fetch_all_symbols_flat`, la MISMA función
+        que usa `train_kodaquant_v5.py` para el full retrain: cascada
+        Twelve Data -> FRED -> Stooq, con normalización de índice tz-naive
+        diaria aplicada a CADA pieza ANTES del outer join (`market_data.py`
+        + `_normalize_daily_index`, fix V13 — evita la duplicación
+        tz-aware/tz-naive de entradas por día calendario que corrompía
+        silenciosamente el dataset de `crypto_specialist`).
+
+        Deliberadamente SIN ffill/dropna acá: ese trabajo es responsabilidad
+        exclusiva de `engineer_asset` (ffill(limit=4) SOLO sobre columnas
+        macro + dropna sobre el OHLCV propio del activo, fix V13) — un
+        `.ffill().dropna()` ciego aplicado ACÁ, antes de `engineer_asset`,
+        reintroduciría exactamente el bug que esa auditoría corrigió
+        (aniquilar filas de fin de semana de un activo 24/7 al tratarlas
+        igual que un NaN real).
         """
-        end_date = datetime.now(timezone.utc)
-        start_date = end_date - pd.DateOffset(months=months)
-        all_symbols = list(dict.fromkeys(tickers + macro_tickers))
-        fields = ["Open", "High", "Low", "Close", "Volume"]
-
-        raw = yf.download(
-            all_symbols,
-            start=start_date.strftime("%Y-%m-%d"),
-            end=end_date.strftime("%Y-%m-%d"),
-            auto_adjust=True,
-            progress=False,
-        )
-        if raw is None or raw.empty:
-            raise RuntimeError(
-                f"yfinance no devolvió datos para {all_symbols} "
-                f"({start_date.date()} -> {end_date.date()})."
-            )
-
-        flat = pd.DataFrame(index=raw.index)
-        if isinstance(raw.columns, pd.MultiIndex):
-            available_fields = set(raw.columns.get_level_values(0))
-            for field in fields:
-                if field not in available_fields:
-                    continue
-                sub = raw[field]
-                for sym in all_symbols:
-                    if sym in sub.columns:
-                        flat[f"{sym}_{field}"] = sub[sym]
-        else:
-            # Edge case defensivo: no debería ocurrir aquí (all_symbols
-            # siempre incluye >= 1 macro ticker además del activo), pero se
-            # cubre por honestidad ante cualquier cambio de yfinance.
-            sym = all_symbols[0]
-            for field in fields:
-                if field in raw.columns:
-                    flat[f"{sym}_{field}"] = raw[field]
+        period = f"{max(1, int(months))}mo"  # _period_to_sessions ya entiende el sufijo "mo"
+        flat = _fetch_all_symbols_flat(tickers, macro_tickers, period)
 
         required = {f"{t}_{f}" for t in tickers for f in ("Close", "High", "Low", "Volume")}
         required |= {f"{m}_Close" for m in macro_tickers}
         missing = required - set(flat.columns)
         if missing:
-            raise RuntimeError(f"Faltan columnas tras la descarga: {sorted(missing)}")
-
-        return flat.ffill().dropna(how="all")
+            raise RuntimeError(
+                f"Faltan columnas tras la descarga multi-proveedor (Twelve Data/FRED/Stooq): "
+                f"{sorted(missing)} -- ver logs de _fetch_all_symbols_flat para el detalle "
+                f"por símbolo (un ticker que falle en TODOS los proveedores se omite, no aborta)."
+            )
+        return flat
 
     def _build_windows_existing_scalers(
         self,
@@ -489,7 +554,7 @@ class KodaQuantV5MLOps:
 
             y_pred_scaled = np.asarray(
                 champion.predict([X_recent, asset_recent], verbose=0)
-            ).reshape(-1, 1)
+            )[:, 0:1]  # V14.1: head dual [mu, log_var] -- extrae SOLO mu; .reshape(-1,1) intercalaba ambas columnas
             target_scaler = scalers["target_scalers"][ticker]
             y_pred_real = target_scaler.inverse_transform(y_pred_scaled).reshape(-1)
             y_true_real = target_scaler.inverse_transform(y_recent_scaled).reshape(-1)
@@ -575,11 +640,18 @@ class KodaQuantV5MLOps:
 
         X_parts, y_parts, asset_parts, date_parts = [], [], [], []
         for ticker in tickers:
-            X, y_scaled, asset_ids, dates = self._prepare_ticker_dataset(
-                all_market_data, ticker, macro_tickers, lookback,
-                scalers["feature_scalers"][ticker], scalers["target_scalers"][ticker],
-                asset_to_id[ticker],
-            )
+            try:
+                X, y_scaled, asset_ids, dates = self._prepare_ticker_dataset(
+                    all_market_data, ticker, macro_tickers, lookback,
+                    scalers["feature_scalers"][ticker], scalers["target_scalers"][ticker],
+                    asset_to_id[ticker],
+                )
+            except Exception as exc:  # noqa: BLE001 — un ticker caído no debe tumbar el fine-tuning del régimen
+                self.logger.warning(
+                    "[%s] Fine-tuning: %s omitido -- %r (mismo criterio de tolerancia a fallos "
+                    "que evaluate_champion_drift).", regime_name, ticker, exc,
+                )
+                continue
             if len(X) == 0:
                 self.logger.warning(
                     "[%s] Sin ventanas utilizables para %s — se omite del fine-tuning.",
@@ -636,9 +708,13 @@ class KodaQuantV5MLOps:
         Clona arquitectura Y pesos del Champion (`clone_model` + `set_weights`
         — objetos completamente independientes en memoria) y recompila con
         LR ultra-bajo (`1e-5` default) para fine-tuning conservador. Usa la
-        MISMA `DirectionalHuberLoss` con la que el especialista fue
-        entrenado, con `gamma` fijo en `GAMMA_MAX` (curriculum ya completo
-        — no se re-arranca el warmup en un fine-tuning incremental).
+        MISMA `DirectionalGaussianNLL` (head dual [mu, log_var], V6+ de
+        train_kodaquant_v5.py — NO `DirectionalHuberLoss`, que ese módulo
+        mantiene solo como referencia histórica sin uso) con IDÉNTICOS
+        hiperparámetros anti-colapso de varianza (β-NLL, barrera de
+        log_var) con los que el Champion fue entrenado, y `gamma` fijo en
+        `GAMMA_MAX` (curriculum ya completo — no se re-arranca el warmup en
+        un fine-tuning incremental).
         """
         challenger = keras.models.clone_model(champion)
         challenger.set_weights(champion.get_weights())
@@ -652,11 +728,14 @@ class KodaQuantV5MLOps:
                 weight_decay=1e-4,
                 clipnorm=GRAD_CLIPNORM,
             ),
-            loss=DirectionalHuberLoss(
-                delta=HUBER_DELTA, gamma=gamma_variable,
-                variance_lambda=VARIANCE_LAMBDA, variance_cap=VARIANCE_CAP,
+            loss=DirectionalGaussianNLL(
+                gamma_directional=gamma_variable,
+                beta=GAUSSIAN_NLL_BETA,
+                log_var_min=LOG_VAR_MIN, log_var_max=LOG_VAR_MAX,
+                log_var_l2_lambda=LOG_VAR_L2_LAMBDA,
+                log_var_barrier_lambda=LOG_VAR_BARRIER_LAMBDA,
             ),
-            metrics=["mae", directional_accuracy_metric],
+            metrics=[mu_mae_metric, directional_accuracy_metric],
         )
         return challenger
 
@@ -693,7 +772,7 @@ class KodaQuantV5MLOps:
         id_to_ticker = {v: k for k, v in scalers["asset_to_id"].items()}
         flat_ids = asset_hold.reshape(-1)
 
-        y_pred_scaled = np.asarray(model.predict([X_hold, asset_hold], verbose=0)).reshape(-1, 1)
+        y_pred_scaled = np.asarray(model.predict([X_hold, asset_hold], verbose=0))[:, 0:1]  # V14.1: solo mu
 
         y_true_real = np.empty(flat_ids.shape[0], dtype=np.float64)
         y_pred_real = np.empty(flat_ids.shape[0], dtype=np.float64)
@@ -899,7 +978,7 @@ class KodaQuantV5MLOps:
         if tickers:
             grouped: dict[str, list[str]] = {}
             for raw_ticker in tickers:
-                ticker = raw_ticker.strip().upper()
+                ticker = _normalize_ticker_symbol(raw_ticker)
                 if not ticker:
                     continue
                 regime_name = _resolve_regime(ticker)
@@ -963,7 +1042,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tickers", type=str, default=None,
-        help="Lista separada por comas de tickers a rutear dinámicamente hacia su especialista. Ej: TSLA,BTC-USD",
+        help="Lista separada por comas de tickers a rutear dinámicamente hacia su especialista. "
+             "Ej: TSLA,BTC/USD (también acepta BTC-USD, se normaliza automáticamente).",
     )
     return parser.parse_args()
 

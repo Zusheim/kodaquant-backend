@@ -52,6 +52,14 @@ cripto (flujo de noticias 24/7, la misma densidad que sostiene el
 train_kodaquant_v5.py/quanti_engine.py: ambos consumen esta función tal
 cual, consistencia train/inferencia automática.
 
+V9 (consolidación del core, auditoría CTO 2026-08-16): `fetch_recent_headlines`
+ahora cachea en disco vía `kodaquant_core.CacheManager` (TTL corto,
+`KODAQUANT_NEWS_CACHE_TTL_SECONDS`, purga automática local en cada
+llamada) -- reduce presión sobre DDGS/Finnhub sin tocar la lógica de
+scoring/merge de abajo, que queda intacta. Ver `kodaquant_core.py` para el
+resto de la consolidación (caché de OHLCV, cliente FRED, alineación de
+calendario macro), compartida ahora con `train_kodaquant_v5.py`.
+
 Analizador de sentimiento: FinBERT (`ProsusAI/finbert` vía `transformers`),
 cargado perezosamente (singleton) y con selección automática de device
 (GPU si disponible, CPU en runners de CI). `get_daily_news_sentiment` sigue
@@ -73,7 +81,39 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable, Optional
+
+# --- RESOLUCIÓN ABSOLUTA DE IMPORTS (Directiva 2 — fin al Import Hell) ----
+# Este archivo vive ÚNICAMENTE en `ml_engine/` (Directiva 1: SINGLE SOURCE
+# OF TRUTH). Sube desde este archivo hasta encontrar la raíz del proyecto
+# -- el primer ancestro que contiene TANTO `ml_engine/` como `services/`
+# como subdirectorios -- y la inserta en `sys.path[0]`. A partir de ahí,
+# `ml_engine` y `services` son paquetes válidos sin importar desde qué
+# directorio de trabajo se invoque `python .../data_pipeline.py` (directo,
+# importado por `train_kodaquant_v5.py`, o vía `services.quanti_engine`).
+# Reemplaza por completo el patrón try/except dual + copias duplicadas de
+# `kodaquant_core.py` que causaba `ModuleNotFoundError`/`ImportError`.
+def _bootstrap_project_root() -> Path:
+    here = Path(__file__).resolve()
+    for ancestor in (here.parent, *here.parents):
+        if (ancestor / "ml_engine").is_dir() and (ancestor / "services").is_dir():
+            return ancestor
+    # Fallback determinista: este archivo vive en ml_engine/, por lo que su
+    # abuelo es la raíz del proyecto por construcción, incluso si `services/`
+    # todavía no existe en el entorno actual (ej. checkout parcial/CI).
+    return here.parent.parent
+
+
+_PROJECT_ROOT = _bootstrap_project_root()
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Núcleo compartido train/inferencia -- SINGLE SOURCE OF TRUTH en
+# `ml_engine/kodaquant_core.py` (Directiva 1). Import directo y absoluto,
+# sin fallback dual: con la raíz del proyecto ya en sys.path, esta ruta
+# resuelve siempre, sin importar el cwd de invocación.
+from ml_engine.kodaquant_core import CacheManager  # noqa: E402
 
 # --- PARCHE macOS Intel: runtimes OpenMP duplicados TensorFlow/PyTorch ----
 # `quanti_engine.py` carga TensorFlow/Keras (bundla Intel MKL -> libiomp5.dylib)
@@ -106,6 +146,18 @@ DDG_SAFESEARCH = os.getenv("DDG_SAFESEARCH", "moderate")
 MAX_DDG_HEADLINES = 10  # techo por-ticker -- Finnhub complementa si esto no alcanza
 
 logger = logging.getLogger("kodaquant.data_pipeline")
+
+# Caché de titulares (DDGS/Finnhub) — vida corta: la cobertura de prensa
+# cambia varias veces al día, pero no vale la pena re-golpear DDGS/Finnhub
+# en cada llamada de `get_daily_news_sentiment` dentro de la MISMA corrida
+# (el radar escanea el universo completo en paralelo, ver
+# `data_pipeline.get_daily_news_sentiment` invocado por cada régimen).
+# Purga automática local (Requerimiento 1): `_headline_cache.purge_stale()`
+# se invoca de forma perezosa en cada `fetch_recent_headlines` -- sin cron
+# externo, sin intervención manual.
+_HEADLINE_CACHE_DIR = Path(os.getenv("KODAQUANT_NEWS_CACHE_DIR", "cache/news"))
+_HEADLINE_CACHE_TTL_SECONDS = int(os.getenv("KODAQUANT_NEWS_CACHE_TTL_SECONDS", str(2 * 3600)))
+_headline_cache = CacheManager(_HEADLINE_CACHE_DIR, default_ttl_seconds=_HEADLINE_CACHE_TTL_SECONDS)
 
 # ---------------------------------------------------------------------------
 # FinBERT — analizador de sentimiento transformer, carga perezosa (singleton)
@@ -385,7 +437,25 @@ def fetch_recent_headlines(ticker: str) -> list[dict]:
     Orquesta ambas fuentes nativas (DDGS -> Finnhub) y deduplica por
     título. DDGS es la fuente primaria (no exige API key); Finnhub
     complementa cobertura solo cuando DDGS devuelve pocos titulares.
+
+    CacheManager (kodaquant_core): cachea el resultado ya deduplicado por
+    `_HEADLINE_CACHE_TTL_SECONDS` -- evita re-golpear DDGS/Finnhub por
+    ticker dentro de la misma ventana corta cuando el radar escanea el
+    universo completo. Purga automática local en cada llamada (best-effort,
+    nunca bloquea el fetch real si falla).
     """
+    try:
+        _headline_cache.purge_stale()
+    except Exception as exc:  # noqa: BLE001 -- la purga nunca debe tumbar el fetch real
+        logger.debug("[CacheManager] purge_stale falló (%r) -- se ignora.", exc)
+
+    cache_key = f"headlines_{ticker}"
+    cached = _headline_cache.get_json(cache_key)
+    if cached is not None:
+        for h in cached:
+            h["published_at"] = _normalize_timestamp(h.get("published_at"))
+        return [h for h in cached if h.get("published_at") is not None]
+
     headlines = _fetch_headlines_ddg(ticker)
     if len(headlines) < 5:
         headlines += _fetch_headlines_finnhub(ticker)
@@ -396,7 +466,14 @@ def fetch_recent_headlines(ticker: str) -> list[dict]:
         if h["title"] not in seen_titles:
             seen_titles.add(h["title"])
             deduped.append(h)
-    return deduped[:MAX_HEADLINES_PER_TICKER]
+    deduped = deduped[:MAX_HEADLINES_PER_TICKER]
+
+    serializable = [
+        {"title": h["title"], "published_at": h["published_at"].isoformat()}
+        for h in deduped
+    ]
+    _headline_cache.set_json(cache_key, serializable)
+    return deduped
 
 
 def get_daily_news_sentiment(

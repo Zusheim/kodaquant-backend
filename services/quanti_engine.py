@@ -55,6 +55,15 @@ Contrato dinámico con el Command Center (frontend):
     `risk_score` (0-100) es ahora la ÚNICA fuente de verdad matemática
     del split Plan A / Plan B — ver `_resolve_risk_split`. `risk_profile`
     queda como etiqueta narrativa/contextual, no participa en el cálculo.
+
+V15 (consolidación del core, auditoría CTO 2026-08-16): este archivo ahora
+importa `services/kodaquant_core.py` -- el mismo módulo que
+`train_kodaquant_v5.py` usa para caché/FRED/alineación de calendario
+macro -- consolidando ambos pipelines sobre una única base de código. La
+ingesta en vivo (`fetch_feature_ohlcv`, `_fetch_feature_window`) y el NLP
+de sentimiento (`services.data_pipeline.get_daily_news_sentiment`, ahora
+con caché propia vía `CacheManager`) quedan sin cambios de comportamiento
+-- cero riesgo sobre el motor de forecast en producción.
 """
 
 
@@ -115,6 +124,17 @@ import pandas as pd
 # -- este archivo solo importa las dos funciones públicas que necesita.
 # Ver ese módulo para el detalle completo de la migración.
 from services.market_data import fetch_feature_ohlcv, fetch_close_history, DEFAULT_HISTORY_SESSIONS
+
+# --- kodaquant_core (CONSOLIDACIÓN DEL CORE, Directiva 1/3) -----------------
+# Mismo núcleo (CacheManager/FredClient/alineación de calendario macro) que
+# ahora importa `train_kodaquant_v5.py` -- este proceso de inferencia lo
+# importa acá para que ambos lados queden sobre la MISMA base de código,
+# aunque hoy `services/market_data.py` siga resolviendo su propio caché/FRED
+# inline (ver nota de migración pendiente en el docstring de
+# `kodaquant_core.py`). Nunca se usa `services.kodaquant_core` para
+# recalcular nada que `market_data.py` ya resuelva -- solo se deja
+# disponible como próximo punto de enganche cuando ese módulo migre.
+from services.kodaquant_core import CacheManager, FredClient  # noqa: F401
 from groq import (
     AsyncGroq,
     APIConnectionError as GroqAPIConnectionError,
