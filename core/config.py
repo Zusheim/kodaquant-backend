@@ -37,31 +37,29 @@ class Settings(BaseSettings):
     ENV: str = "development"
     DEBUG: bool = False
 
-    # FIX DEFINITIVO (root cause real, confirmado con traceback): Hugging
-    # Face Spaces bloquea a nivel de firewall de red TODO el egress saliente
-    # a puertos SMTP (25/465/587) -- ni 587/STARTTLS ni 465/SSL-implícito
-    # llegan siquiera a abrir la conexión TCP (el error saltaba en
-    # `_create_connection`, antes de cualquier byte de protocolo). Solo 443
-    # sale garantizado en este entorno. El envío de correo se migró de SMTP
-    # directo a la API HTTPS de Resend (ver core/security.py). Las variables
-    # SMTP_* de abajo ya NO se usan para enviar correo -- se dejan opcionales
-    # por si en el futuro corrés esto en un hosting que sí permita SMTP
-    # saliente. Lo único obligatorio ahora es RESEND_API_KEY.
-    SMTP_HOST: str = "smtp.gmail.com"
-    SMTP_PORT: int = 465
-    SMTP_USE_SSL: bool = True
-    SMTP_USER: str | None = None
-    SMTP_PASSWORD: str | None = None
-    # Techo duro (segundos) para la llamada HTTPS a Resend. El envío corre
-    # como FastAPI BackgroundTask (ver api/auth.py) -- no bloquea la
-    # respuesta al cliente -- así que 15s da margen real sin arriesgar
-    # tareas colgadas indefinidamente. Ver core/security.py::_send_mail_message.
+    # FIX DEFINITIVO: dominio kodaquant.site verificado en Resend, sandbox
+    # desactivado. Se abandona SMTP directo por completo (bloqueado a nivel
+    # de firewall en HF Spaces -- ver historial) a favor del SDK oficial
+    # `resend` (ver core/security.py). Las variables SMTP_HOST/PORT/
+    # USE_SSL/USER/PASSWORD de las iteraciones anteriores ya no existen acá
+    # -- no se usan en ningún lado del código.
+    #
+    # Techo duro (segundos) para la llamada del SDK de Resend, corrida en
+    # thread vía asyncio.to_thread (ver core/security.py::_send_mail_message).
+    # El envío corre como FastAPI BackgroundTask -- no bloquea la respuesta
+    # al cliente -- así que 15s da margen real sin arriesgar tareas colgadas
+    # indefinidamente.
     SMTP_TIMEOUT_SECONDS: float = 15.0
     # API key de Resend (https://resend.com/api-keys). Obligatoria para que
-    # el envío de correo funcione en este hosting -- sin ella, se loguea un
-    # warning y el correo simplemente no sale (no rompe el registro/login).
+    # el envío de correo funcione -- sin ella, se loguea un warning y el
+    # correo simplemente no sale (no rompe el registro/login).
     RESEND_API_KEY: str | None = None
-    SMTP_FROM: str
+    # Remitente verificado. Dominio kodaquant.site ya validado por DNS en
+    # Resend -- puede enviar a cualquier destinatario, no solo al sandbox.
+    SMTP_FROM: str = "KodaQuant <no-reply@kodaquant.site>"
+    # Si un usuario responde un correo automático, llega acá en vez de a
+    # no-reply@kodaquant.site (que nadie lee).
+    REPLY_TO_EMAIL: str = "karim.egure@gmail.com"
     FRONTEND_URL: str = "https://kodaquant.web.app"
 
     model_config = SettingsConfigDict(

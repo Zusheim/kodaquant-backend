@@ -151,7 +151,14 @@ soupsieve==2.8.4
 webencodings==0.5.1
 
 # --- Email -----------------------------------------------------------------
-aiosmtplib>=3.0.0
+# aiosmtplib RETIRADO: Hugging Face Spaces bloquea a nivel de firewall de
+# red TODO el egress saliente a puertos SMTP (25/465/587) -- confirmado con
+# traceback real (TimeoutError en aiosmtplib.smtp._create_connection, nunca
+# llega a abrir la conexión TCP, sin importar 587/STARTTLS ni 465/SSL). Solo
+# 443 sale garantizado en este entorno (mismo puerto que ya usan Supabase/
+# Stripe sin problema). Migrado al SDK oficial de Resend sobre HTTPS. Ver
+# core/security.py::_send_mail_message.
+resend>=2.0.0,<3.0
 
 # --- Misc / packaging -------------------------------------------------
 python-dotenv==1.2.2

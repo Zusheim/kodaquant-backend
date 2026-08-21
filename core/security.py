@@ -24,8 +24,8 @@ from core.supabase_client import supabase, supabase_admin
 # (/api/v1/quanti/consult, /api/v1/auth/*, payments). Solo se listan
 # orígenes explícitos y verificados.
 PRODUCTION_ORIGINS = {
-    "https://kodaquant.web.app",         # Firebase Hosting (dominio primario)
-    "https://kodaquant.firebaseapp.com", # Firebase Hosting (dominio secundario, mismo proyecto)
+    "https://kodaquant.site",         # Firebase Hosting (dominio primario)
+    "https://kodaquant.site", # Firebase Hosting (dominio secundario, mismo proyecto)
 }
 
 # Puertos reales del dev server (Vite), tomados de la config actual del
