@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     # Si un usuario responde un correo automático, llega acá en vez de a
     # no-reply@kodaquant.site (que nadie lee).
     REPLY_TO_EMAIL: str = "karim.egure@gmail.com"
-    FRONTEND_URL: str = "https://kodaquant.web.app"
+    FRONTEND_URL: str = "https://kodaquant.site"
 
     model_config = SettingsConfigDict(
         env_file=".env",
