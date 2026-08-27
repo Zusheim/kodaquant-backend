@@ -2,9 +2,9 @@
   <h1>📈 KodaQuant & Quanti AI</h1>
   <p><b>An open-source, institutional-grade quantitative trading infrastructure and AI terminal.</b></p>
   
-  [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-  [![Status: Active Development](https://img.shields.io/badge/Status-Active%20Development-success.svg)]()
-  [![Ecosystem: KodaNet](https://img.shields.io/badge/Ecosystem-KodaNet-purple.svg)]()
+  <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT" style="margin: 0 5px;" />
+  <img src="https://img.shields.io/badge/Status-Active%20Development-success.svg" alt="Status: Active Development" style="margin: 0 5px;" />
+  <img src="https://img.shields.io/badge/Ecosystem-KodaNet-purple.svg" alt="Ecosystem: KodaNet" style="margin: 0 5px;" />
 </div>
 
 <br />
