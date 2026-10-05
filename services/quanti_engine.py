@@ -81,7 +81,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncGenerator
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 logger = logging.getLogger("kodaquant.quanti_engine")
 # FIX REAL (el motivo de que ningún logger.info se viera en terminal):
@@ -115,6 +115,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import numpy as np
 import pandas as pd
+import requests  # AUDITORÍA RESCATE 2026-08 — Fear&Greed/Binance funding/blockchain.info (ver TECH_COLS nuevo)
 
 # --- Proveedor de datos de mercado: Twelve Data (API oficial, gratuita) +
 # Stooq (fallback sin key) -- yfinance y el pool de proxies fueron
@@ -135,6 +136,27 @@ from services.market_data import fetch_feature_ohlcv, fetch_close_history, DEFAU
 # recalcular nada que `market_data.py` ya resuelva -- solo se deja
 # disponible como próximo punto de enganche cuando ese módulo migre.
 from services.kodaquant_core import CacheManager, FredClient  # noqa: F401
+# V28 -- MISMA implementación que ml_engine/free_alpha.py (copia idéntica).
+from services import free_alpha as _free_alpha  # noqa: E402
+from services.free_alpha import (  # noqa: E402
+    V28_COLS, V28_CRYPTO_COLS, V28_EQUITY_COLS,
+    build_crypto_flow_features, compute_equity_open_features,
+)
+
+_V28_CACHE_UTC_DAY: Optional[str] = None
+
+
+def _v28_flush_cache_on_utc_rollover() -> None:
+    """La caché en RAM de free_alpha (TTL 6h) puede retener la vela PARCIAL del día D
+    si se pobló antes de las 00:00 UTC; al rotar el día UTC se descarta para que la
+    última fila consolidada use el taker-volume completo (paridad con train)."""
+    global _V28_CACHE_UTC_DAY
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _V28_CACHE_UTC_DAY != today:
+        _free_alpha._MEM_CACHE.clear()
+        _V28_CACHE_UTC_DAY = today
+
+
 from groq import (
     AsyncGroq,
     APIConnectionError as GroqAPIConnectionError,
@@ -261,6 +283,37 @@ except Exception as _device_guard_exc:  # noqa: BLE001 — nunca tumbar el arran
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# [ZERO GPU BUDGET] — Hugging Face Spaces free tier (CPU-only, 2 vCPU / 16GB
+# compartidos) sin este guard TensorFlow por defecto abre un pool de hilos
+# intra/inter-op dimensionado a `os.cpu_count()` REAL del host físico del
+# contenedor (a veces reportado >2 en Spaces pese a la cuota real asignada,
+# ver issues públicos de HF), sobre-suscribiendo CPU y degradando latencia
+# por contención de hilos en vez de por trabajo real — mismo síntoma con el
+# que ya lidia `_KERAS_CALL_TIMEOUT_SECONDS` más abajo, pero atacado en la
+# causa en vez del síntoma. Debe fijarse ANTES del primer op de TF (mismo
+# requisito de ordenamiento que `set_visible_devices` arriba) — por eso vive
+# en el mismo bloque, nunca dentro de `_get_keras_model`. Configurable vía
+# env var para correr sin este techo en el Mac local (`KODAQUANT_TF_THREADS`
+# no seteada -> default conservador de 2, seguro tanto en el tier gratuito
+# de Spaces como en un i7 de 4-8 hilos).
+try:
+    _tf_thread_budget = max(1, int(os.environ.get("KODAQUANT_TF_THREADS", "2")))
+    _tf_device_guard.config.threading.set_intra_op_parallelism_threads(_tf_thread_budget)
+    _tf_device_guard.config.threading.set_inter_op_parallelism_threads(_tf_thread_budget)
+    logging.getLogger("kodaquant.quanti_engine").info(
+        "[ZERO GPU BUDGET] TF intra/inter-op threads fijados a %d (KODAQUANT_TF_THREADS).",
+        _tf_thread_budget,
+    )
+except Exception as _thread_guard_exc:  # noqa: BLE001 — nunca tumbar el arranque por esto
+    logging.getLogger("kodaquant.quanti_engine").warning(
+        "[ZERO GPU BUDGET] No se pudo acotar el pool de hilos de TF (%r) — probablemente "
+        "una op de TF ya corrió antes de este bloque (import circular / reload de módulo). "
+        "No es fatal, solo pierde la optimización de CPU.",
+        _thread_guard_exc,
+    )
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Configuración — rutas y endpoints
 # ---------------------------------------------------------------------------
 
@@ -310,7 +363,10 @@ DEFAULT_FORECAST_HORIZON_DAYS = 5
 PLAN_A_TICKER = "SPY"  # Reserva — activo ancla de baja volatilidad
 
 # --- V6: TECH_COLS — fuente de verdad ÚNICA del orden de columnas técnicas
-# del tensor de 17 features (LOG_RETURN_1D + 11 técnicos + 5 macro). DEBE
+# del tensor de N_FEATURES = 1 + len(TECH_COLS) + len(macro_tickers) features
+# (LOG_RETURN_1D + técnicos + macro; 24 tras la auditoría 2026-08 -- ver
+# bloque de constantes nuevas más abajo, NUNCA hardcodear este número en un
+# comentario, esa fue la causa raíz real de la desalineación auditada). DEBE
 # coincidir EXACTO (mismo orden Y misma definición matemática) con TECH_COLS
 # en train_kodaquant_v5.py — el feature_scaler cargado desde
 # scalers_dict.pkl fue ajustado con ESTE orden/definición, así que
@@ -328,11 +384,140 @@ PLAN_A_TICKER = "SPY"  # Reserva — activo ancla de baja volatilidad
 # EMA20_DEV_PCT, MACD_PCT, MACD_SIGNAL_PCT, ATR_PCT, OBV_ROC_20. RSI_14 /
 # BB_WIDTH_20 / ADX_14 / STOCH_K_14 / SENTIMENT_SCORE / NEWS_SENTIMENT_SCORE
 # quedan idénticos (ya acotados/adimensionales por construcción).
+# AUDITORÍA RESCATE 2026-08 — DESALINEACIÓN CRÍTICA ENCONTRADA Y CORREGIDA:
+# esta lista tenía 11 columnas (V6, pre-V23.5/V24) mientras que
+# train_kodaquant_v5.py ya entrena con 18 (agregó FEAR_GREED_INDEX/
+# FUNDING_RATE_ZSCORE/ONCHAIN_ACTIVITY_ROC/FRAC_DIFF_LOG_CLOSE/
+# PUELL_MULTIPLE_ZSCORE en V23.5/V24, y PARKINSON_VOL_ZSCORE/
+# VOL_OF_VOL_ZSCORE en la auditoría 2026-08). `_get_scalers()` ya valida
+# `saved_tech_cols == TECH_COLS` y falla ruidosamente ante cualquier
+# desalineación (ver más abajo) — con la lista vieja, CUALQUIER
+# scalers_dict.pkl generado por el train_kodaquant_v5.py actual bloqueaba
+# el arranque de este motor de inferencia. Sincronizado 1:1, mismo orden.
 TECH_COLS = ["RSI_14", "EMA20_DEV_PCT", "MACD_PCT", "MACD_SIGNAL_PCT", "SENTIMENT_SCORE",
              "ATR_PCT", "BB_WIDTH_20", "OBV_ROC_20", "ADX_14", "STOCH_K_14",
-             "NEWS_SENTIMENT_SCORE"]
+             "NEWS_SENTIMENT_SCORE", "FEAR_GREED_INDEX",
+             "FUNDING_RATE_ZSCORE", "ONCHAIN_ACTIVITY_ROC", "FRAC_DIFF_LOG_CLOSE",
+             "PUELL_MULTIPLE_ZSCORE", "PARKINSON_VOL_ZSCORE", "VOL_OF_VOL_ZSCORE",
+             "FUNDING_RATE_MOMENTUM_ZSCORE", "AMIHUD_ILLIQUIDITY_ZSCORE",
+             "GARMAN_KLASS_VOL_ZSCORE", "FIB_GAP_Z_20", "FIB_GAP_Z_50",
+             "OFI_PROXY_ZSCORE", "RETURN_ENTROPY_ZSCORE"] + list(V28_COLS)
+# V28 -- 25 base + 8 (V28_COLS, importado de free_alpha: idéntico a train por
+# construcción) = 33 TECH_COLS -> N_FEATURES = 1 + 33 + 5 macro = 39. Sin
+# NEWS_SENTIMENT_SCORE (gate de train): 32 / 38, adoptado desde el pkl por
+# `_get_scalers()`. La forma final se valida contra `feature_scaler.n_features_in_`
+# al final de `_fetch_feature_window`.
+if 1 + len(TECH_COLS) + 5 != 39:
+    raise ImportError(f"[V28] TECH_COLS={len(TECH_COLS)} -> N_FEATURES={1 + len(TECH_COLS) + 5} != 39.")
+# RE-VERIFICACIÓN 2026-08-31 (auditoría rescate, Directiva "sincronizar
+# fetchers/TECH_COLS-N_FEATURES") -- diff línea por línea contra TECH_COLS
+# en train_kodaquant_v5.py: 18 columnas, MISMO orden, MISMOS 7 fetchers/
+# compute_* de alpha cripto (FEAR_GREED_INDEX, FUNDING_RATE_ZSCORE vía
+# Binance funding asimétrico, ONCHAIN_ACTIVITY_ROC vía NVT Ratio Z-score,
+# FRAC_DIFF_LOG_CLOSE, PUELL_MULTIPLE_ZSCORE, PARKINSON_VOL_ZSCORE,
+# VOL_OF_VOL_ZSCORE) ya presentes y replicados 1:1 (mismas constantes de
+# ventana/clip, mismo criterio 0.0-neutro fuera de cripto/BTC) en ambos
+# archivos -- CERO desalineación encontrada, CERO cambio funcional
+# requerido en este módulo. `N_FEATURES` (derivado, no hardcodeado) sigue
+# idéntico en ambos lados por construcción.
 OBV_ROC_LOOKBACK_DAYS = 20   # DEBE calzar con OBV_ROC_LOOKBACK_DAYS en train_kodaquant_v5.py
 OBV_ROC_CLIP = 3.0           # ±300% — DEBE calzar con OBV_ROC_CLIP en train_kodaquant_v5.py
+
+# --- V23.5/V24/auditoría 2026-08 — réplica EXACTA de las constantes de
+# train_kodaquant_v5.py para las 7 columnas nuevas de TECH_COLS arriba.
+# Mismos valores, mismas fórmulas — cualquier divergencia numérica acá
+# desalinearía la inferencia contra un feature_scaler ajustado con los
+# valores de entrenamiento (ver docstring de módulo, "replica EXACTA").
+CRYPTO_TICKERS_V5 = ("BTC-USD", "ETH-USD")   # DEBE calzar con REGIMES["crypto_specialist"]["tickers"]
+BTC_TICKER_V5 = "BTC-USD"
+
+FUNDING_ZSCORE_WINDOW_DAYS = 90
+FUNDING_ZSCORE_MIN_PERIODS = 20
+FUNDING_ZSCORE_CLIP = 5.0
+# AUDITORÍA RESCATE 2026-08 -- réplica EXACTA de la restructuración asimétrica
+# de train_kodaquant_v5.py (ver docstring de módulo ahí, bloque
+# FUNDING_ZSCORE_ASYM_*). Mismos valores -- cualquier divergencia numérica
+# acá desalinearía inferencia vs. el feature_scaler ajustado en train.
+FUNDING_ZSCORE_ASYM_POS_GAMMA = 1.35
+FUNDING_ZSCORE_ASYM_NEG_GAMMA = 0.85
+BINANCE_FAPI_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
+BINANCE_FUNDING_SYMBOL_MAP = {"BTC-USD": "BTCUSDT", "ETH-USD": "ETHUSDT"}
+
+ONCHAIN_CHART_NAME = "n-transactions"
+ONCHAIN_ROC_LOOKBACK_DAYS = 7
+ONCHAIN_ROC_CLIP = 3.0
+BLOCKCHAIN_INFO_CHART_URL = "https://api.blockchain.info/charts/{chart}"
+# AUDITORÍA RESCATE 2026-08 -- réplica EXACTA de la restructuración NVT Ratio
+# de train_kodaquant_v5.py (ver docstring de módulo ahí, bloque "V25").
+ONCHAIN_TX_VALUE_CHART_NAME = "estimated-transaction-volume-usd"
+NVT_ZSCORE_WINDOW_DAYS = 365
+NVT_ZSCORE_MIN_PERIODS = 60
+NVT_ZSCORE_CLIP = 5.0
+
+FRAC_DIFF_D_GRID = tuple(round(float(d), 2) for d in np.arange(0.10, 1.01, 0.10))
+FRAC_DIFF_ADF_PVALUE_MAX = 0.05
+FRAC_DIFF_THRESH = 1e-4
+FRAC_DIFF_DEFAULT_D = 0.40
+
+BTC_HALVING_SCHEDULE: tuple[tuple[datetime, float], ...] = (
+    (datetime(2009, 1, 3, tzinfo=timezone.utc), 50.0),
+    (datetime(2012, 11, 28, tzinfo=timezone.utc), 25.0),
+    (datetime(2016, 7, 9, tzinfo=timezone.utc), 12.5),
+    (datetime(2020, 5, 11, tzinfo=timezone.utc), 6.25),
+    (datetime(2024, 4, 20, tzinfo=timezone.utc), 3.125),
+    (datetime(2028, 4, 1, tzinfo=timezone.utc), 1.5625),
+)
+BTC_BLOCKS_PER_DAY = 144.0
+PUELL_MA_WINDOW_DAYS = 365
+PUELL_MA_MIN_PERIODS = 30
+PUELL_ZSCORE_WINDOW_DAYS = 365
+PUELL_ZSCORE_MIN_PERIODS = 60
+PUELL_ZSCORE_CLIP = 5.0
+
+PARKINSON_VOL_LOOKBACK_DAYS = 20
+PARKINSON_VOL_ZSCORE_WINDOW_DAYS = 60
+PARKINSON_VOL_ZSCORE_MIN_PERIODS = 20
+PARKINSON_VOL_ZSCORE_CLIP = 5.0
+VOL_OF_VOL_LOOKBACK_DAYS = 20
+VOL_OF_VOL_ZSCORE_WINDOW_DAYS = 60
+VOL_OF_VOL_ZSCORE_MIN_PERIODS = 20
+VOL_OF_VOL_ZSCORE_CLIP = 5.0
+
+# --- V27 — réplica EXACTA de las constantes de train_kodaquant_v5.py.
+# Cualquier divergencia numérica acá desalinea la inferencia contra un
+# feature_scaler ajustado con los valores de entrenamiento.
+GK_VOL_LOOKBACK_DAYS = 20
+GK_ZSCORE_WINDOW_DAYS = 60
+GK_ZSCORE_MIN_PERIODS = 20
+GK_ZSCORE_CLIP = 5.0
+
+FIB_WINDOWS = (20, 50)
+FIB_RATIOS = (0.382, 0.500, 0.618, 1.272)
+FIB_ZSCORE_WINDOW_DAYS = 120
+FIB_ZSCORE_MIN_PERIODS = 30
+FIB_ZSCORE_CLIP = 5.0
+
+OFI_LOOKBACK_DAYS = 10
+OFI_ZSCORE_WINDOW_DAYS = 90
+OFI_ZSCORE_MIN_PERIODS = 30
+OFI_ZSCORE_CLIP = 5.0
+
+ENTROPY_WINDOW_DAYS = 30
+ENTROPY_SIGMA_LOOKBACK = 60
+ENTROPY_DEADZONE_SIGMA = 0.25
+ENTROPY_ZSCORE_WINDOW_DAYS = 120
+ENTROPY_ZSCORE_MIN_PERIODS = 30
+ENTROPY_ZSCORE_CLIP = 5.0
+
+try:
+    from statsmodels.tsa.stattools import adfuller as _adfuller
+except ImportError:  # pragma: no cover
+    _adfuller = None
+    logger.warning(
+        "statsmodels no instalado — FRAC_DIFF_LOG_CLOSE usará FRAC_DIFF_DEFAULT_D=%.2f fijo "
+        "en vez de calibrar 'd' vía ADF (ver train_kodaquant_v5.py:find_min_ffd_d).",
+        FRAC_DIFF_DEFAULT_D,
+    )
 
 # --- Inyección de Volatilidad Estocástica (post inverse_transform) --------
 # El log-return que sale del modelo (`r_hat`, ya en escala real) se
@@ -1159,6 +1344,21 @@ def _load_scalers_from_disk(regime: str) -> dict:
     # desalineamiento de shape, pero sin lanzar ningún error propio. Se
     # compara nombre y orden exactos, no solo el conteo.
     saved_tech_cols = payload.get("tech_cols")
+    # V27 -- ÚNICA divergencia tolerada: NEWS_SENTIMENT_SCORE ausente en el
+    # pkl porque el entrenamiento corrió sin backend de sentimiento (ver
+    # `_apply_news_sentiment_gate` en train_kodaquant_v5.py). Se ADOPTA la
+    # lista guardada en vez de fallar: el feature_scaler fue ajustado con
+    # ESE orden. Cualquier OTRA diferencia sigue siendo fatal.
+    if saved_tech_cols is not None and list(saved_tech_cols) != TECH_COLS:
+        _saved = list(saved_tech_cols)
+        if _saved == [c for c in TECH_COLS if c != "NEWS_SENTIMENT_SCORE"]:
+            TECH_COLS[:] = _saved
+            logger.warning(
+                "[ARTIFACT LOAD] '%s' se entrenó SIN NEWS_SENTIMENT_SCORE -> "
+                "columna excluida del tensor de inferencia (len=%d). El motor "
+                "NO reintroduce la feature: el feature_scaler no tiene columna "
+                "para ella.", regime, len(TECH_COLS))
+            saved_tech_cols = TECH_COLS
     if saved_tech_cols is not None and list(saved_tech_cols) != TECH_COLS:
         raise ValueError(
             f"Desalineación de TECH_COLS entre {scalers_path.name} "
@@ -1421,6 +1621,319 @@ def _compute_adx_state(high: pd.Series, low: pd.Series, close: pd.Series, period
     }
 
 
+# ---------------------------------------------------------------------------
+# AUDITORÍA RESCATE 2026-08 — paridad train/inferencia para las 7 columnas
+# que faltaban en TECH_COLS (ver auditoría arriba). Réplica EXACTA (mismos
+# endpoints públicos sin key, misma matemática) de las funciones equivalentes
+# en train_kodaquant_v5.py — self-contained en este módulo, mismo patrón que
+# el resto de _compute_* de arriba (el docstring de módulo ya documenta que
+# este archivo es una "replica EXACTA del notebook de entrenamiento").
+# ---------------------------------------------------------------------------
+
+def _fetch_fear_greed_index(tail_days: int = 3700) -> pd.Series | None:
+    """Fear & Greed Index (alternative.me, público, sin key). Neutro (50.0)
+    en el caller si el fetch falla — nunca tumba la inferencia."""
+    try:
+        resp = requests.get("https://api.alternative.me/fng/", params={"limit": 0, "format": "json"}, timeout=10.0)
+        resp.raise_for_status()
+        records = resp.json().get("data", [])
+    except Exception as exc:  # noqa: BLE001 — proveedor opcional
+        logger.debug("Fear & Greed Index falló: %r", exc)
+        return None
+    if not records:
+        return None
+    fg = pd.DataFrame(records)
+    fg["date"] = pd.to_datetime(pd.to_numeric(fg["timestamp"]), unit="s").dt.normalize()
+    fg["value"] = pd.to_numeric(fg["value"], errors="coerce")
+    return fg.groupby("date")["value"].mean()
+
+
+def _fetch_binance_funding_history(ticker: str) -> pd.Series | None:
+    """Historial diario de funding rate de perpetuos Binance (REST público, sin key)."""
+    symbol = BINANCE_FUNDING_SYMBOL_MAP.get(ticker)
+    if symbol is None:
+        return None
+    all_records: list[dict] = []
+    cursor_ms = int(datetime(2019, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    now_ms = int(time.time() * 1000)
+    for _ in range(50):
+        if cursor_ms >= now_ms:
+            break
+        try:
+            resp = requests.get(
+                BINANCE_FAPI_FUNDING_URL, params={"symbol": symbol, "startTime": cursor_ms, "limit": 1000}, timeout=15,
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Binance fundingRate falló para %s: %r", symbol, exc)
+            break
+        if not batch:
+            break
+        all_records.extend(batch)
+        last_time = int(batch[-1]["fundingTime"])
+        if last_time <= cursor_ms:
+            break
+        cursor_ms = last_time + 1
+        if len(batch) < 1000:
+            break
+        time.sleep(0.15)
+    if not all_records:
+        return None
+    raw = pd.DataFrame(all_records)
+    raw["date"] = pd.to_datetime(pd.to_numeric(raw["fundingTime"]), unit="ms").dt.normalize()
+    raw["fundingRate"] = pd.to_numeric(raw["fundingRate"], errors="coerce")
+    return raw.groupby("date")["fundingRate"].mean().sort_index()
+
+
+def _compute_funding_rate_zscore(daily_funding: pd.Series, window: int = FUNDING_ZSCORE_WINDOW_DAYS,
+                                  min_periods: int = FUNDING_ZSCORE_MIN_PERIODS) -> pd.Series:
+    """Réplica EXACTA de `compute_funding_rate_zscore` en train_kodaquant_v5.py
+    (V25 -- asimétrico, ver docstring ahí)."""
+    mean = daily_funding.rolling(window, min_periods=min_periods).mean()
+    std = daily_funding.rolling(window, min_periods=min_periods).std()
+    z = (daily_funding - mean) / std.replace(0.0, np.nan)
+    pos = z.clip(lower=0.0)
+    neg_abs = (-z.clip(upper=0.0))
+    z_asym = pos.pow(FUNDING_ZSCORE_ASYM_POS_GAMMA) - neg_abs.pow(FUNDING_ZSCORE_ASYM_NEG_GAMMA)
+    return z_asym.clip(-FUNDING_ZSCORE_CLIP, FUNDING_ZSCORE_CLIP).fillna(0.0)
+
+
+def _fetch_onchain_activity(chart: str = ONCHAIN_CHART_NAME) -> pd.Series | None:
+    """Actividad on-chain BTC (blockchain.info /charts, público, sin key). BTC únicamente."""
+    try:
+        resp = requests.get(
+            BLOCKCHAIN_INFO_CHART_URL.format(chart=chart),
+            params={"timespan": "all", "format": "json", "sampled": "false"}, timeout=20,
+        )
+        resp.raise_for_status()
+        values = resp.json().get("values", [])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("blockchain.info/charts/%s falló: %r", chart, exc)
+        return None
+    if not values:
+        return None
+    idx = pd.to_datetime([v["x"] for v in values], unit="s").normalize()
+    series = pd.Series([v["y"] for v in values], index=idx, dtype=float)
+    return series.groupby(level=0).mean().sort_index()
+
+
+def _btc_block_reward_schedule(dates: pd.DatetimeIndex) -> np.ndarray:
+    idx = pd.DatetimeIndex(dates)
+    idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    schedule_dates = pd.DatetimeIndex([d for d, _ in BTC_HALVING_SCHEDULE])
+    schedule_rewards = np.array([r for _, r in BTC_HALVING_SCHEDULE])
+    pos = schedule_dates.searchsorted(idx_utc, side="right") - 1
+    pos = np.clip(pos, 0, len(schedule_rewards) - 1)
+    return schedule_rewards[pos]
+
+
+def _compute_puell_multiple_zscore(close: pd.Series, window: int = PUELL_ZSCORE_WINDOW_DAYS,
+                                    min_periods: int = PUELL_ZSCORE_MIN_PERIODS) -> pd.Series:
+    """BTC únicamente — cero llamada de red, calendario de halving determinístico."""
+    reward_per_block = _btc_block_reward_schedule(close.index)
+    daily_issuance_usd = reward_per_block * BTC_BLOCKS_PER_DAY * close.to_numpy()
+    issuance = pd.Series(daily_issuance_usd, index=close.index)
+    issuance_ma = issuance.rolling(PUELL_MA_WINDOW_DAYS, min_periods=PUELL_MA_MIN_PERIODS).mean()
+    puell = issuance / issuance_ma.replace(0.0, np.nan)
+    log_puell = np.log(puell.clip(lower=1e-6))
+    mean = log_puell.rolling(window, min_periods=min_periods).mean()
+    std = log_puell.rolling(window, min_periods=min_periods).std()
+    z = (log_puell - mean) / std.replace(0.0, np.nan)
+    return z.clip(-PUELL_ZSCORE_CLIP, PUELL_ZSCORE_CLIP).fillna(0.0)
+
+
+def _btc_halving_epoch_cum_supply() -> np.ndarray:
+    """Réplica EXACTA de `_btc_halving_epoch_cum_supply` en train_kodaquant_v5.py."""
+    dates = [d for d, _ in BTC_HALVING_SCHEDULE]
+    rewards = [r for _, r in BTC_HALVING_SCHEDULE]
+    cum = [0.0]
+    for i in range(1, len(dates)):
+        days = (dates[i] - dates[i - 1]).total_seconds() / 86400.0
+        cum.append(cum[-1] + days * BTC_BLOCKS_PER_DAY * rewards[i - 1])
+    return np.array(cum)
+
+
+_BTC_EPOCH_CUM_SUPPLY_AT_START = _btc_halving_epoch_cum_supply()
+
+
+def _btc_cumulative_supply(dates: pd.DatetimeIndex) -> np.ndarray:
+    """Réplica EXACTA de `_btc_cumulative_supply` en train_kodaquant_v5.py --
+    suministro circulante determinístico, cero llamada de red."""
+    idx = pd.DatetimeIndex(dates)
+    idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    schedule_dates = pd.DatetimeIndex([d for d, _ in BTC_HALVING_SCHEDULE])
+    schedule_rewards = np.array([r for _, r in BTC_HALVING_SCHEDULE])
+    pos = np.clip(schedule_dates.searchsorted(idx_utc, side="right") - 1, 0, len(schedule_rewards) - 1)
+    epoch_start = schedule_dates[pos]
+    days_since_epoch_start = (idx_utc - epoch_start).total_seconds() / 86400.0
+    return _BTC_EPOCH_CUM_SUPPLY_AT_START[pos] + days_since_epoch_start * BTC_BLOCKS_PER_DAY * schedule_rewards[pos]
+
+
+def _fetch_onchain_tx_volume_usd() -> pd.Series | None:
+    """Réplica EXACTA de `_fetch_onchain_tx_volume_usd` en train_kodaquant_v5.py
+    -- numerador de utilidad real de NVT Ratio, mismo endpoint que
+    `_fetch_onchain_activity`, chart distinto."""
+    return _fetch_onchain_activity(chart=ONCHAIN_TX_VALUE_CHART_NAME)
+
+
+def _compute_nvt_ratio_zscore(close: pd.Series, tx_volume_usd: pd.Series,
+                               window: int = NVT_ZSCORE_WINDOW_DAYS,
+                               min_periods: int = NVT_ZSCORE_MIN_PERIODS) -> pd.Series:
+    """Réplica EXACTA de `compute_nvt_ratio_zscore` en train_kodaquant_v5.py
+    (V25 -- reemplaza ONCHAIN_ACTIVITY_ROC, ver docstring ahí). BTC únicamente."""
+    market_cap = close * _btc_cumulative_supply(close.index)
+    nvt = market_cap / tx_volume_usd.replace(0.0, np.nan)
+    log_nvt = np.log(nvt.clip(lower=1e-6))
+    mean = log_nvt.rolling(window, min_periods=min_periods).mean()
+    std = log_nvt.rolling(window, min_periods=min_periods).std()
+    z = (log_nvt - mean) / std.replace(0.0, np.nan)
+    return z.clip(-NVT_ZSCORE_CLIP, NVT_ZSCORE_CLIP).fillna(0.0)
+
+
+def _ffd_weights(d: float, thresh: float) -> np.ndarray:
+    w = [1.0]
+    k = 1
+    while True:
+        w_k = -w[-1] * (d - k + 1) / k
+        if abs(w_k) < thresh:
+            break
+        w.append(w_k)
+        k += 1
+    return np.array(w[::-1])
+
+
+def _frac_diff_ffd(series: pd.Series, d: float, thresh: float = FRAC_DIFF_THRESH) -> pd.Series:
+    weights = _ffd_weights(d, thresh)
+    width = len(weights)
+    values = series.to_numpy(dtype=np.float64)
+    out = np.full(len(values), np.nan)
+    for i in range(width - 1, len(values)):
+        out[i] = np.dot(weights, values[i - width + 1:i + 1])
+    return pd.Series(out, index=series.index)
+
+
+def _find_min_ffd_d(series: pd.Series, train_frac: float = 0.8) -> float:
+    """Calibra el mínimo `d` que logra estacionariedad (ADF) SOLO sobre el
+    prefijo de train — cero fuga hacia test/inferencia en vivo. Fallback a
+    FRAC_DIFF_DEFAULT_D si statsmodels no está disponible."""
+    if _adfuller is None:
+        return FRAC_DIFF_DEFAULT_D
+    n_train = max(int(len(series) * train_frac), 100)
+    train_series = series.iloc[:n_train]
+    for d in FRAC_DIFF_D_GRID:
+        diffed = _frac_diff_ffd(train_series, d).dropna()
+        if len(diffed) < 20:
+            continue
+        try:
+            p_value = _adfuller(diffed.to_numpy(), autolag="AIC")[1]
+        except Exception:  # noqa: BLE001
+            continue
+        if p_value <= FRAC_DIFF_ADF_PVALUE_MAX:
+            return d
+    return float(FRAC_DIFF_D_GRID[-1])
+
+
+def _compute_parkinson_vol(high: pd.Series, low: pd.Series, window: int = PARKINSON_VOL_LOOKBACK_DAYS) -> pd.Series:
+    """Estimador de volatilidad realizada de Parkinson — proxy libre de IV,
+    solo High/Low. Réplica exacta de compute_parkinson_vol() del notebook."""
+    log_hl = np.log(high / low)
+    variance = (log_hl ** 2).rolling(window=window, min_periods=window).mean() / (4.0 * np.log(2.0))
+    return np.sqrt(variance.clip(lower=0.0))
+
+
+def _compute_parkinson_vol_zscore(parkinson_vol: pd.Series, window: int = PARKINSON_VOL_ZSCORE_WINDOW_DAYS,
+                                   min_periods: int = PARKINSON_VOL_ZSCORE_MIN_PERIODS) -> pd.Series:
+    mean = parkinson_vol.rolling(window, min_periods=min_periods).mean()
+    std = parkinson_vol.rolling(window, min_periods=min_periods).std()
+    z = (parkinson_vol - mean) / std.replace(0.0, np.nan)
+    return z.clip(-PARKINSON_VOL_ZSCORE_CLIP, PARKINSON_VOL_ZSCORE_CLIP).fillna(0.0)
+
+
+def _compute_vol_of_vol_zscore(parkinson_vol: pd.Series, lookback: int = VOL_OF_VOL_LOOKBACK_DAYS,
+                                window: int = VOL_OF_VOL_ZSCORE_WINDOW_DAYS,
+                                min_periods: int = VOL_OF_VOL_ZSCORE_MIN_PERIODS) -> pd.Series:
+    vol_of_vol = parkinson_vol.rolling(lookback, min_periods=lookback).std()
+    mean = vol_of_vol.rolling(window, min_periods=min_periods).mean()
+    std = vol_of_vol.rolling(window, min_periods=min_periods).std()
+    z = (vol_of_vol - mean) / std.replace(0.0, np.nan)
+    return z.clip(-VOL_OF_VOL_ZSCORE_CLIP, VOL_OF_VOL_ZSCORE_CLIP).fillna(0.0)
+
+
+# --- V27 — espejo 1:1 de train_kodaquant_v5.py (mismas ventanas, mismos
+# clips, mismas fórmulas). Todo trailing: cero lookahead, cero fetch nuevo.
+def _rolling_zscore(s: pd.Series, window: int, min_periods: int, clip: float) -> pd.Series:
+    mean = s.rolling(window, min_periods=min_periods).mean()
+    std = s.rolling(window, min_periods=min_periods).std()
+    z = (s - mean) / std.replace(0.0, np.nan)
+    return z.replace([np.inf, -np.inf], np.nan).clip(-clip, clip).fillna(0.0)
+
+
+def _compute_garman_klass_vol(open_: Optional[pd.Series], high: pd.Series, low: pd.Series,
+                              close: pd.Series, window: int = GK_VOL_LOOKBACK_DAYS) -> pd.Series:
+    """sigma^2 = 0.5*ln(H/L)^2 - (2ln2-1)*ln(C/O)^2, media rolling.
+
+    `open_` NO se decide acá: lo impone `scalers["gk_uses_open"]` vía
+    `_fetch_feature_window`. Elegir la rama localmente produciría un número
+    distinto al de entrenamiento contra el MISMO feature_scaler.
+    """
+    var = 0.5 * np.log(high / low) ** 2
+    if open_ is not None:
+        var = var - (2.0 * np.log(2.0) - 1.0) * np.log(close / open_) ** 2
+    var = var.replace([np.inf, -np.inf], np.nan)
+    return np.sqrt(var.rolling(window, min_periods=window).mean().clip(lower=0.0))
+
+
+def _compute_fib_gap_zscore(high: pd.Series, low: pd.Series, close: pd.Series,
+                            window: int) -> pd.Series:
+    """Distancia FIRMADA al nivel de Fibonacci más cercano, z-scoreada."""
+    swing_high = high.rolling(window, min_periods=window).max()
+    swing_low = low.rolling(window, min_periods=window).min()
+    rng = (swing_high - swing_low).replace(0.0, np.nan)
+    pos = (close - swing_low) / rng
+
+    gaps = np.stack([(pos - r).to_numpy(dtype=float) for r in FIB_RATIOS], axis=1)
+    abs_gaps = np.abs(gaps)
+    all_nan = np.isnan(abs_gaps).all(axis=1)
+    nearest = gaps[np.arange(gaps.shape[0]),
+                   np.where(np.isnan(abs_gaps), np.inf, abs_gaps).argmin(axis=1)]
+    nearest[all_nan] = np.nan
+    return _rolling_zscore(pd.Series(nearest, index=close.index),
+                           FIB_ZSCORE_WINDOW_DAYS, FIB_ZSCORE_MIN_PERIODS, FIB_ZSCORE_CLIP)
+
+
+def _compute_ofi_proxy_zscore(high: pd.Series, low: pd.Series, close: pd.Series,
+                              volume: pd.Series, lookback: int = OFI_LOOKBACK_DAYS) -> pd.Series:
+    """Order Flow Imbalance proxy: CLV ponderado por volumen, normalizado."""
+    rng = (high - low).replace(0.0, np.nan)
+    clv = ((close - low) - (high - close)) / rng
+    signed_vol = (clv * volume).replace([np.inf, -np.inf], np.nan)
+    num = signed_vol.rolling(lookback, min_periods=lookback).sum()
+    den = volume.rolling(lookback, min_periods=lookback).sum().replace(0.0, np.nan)
+    return _rolling_zscore((num / den), OFI_ZSCORE_WINDOW_DAYS,
+                           OFI_ZSCORE_MIN_PERIODS, OFI_ZSCORE_CLIP)
+
+
+def _compute_return_entropy_zscore(log_return: pd.Series,
+                                   window: int = ENTROPY_WINDOW_DAYS) -> pd.Series:
+    """Entropía de Shannon normalizada de los retornos simbolizados en 3 estados."""
+    sigma = log_return.rolling(ENTROPY_SIGMA_LOOKBACK,
+                               min_periods=ENTROPY_SIGMA_LOOKBACK).std()
+    thr = ENTROPY_DEADZONE_SIGMA * sigma
+    up = (log_return > thr).astype(float)
+    down = (log_return < -thr).astype(float)
+    flat = 1.0 - up - down
+
+    h = None
+    for state in (up, down, flat):
+        p = state.rolling(window, min_periods=window).mean()
+        term = -(p * np.log(p.where(p > 0.0)))
+        h = term if h is None else h.add(term, fill_value=0.0)
+    h = (h / np.log(3.0)).where(sigma.notna())
+    return _rolling_zscore(h, ENTROPY_ZSCORE_WINDOW_DAYS,
+                           ENTROPY_ZSCORE_MIN_PERIODS, ENTROPY_ZSCORE_CLIP)
+
+
 def _compute_indicator_states(close_df: pd.DataFrame, ticker: str, vix_ticker: str) -> dict:
     """
     Estado recursivo final de RSI/EMA/MACD/SENTIMENT/ATR/BB_WIDTH/OBV/ADX_14/
@@ -1562,8 +2075,18 @@ def _fetch_feature_window(
     macro_tickers: list,
     lookback: int,
     as_of_date: str | None = None,
+    scalers: dict | None = None,
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """
+    AUDITORÍA RESCATE 2026-08 -- `scalers` (opcional, default None por
+    compatibilidad con cualquier caller que no lo pase) permite leer
+    `scalers["ffd_d_by_ticker"]` (ver train_kodaquant_v5.py -- persiste el
+    `d` REAL calibrado en entrenamiento para FRAC_DIFF_LOG_CLOSE) en vez de
+    recalibrar por ADF sobre la ventana corta de inferencia (fix de
+    desalineación train/serve, ver bloque FRAC_DIFF_LOG_CLOSE más abajo).
+    Sin este argumento (o con un bundle viejo que no tiene la clave), el
+    comportamiento es IDÉNTICO al previo (recalibra localmente).
+
     Ingesta en vivo — DEBE replicar bit a bit `engineer_asset()` del notebook,
     con una salvedad de PRODUCCIÓN: los filtros IIR recursivos (RSI/EMA/MACD,
     todos `ewm(adjust=False)`) requieren un tramo de calentamiento largo para
@@ -1725,6 +2248,147 @@ def _fetch_feature_window(
     # esto es consistente con el resto de este método (sin cache propio).
     close["NEWS_SENTIMENT_SCORE"] = get_daily_news_sentiment(ticker, close.index)
 
+    # --- AUDITORÍA RESCATE 2026-08 — FEAR_GREED_INDEX/FUNDING_RATE_ZSCORE/
+    # ONCHAIN_ACTIVITY_ROC/PUELL_MULTIPLE_ZSCORE/FRAC_DIFF_LOG_CLOSE/
+    # PARKINSON_VOL_ZSCORE/VOL_OF_VOL_ZSCORE -- las 7 columnas que TECH_COLS
+    # ya declara pero que este bloque nunca calculaba (ver auditoría al
+    # inicio del módulo). Réplica 1:1 de `engineer_asset` en
+    # train_kodaquant_v5.py, mismo criterio "neutro 0.0 fuera de cripto/BTC".
+    is_crypto_ticker = ticker in CRYPTO_TICKERS_V5
+
+    if is_crypto_ticker:
+        fg_series = _fetch_fear_greed_index(tail_days=3700)
+        if fg_series is not None and not fg_series.empty:
+            fg_series.index = pd.DatetimeIndex(fg_series.index).tz_localize(None)
+            close["FEAR_GREED_INDEX"] = fg_series.reindex(close.index).ffill().fillna(50.0)
+        else:
+            close["FEAR_GREED_INDEX"] = 50.0
+    else:
+        close["FEAR_GREED_INDEX"] = 50.0
+
+    if is_crypto_ticker:
+        funding_series = _fetch_binance_funding_history(ticker)
+        if funding_series is not None and not funding_series.empty:
+            funding_series.index = pd.DatetimeIndex(funding_series.index).tz_localize(None)
+            funding_z = _compute_funding_rate_zscore(funding_series)
+            close["FUNDING_RATE_ZSCORE"] = funding_z.reindex(close.index).ffill().fillna(0.0)
+        else:
+            close["FUNDING_RATE_ZSCORE"] = 0.0
+    else:
+        close["FUNDING_RATE_ZSCORE"] = 0.0
+
+    # AUDITORÍA RESCATE 2026-08 -- V25: ONCHAIN_ACTIVITY_ROC ahora es NVT
+    # Ratio Z-score (réplica EXACTA de train_kodaquant_v5.py::engineer_asset,
+    # ver docstring ahí), con el tx-count ROC V24 como fallback si el chart
+    # de volumen USD no responde. MISMO nombre de columna -- cero cambio de
+    # shape/N_FEATURES.
+    if ticker == BTC_TICKER_V5:
+        tx_value_series = _fetch_onchain_tx_volume_usd()
+        if tx_value_series is not None and not tx_value_series.empty:
+            tx_value_series.index = pd.DatetimeIndex(tx_value_series.index).tz_localize(None)
+            nvt_z = _compute_nvt_ratio_zscore(close[ticker], tx_value_series.reindex(close.index).ffill())
+            close["ONCHAIN_ACTIVITY_ROC"] = nvt_z.reindex(close.index).fillna(0.0)
+        else:
+            onchain_series = _fetch_onchain_activity()
+            if onchain_series is not None and not onchain_series.empty:
+                onchain_series.index = pd.DatetimeIndex(onchain_series.index).tz_localize(None)
+                onchain_roc = onchain_series.pct_change(periods=ONCHAIN_ROC_LOOKBACK_DAYS)
+                onchain_roc = onchain_roc.replace([np.inf, -np.inf], np.nan).clip(-ONCHAIN_ROC_CLIP, ONCHAIN_ROC_CLIP)
+                close["ONCHAIN_ACTIVITY_ROC"] = onchain_roc.reindex(close.index).ffill().fillna(0.0)
+            else:
+                close["ONCHAIN_ACTIVITY_ROC"] = 0.0
+    else:
+        close["ONCHAIN_ACTIVITY_ROC"] = 0.0
+
+    if ticker == BTC_TICKER_V5:
+        close["PUELL_MULTIPLE_ZSCORE"] = _compute_puell_multiple_zscore(close[ticker])
+    else:
+        close["PUELL_MULTIPLE_ZSCORE"] = 0.0
+
+    # AUDITORÍA RESCATE 2026-08 -- fix de desalineación train/serve: usa el
+    # `d` REAL calibrado en entrenamiento (persistido en `scalers_dict.pkl`,
+    # ver train_kodaquant_v5.py::_LAST_FFD_D_BY_TICKER) en vez de recalibrar
+    # por ADF sobre esta ventana corta de inferencia. Bundle viejo sin la
+    # clave (o `scalers=None`) -> fallback IDÉNTICO al comportamiento previo.
+    if is_crypto_ticker:
+        persisted_ffd_d = (scalers or {}).get("ffd_d_by_ticker", {}).get(ticker)
+        ffd_d = float(persisted_ffd_d) if persisted_ffd_d is not None else _find_min_ffd_d(np.log(close[ticker]))
+        close["FRAC_DIFF_LOG_CLOSE"] = _frac_diff_ffd(np.log(close[ticker]), ffd_d)
+    else:
+        close["FRAC_DIFF_LOG_CLOSE"] = 0.0
+
+    _parkinson_vol = _compute_parkinson_vol(close[f"{ticker}_High"], close[f"{ticker}_Low"])
+    close["PARKINSON_VOL_ZSCORE"] = _compute_parkinson_vol_zscore(_parkinson_vol)
+    if is_crypto_ticker:
+        close["VOL_OF_VOL_ZSCORE"] = _compute_vol_of_vol_zscore(_parkinson_vol)
+    else:
+        close["VOL_OF_VOL_ZSCORE"] = 0.0
+
+    # --- V27: microestructura OHLC + geometría fractal + flujo + caos ------
+    # AMBOS regímenes, 100% OHLCV ya en scope -- cero fetch nuevo.
+    _gk_uses_open = bool((scalers or {}).get("gk_uses_open", False))
+    _open_col = f"{ticker}_Open"
+    if _gk_uses_open and _open_col not in close.columns:
+        raise RuntimeError(
+            f"[GK] '{ticker}': el entrenamiento calculó GARMAN_KLASS_VOL_ZSCORE CON el "
+            f"término ln(C/O) (scalers['gk_uses_open']=True) pero '{_open_col}' no está en "
+            "este feed de inferencia. Calcular la rama H/L acá produciría un valor "
+            "numéricamente distinto contra el MISMO feature_scaler -- desync silencioso. "
+            "Agregá 'Open' a fetch_feature_ohlcv (services/market_data.py) o reentrená "
+            "sin Open. NO se degrada en silencio a propósito."
+        )
+    _gk_open = close[_open_col] if _gk_uses_open else None
+    _high, _low, _vol = close[f"{ticker}_High"], close[f"{ticker}_Low"], close[f"{ticker}_Volume"]
+    close["GARMAN_KLASS_VOL_ZSCORE"] = _rolling_zscore(
+        _compute_garman_klass_vol(_gk_open, _high, _low, close[ticker]),
+        GK_ZSCORE_WINDOW_DAYS, GK_ZSCORE_MIN_PERIODS, GK_ZSCORE_CLIP)
+
+    for _w in FIB_WINDOWS:
+        close[f"FIB_GAP_Z_{_w}"] = _compute_fib_gap_zscore(_high, _low, close[ticker], _w)
+
+    close["OFI_PROXY_ZSCORE"] = _compute_ofi_proxy_zscore(_high, _low, close[ticker], _vol)
+    close["RETURN_ENTROPY_ZSCORE"] = _compute_return_entropy_zscore(
+        np.log(close[ticker] / close[ticker].shift(1)))
+
+    # --- V28: free_alpha.py -- réplica 1:1 de engineer_asset (misma función) ---
+    # Cualquier fuente caída / Open ausente -> 0.0 neutro + log (nunca excepción).
+    # Corre ANTES del log-return macro: `close["^GSPC"]` sigue en precio crudo.
+    _v28_flush_cache_on_utc_rollover()
+    if is_crypto_ticker:
+        for _c in V28_EQUITY_COLS:
+            close[_c] = 0.0
+        try:
+            _flow = build_crypto_flow_features(ticker, close.index, cache=None)
+            if len(_flow) != len(close):
+                raise ValueError(f"len(flow)={len(_flow)} != len(close)={len(close)}")
+            _flow_arr = _flow[V28_CRYPTO_COLS].to_numpy(dtype=float)
+        except Exception as exc:  # noqa: BLE001 -- proveedor opcional, degrada a neutro
+            logger.error("[V28] '%s': flujo cripto falló (%r) -> 4 cols = 0.0 "
+                         "(skew vs. entrenamiento).", ticker, exc)
+            _flow_arr = np.zeros((len(close), len(V28_CRYPTO_COLS)))
+        _flow_arr = np.nan_to_num(_flow_arr, nan=0.0, posinf=0.0, neginf=0.0)
+        for _i, _c in enumerate(V28_CRYPTO_COLS):
+            close[_c] = _flow_arr[:, _i]
+    else:
+        for _c in V28_CRYPTO_COLS:
+            close[_c] = 0.0
+        _v28_open_col = f"{ticker}_Open"
+        _v28_open = close[_v28_open_col] if _v28_open_col in close.columns else None
+        _v28_trained = (scalers or {}).get("v28_open_by_ticker")
+        if _v28_trained is not None:
+            if bool(_v28_trained.get(ticker, False)) and _v28_open is None:
+                logger.error("[V28] '%s': entrenado CON Open pero el feed live no trae '%s' -> "
+                             "OVERNIGHT_GAP/INTRADAY_RET/OVERNIGHT_MOM = 0.0 (SKEW train/serve). "
+                             "Agregar 'Open' a services/market_data.fetch_feature_ohlcv.",
+                             ticker, _v28_open_col)
+            elif not bool(_v28_trained.get(ticker, False)):
+                _v28_open = None  # train usó 0.0 constante: paridad estricta
+        _v28_spx = (np.log(close["^GSPC"] / close["^GSPC"].shift(1))
+                    if "^GSPC" in macro_tickers and "^GSPC" in close.columns else None)
+        _v28_eq = compute_equity_open_features(_v28_open, close[ticker], _v28_spx, ticker)
+        for _c in V28_EQUITY_COLS:
+            close[_c] = _v28_eq[_c]
+
     # --- FIX CRÍTICO (auditoría de paridad train/serve, previa a V6):
     # `engineer_asset()` en train_kodaquant_v5.py transforma CADA factor
     # macro a log-return ANTES de que `feature_scaler.fit()` los vea
@@ -1746,22 +2410,35 @@ def _fetch_feature_window(
 
     close = close.ffill().dropna()
 
-    # Orden EXACTO de TECH_COLS (ver constante de módulo, arriba): RSI_14,
+    # Orden EXACTO de TECH_COLS (ver constante de módulo, arriba — sincronizada
+    # con train_kodaquant_v5.py tras la auditoría 2026-08): RSI_14,
     # EMA20_DEV_PCT, MACD_PCT, MACD_SIGNAL_PCT, SENTIMENT_SCORE, ATR_PCT,
-    # BB_WIDTH_20, OBV_ROC_20, ADX_14, STOCH_K_14, NEWS_SENTIMENT_SCORE — el
-    # feature_scaler cargado desde scalers_dict.pkl fue ajustado con ese
-    # orden/definición, así que romperlo aquí desalinearía cada columna al
-    # pasar por `.transform()`. `_get_scalers()` ya validó que TECH_COLS
-    # coincide con `scalers["tech_cols"]` al arrancar el proceso. El tramo
-    # macro usa las columnas `__LOGRET` (estacionarias) — NUNCA el precio
-    # crudo `macro_tickers`, que sigue vivo en `close` solo para los otros
-    # consumidores señalados arriba.
+    # BB_WIDTH_20, OBV_ROC_20, ADX_14, STOCH_K_14, NEWS_SENTIMENT_SCORE,
+    # FEAR_GREED_INDEX, FUNDING_RATE_ZSCORE, ONCHAIN_ACTIVITY_ROC,
+    # FRAC_DIFF_LOG_CLOSE, PUELL_MULTIPLE_ZSCORE, PARKINSON_VOL_ZSCORE,
+    # VOL_OF_VOL_ZSCORE — el feature_scaler cargado desde scalers_dict.pkl fue
+    # ajustado con ese orden/definición, así que romperlo aquí desalinearía
+    # cada columna al pasar por `.transform()`. `_get_scalers()` ya valida que
+    # TECH_COLS coincide con `scalers["tech_cols"]` al arrancar el proceso. El
+    # tramo macro usa las columnas `__LOGRET` (estacionarias) — NUNCA el
+    # precio crudo `macro_tickers`, que sigue vivo en `close` solo para los
+    # otros consumidores señalados arriba.
     feature_cols = ["LOG_RETURN_1D"] + TECH_COLS + macro_logret_cols
 
     # Recorte estricto: SOLO el tensor de entrada a la red se acota a
     # `lookback` filas. `close` se retorna completo (2y) para los
     # consumidores que necesitan más historia que la ventana del modelo.
     raw_features = close[feature_cols].values[-lookback:]
+
+    # V28 -- guardia dura de forma: un entero de desalineación contra el
+    # feature_scaler ajustado en train debe fallar AQUÍ, no dentro de Keras.
+    _n_expected = getattr(((scalers or {}).get("feature_scalers") or {}).get(ticker),
+                          "n_features_in_", None)
+    if _n_expected is not None and raw_features.shape[1] != _n_expected:
+        raise ValueError(
+            f"[V28] '{ticker}': tensor de inferencia con {raw_features.shape[1]} features, "
+            f"feature_scaler entrenado con {_n_expected}. Regenerar artefactos con "
+            "train_kodaquant_v5.py (TECH_COLS/V28_COLS desalineados).")
 
     return close, raw_features
 
@@ -1920,6 +2597,328 @@ def _historical_window_for_horizon(steps: int) -> int:
     """
     return max(30, min(90, int(steps * 1.5)))
 
+# ---------------------------------------------------------------------------
+# V22 — Inferencia target_mode="triple_barrier" (crypto_specialist).
+# ---------------------------------------------------------------------------
+# `_forecast_asset` (regresión, ver más abajo) es un motor AUTOREGRESIVO:
+# encadena `steps` forward passes de una cabeza Dense(2) [mu, log_var] que
+# predice un log-return de UN solo paso, y ese paso se retroalimenta al
+# siguiente. La cabeza Triple Barrier (Dense(3, softmax)) no predice un
+# retorno de un solo paso — clasifica el DESENLACE completo de una apuesta
+# que ya lleva codificado su propio horizonte (`max_holding_days`) en el
+# entrenamiento. Encadenar `steps` clasificaciones sucesivas de esa cabeza
+# (una por día, retroalimentando la "clase" al tensor de entrada del día
+# siguiente) no tiene ningún fundamento estadístico: no es lo que el
+# clasificador aprendió a hacer, y el propio `evaluate_asset_triple_barrier`
+# de train_kodaquant_v5.py lo confirma — evalúa con UN solo
+# `model.predict(...)` por ventana de test, nunca autoregresivo. Esta
+# función replica ESE mismo contrato en producción.
+#
+# Zero-GPU budget: un solo forward pass por request (batcheado a
+# TB_MC_DROPOUT_PASSES filas para MC Dropout) es órdenes de magnitud más
+# barato que los `steps x N_MONTE_CARLO_SIMULATIONS` forward passes del
+# régimen de regresión — el régimen crypto es, con este diseño, el MÁS
+# barato de servir en CPU, no el más caro.
+TB_MC_DROPOUT_PASSES = 30  # error MC ~ 1/sqrt(N); 30 estabiliza la media del softmax a bajo costo de CPU/RAM
+
+# Fallbacks defensivos ÚNICAMENTE — replican línea por línea los defaults de
+# train_kodaquant_v5.py. `tb_params` SIEMPRE debería viajar en
+# scalers_dict.pkl para target_mode="triple_barrier" (ver scalers_payload en
+# run_regime_pipeline); esto solo cubre un bundle viejo/corrupto sin esa
+# clave, para fallar hacia un comportamiento documentado en vez de un
+# KeyError críptico en producción. V23.5: los fallbacks son el ÚLTIMO
+# recurso también cuando `tb_params[ticker]` no tiene entrada propia (ver
+# detección dual de esquema en `_forecast_asset_triple_barrier`).
+_TB_PT_MULT_FALLBACK = 2.0
+_TB_SL_MULT_FALLBACK = 2.0
+_TB_MAX_HOLDING_DAYS_FALLBACK = 10
+_TB_VOL_LOOKBACK_FALLBACK = 20
+_TB_MIN_VOL_FALLBACK = 1e-6
+_TB_CLASS_NAMES_FALLBACK = ["SL", "TIMEOUT", "TP"]
+
+# Meta-labeling (López de Prado, cap. 3) — Directiva 3 de la misión: piso de
+# confianza ANTES de traducir una clase predicha en señal operativa. Con 3
+# clases, 33.3% es azar puro; exigir >= 45% es una banda de convicción real.
+# Es el ÚNICO lever honesto para mover precisión (win-rate de las señales
+# que SÍ se operan) a costa de recall (frecuencia de señal) — el trade-off
+# clásico de cualquier clasificador, no una promesa de resultado. Este valor
+# es un PUNTO DE PARTIDA razonable, no una cifra medida contra tus datos:
+# antes de subirlo/bajarlo en producción, corré walk_forward_eval.py /
+# pnl_backtest.py y mirá cómo se mueven `signal_precision` /
+# `actionable_accuracy` / `win_rate_pct` en función de este piso — ver
+# MANUAL DE IGNICIÓN.
+TB_MIN_SIGNAL_CONFIDENCE = 0.45
+
+# V27 -- Auditoría Purged Walk-Forward completa (2026-09-25/26, 4 folds
+# válidos por ticker, k=5 epochs=45 -- ver run_cpcv_audit en
+# train_kodaquant_v5.py). NO es un ajuste algorítmico más: es la medición
+# honesta, out-of-sample, de qué tickers tienen DirAcc real por encima del
+# 53% baseline y cuáles no -- después de que sentimiento real, meta-
+# labeling, ajuste de umbral, exclusión de TIMEOUT, más tickers y más
+# historia (6 intentos, cripto) NO movieran el techo. Equity nunca había
+# sido auditado con la misma disciplina hasta este barrido.
+#
+# ticker -> (dir_acc_media_cpcv, std_entre_folds, tier)
+# tier: "high" (>=53%, std bajo) / "watch" (~52-53%, std bajo, cerca) /
+#       "low" (<52% o std alto -- el single-split original no era confiable)
+EQUITY_HISTORICAL_EDGE = {
+    "AAPL":  (0.531, 0.027, "high"),
+    "MSFT":  (0.532, 0.022, "high"),
+    "NVDA":  (0.527, 0.015, "watch"),
+    "GOOGL": (0.527, 0.017, "watch"),
+    "AMZN":  (0.518, 0.012, "low"),
+    "SPY":   (0.517, 0.054, "low"),   # std alto -- single-split (55.5%) estaba inflado
+    "TSLA":  (0.514, 0.027, "low"),
+    "META":  (0.499, 0.028, "low"),
+}
+
+
+def _get_historical_edge(ticker: str) -> dict:
+    """
+    V27 -- lookup de EQUITY_HISTORICAL_EDGE. Ticker fuera de la tabla (ej.
+    un activo nuevo, todavía no auditado) -> tier "unaudited", NUNCA se
+    inventa un número: es una categoría honesta más, no un fallback a
+    "high" ni a "low".
+    """
+    entry = EQUITY_HISTORICAL_EDGE.get(ticker)
+    if entry is None:
+        return {"tier": "unaudited", "dir_acc_cpcv_mean": None, "dir_acc_cpcv_std": None}
+    mean, std, tier = entry
+    return {"tier": tier, "dir_acc_cpcv_mean": mean, "dir_acc_cpcv_std": std}
+
+
+def _forecast_asset_triple_barrier(
+    ticker: str,
+    regime: str,
+    scalers: dict,
+    asset_id: int,
+    feature_scaler: Any,
+    lookback: int,
+    macro_tickers: list,
+    requested_steps: int,
+) -> dict:
+    """
+    Inferencia real V22 target_mode="triple_barrier" — UN forward pass (+MC
+    Dropout, ver TB_MC_DROPOUT_PASSES) sobre la ventana de features más
+    reciente. Ver bloque de módulo arriba para por qué esto NO es
+    autoregresivo.
+
+    Devuelve el MISMO esquema de claves que la rama de regresión de
+    `_forecast_asset` (`ticker`, `last_price`, `predicted_price`,
+    `predicted_return_pct`, `trend`, `historical`, `forecast`,
+    `tactical_signal`, `forecast_incomplete`, `variance_source`,
+    `real_data_ood_frac`, `real_ood_dampening_applied`,
+    `forecast_reliability`) — CERO consumidor aguas abajo
+    (`_fmt_plan_math_line`, `_build_tactical_operation`,
+    `services/prediccion.py`, `services/live_trade.py`) necesita branch
+    propio para no romperse — más las claves `tb_*` con el detalle real de
+    clasificación (confianza P(TP) vs P(SL) vs P(TIMEOUT), ver misión).
+
+    `predicted_return_pct`/`predicted_price` NO son un path día-a-día: son
+    la ESPERANZA del retorno bajo la distribución de clases real del propio
+    modelo (`tb_probabilities`) sobre los DOS niveles de barrera reales
+    (`pt_mult`/`sl_mult` × volatilidad realizada actual, MISMA fórmula que
+    `compute_triple_barrier_labels` en train_kodaquant_v5.py) — cero cifras
+    inventadas. `forecast` son bandas ESTÁTICAS (los niveles de barrera no
+    se mueven una vez abierta la apuesta), no un cono creciente.
+    """
+    # V23.5 -- `scalers["tb_params"]` cambió de esquema en train_kodaquant_v5.py
+    # (Directiva 1): pasó de un dict PLANO compartido por todos los tickers
+    # cripto a un dict-de-dicts `{ticker: {pt_mult, sl_mult, ...}}` (barreras
+    # calibradas de forma INDEPENDIENTE por activo). Detección dual de
+    # esquema -- NO se asume qué versión de scalers_dict.pkl está desplegada:
+    # si el dict trae "pt_mult" como llave de primer nivel, es el esquema
+    # VIEJO (pre-V23.5, plano); si no, se indexa por `ticker` (esquema V23.5).
+    # Esto evita un colapso de producción durante el rollout (modelo/scalers
+    # nuevos desplegados en distintos momentos que este archivo).
+    _tb_params_raw = scalers.get("tb_params") or {}
+    if isinstance(_tb_params_raw, dict) and "pt_mult" in _tb_params_raw:
+        tb_params = _tb_params_raw  # esquema viejo -- plano, mismo dict para cualquier ticker
+    else:
+        tb_params = _tb_params_raw.get(ticker) or {}  # esquema V23.5 -- por ticker
+    pt_mult = float(tb_params.get("pt_mult", _TB_PT_MULT_FALLBACK))
+    sl_mult = float(tb_params.get("sl_mult", _TB_SL_MULT_FALLBACK))
+    max_holding_days = int(tb_params.get("max_holding_days", _TB_MAX_HOLDING_DAYS_FALLBACK))
+    vol_lookback = int(tb_params.get("vol_lookback", _TB_VOL_LOOKBACK_FALLBACK))
+    class_names = list(scalers.get("tb_class_names") or _TB_CLASS_NAMES_FALLBACK)
+
+    if requested_steps and requested_steps != max_holding_days:
+        print(
+            f"ℹ️ {ticker} es target_mode='triple_barrier': horizonte efectivo = "
+            f"max_holding_days={max_holding_days} (entrenado) — se ignora el "
+            f"forecast_horizon_days={requested_steps} solicitado. La cabeza softmax "
+            "clasifica el desenlace COMPLETO de la apuesta, no admite un horizonte parcial."
+        )
+
+    model, dropout_layers = _get_keras_model(regime)
+    close_df, raw_features = _fetch_feature_window(ticker, macro_tickers, lookback, scalers=scalers)
+
+    last_price = float(close_df[ticker].iloc[-1])
+    anchor_date_str = close_df.index[-1].strftime("%Y-%m-%d")
+
+    hist_window = _historical_window_for_horizon(max_holding_days)
+    display_col = f"{ticker}__DISPLAY_CLOSE"
+    historical_price_series = close_df[display_col] if display_col in close_df.columns else close_df[ticker]
+    historical = [
+        {"date": d.strftime("%Y-%m-%d"), "price": round(float(p), 2)}
+        for d, p in historical_price_series.tail(hist_window).items()
+    ]
+    last_price_quote = historical[-1]["price"] if historical else round(last_price, 2)
+
+    # Volatilidad realizada actual — MISMA fórmula exacta que
+    # `compute_triple_barrier_labels` (train_kodaquant_v5.py): rolling std
+    # de LOG_RETURN_1D en una ventana de `vol_lookback` días, evaluada en el
+    # último punto real disponible (el "hoy" de esta apuesta hipotética).
+    close_tail = close_df[ticker].tail(vol_lookback + 1).to_numpy(dtype=np.float64)
+    vol_t = float(np.std(np.diff(np.log(close_tail)))) if len(close_tail) >= 2 else 0.0
+    vol_t = max(vol_t, _TB_MIN_VOL_FALLBACK)
+
+    barrier_upper_price = last_price * math.exp(pt_mult * vol_t)
+    barrier_lower_price = last_price * math.exp(-sl_mult * vol_t)
+
+    window = raw_features[-lookback:]
+    scaled_window = feature_scaler.transform(window)
+    oob_frac = float(np.mean((scaled_window < 0.0) | (scaled_window > 1.0)))
+    real_ood_dampening = _real_ood_dampening_factor(oob_frac)
+    scaled_window = _soft_clip_unit_interval(scaled_window)
+
+    n_mc = TB_MC_DROPOUT_PASSES if dropout_layers else 1
+    X_batch = np.repeat(scaled_window[np.newaxis, :, :], n_mc, axis=0).astype(np.float32)
+    asset_batch = np.full((n_mc, 1), asset_id, dtype=np.int32)
+
+    # Misma semilla determinista "memoria diaria" que la cabeza de
+    # regresión (ver `_forecast_asset`) — todas las requests del mismo
+    # (ticker, día UTC) devuelven las MISMAS `n_mc` máscaras de dropout.
+    today_utc_str = datetime.now(timezone.utc).date().isoformat()
+    tb_seed_material = f"{ticker}|{today_utc_str}|triple_barrier".encode("utf-8")
+    tb_keras_seed = int(hashlib.sha256(tb_seed_material).hexdigest(), 16) % (2**32)
+
+    forecast_incomplete = False
+    try:
+        with inference_lock:
+            keras.utils.set_random_seed(tb_keras_seed)
+            probs_tensor = _call_keras_with_hang_guard(
+                model, [X_batch, asset_batch], training=bool(dropout_layers)
+            )
+        probs_np = keras.ops.convert_to_numpy(probs_tensor)
+        if probs_np.shape != (n_mc, 3):
+            raise ValueError(
+                f"Salida del modelo con shape inesperado {probs_np.shape} "
+                f"(se esperaba ({n_mc}, 3): softmax [SL, TIMEOUT, TP] por pasada MC)."
+            )
+        mean_probs = probs_np.mean(axis=0)
+        std_probs = probs_np.std(axis=0) if n_mc > 1 else np.zeros(3)
+    except Exception as exc:  # noqa: BLE001 — jamás inventar probabilidades, degradar explícito
+        print(
+            f"⚠️ Forward pass Triple Barrier de {ticker} falló ({exc!r}) — forecast "
+            "incompleto, cero clase/confianza inventada."
+        )
+        forecast_incomplete = True
+        mean_probs = np.full(3, 1.0 / 3.0)  # uniforme = "no sé", nunca una clase con convicción falsa
+        std_probs = np.zeros(3)
+
+    predicted_idx = int(np.argmax(mean_probs))
+    predicted_class = class_names[predicted_idx]
+    tb_confidence = float(mean_probs[predicted_idx])
+    # Orden fijo TB_LABEL_TO_CLASS_IDX = {-1:0, 0:1, 1:2} (ver train_kodaquant_v5.py) -> [SL, TIMEOUT, TP]
+    p_sl, p_timeout, p_tp = float(mean_probs[0]), float(mean_probs[1]), float(mean_probs[2])
+
+    # Esperanza del retorno bajo la distribución de clases real del modelo,
+    # sobre los niveles de barrera reales (ver docstring). TIMEOUT aporta
+    # 0.0: este motor de inferencia no tiene, en producción, el historial
+    # de TB_REALIZED_RETURN por-timeout para promediar sin inventar un
+    # número — 0.0 es el supuesto neutro honesto, no una medición.
+    expected_log_return = (p_tp * pt_mult * vol_t) - (p_sl * sl_mult * vol_t)
+    expected_log_return *= real_ood_dampening
+    predicted_price = last_price_quote * math.exp(expected_log_return)
+    predicted_return_pct = expected_log_return * 100.0
+
+    # Filtro de confianza mínima (ver TB_MIN_SIGNAL_CONFIDENCE arriba):
+    # degrada una clase SL/TP de baja convicción a "sin convicción
+    # operativa" — prediccion.py/live_trade.py deben leer `tb_actionable`
+    # (no solo `tb_predicted_class`) antes de convertir la clase en una
+    # acción de COMPRA/VENTA real.
+    tb_actionable = predicted_class != "TIMEOUT" and tb_confidence >= TB_MIN_SIGNAL_CONFIDENCE
+
+    forecast_dates = []
+    cursor_date = close_df.index[-1]
+    for _ in range(max_holding_days):
+        # Crypto cotiza 24/7 — mismo criterio que la rama de regresión
+        # (ver `regime != "crypto_specialist"` más abajo): nunca saltar
+        # fin de semana acá.
+        cursor_date = cursor_date + timedelta(days=1)
+        forecast_dates.append(cursor_date.strftime("%Y-%m-%d"))
+
+    # Bandas ESTÁTICAS (ver docstring): los niveles de barrera se fijan UNA
+    # vez en la entrada y no se mueven mientras la apuesta está abierta —
+    # por eso son los MISMOS en cada fecha del horizonte, a diferencia del
+    # cono creciente P5-P95 de la cabeza de regresión.
+    forecast_points = [
+        {
+            "date": d,
+            "lower_bound": round(barrier_lower_price, 2),
+            "expected_path": round(predicted_price, 2),
+            "upper_bound": round(barrier_upper_price, 2),
+            "sample_path": round(predicted_price, 2),
+        }
+        for d in forecast_dates
+    ]
+
+    # Señal táctica V22: Triple Barrier es una apuesta ÚNICA sostenida hasta
+    # que se toque una barrera o venza `max_holding_days` — no hay
+    # peak&trough que buscar dentro de una banda estática (a diferencia de
+    # `_find_optimal_entry_exit`, diseñada para el cono creciente de la
+    # cabeza de regresión). Entrada = HOY al precio real; salida = fin del
+    # horizonte de la apuesta, al valor esperado bajo la distribución de
+    # clases — None si el filtro de confianza (`tb_actionable`) descartó la
+    # señal, degradando el prompt/frontend en vez de inventar una operación.
+    tactical_signal = None
+    if tb_actionable and forecast_dates:
+        tactical_signal = {
+            "entry_date": anchor_date_str,
+            "entry_price": last_price_quote,
+            "exit_date": forecast_dates[-1],
+            "exit_price": round(predicted_price, 2),
+        }
+
+    return {
+        "ticker": ticker,
+        "regime": regime,
+        "target_mode": "triple_barrier",
+        "last_price": last_price_quote,
+        "predicted_price": round(predicted_price, 2),
+        "predicted_return_pct": round(predicted_return_pct, 4),
+        "trend": "alcista" if predicted_return_pct >= 0 else "bajista",
+        "historical": historical,
+        "forecast": forecast_points,
+        "predicted_path": [p["expected_path"] for p in forecast_points],
+        "tactical_signal": tactical_signal,
+        "forecast_incomplete": forecast_incomplete,
+        "variance_source": f"mc_dropout_{n_mc}x_softmax" if dropout_layers else "deterministic_native_keras_softmax",
+        "n_simulations": n_mc,
+        "deterministic_seed": tb_keras_seed,
+        "confidence_interval": "static_barrier_band",
+        "real_data_ood_frac": round(oob_frac, 4),
+        "real_ood_dampening_applied": round(real_ood_dampening, 4),
+        "forecast_reliability": "degraded" if oob_frac > REAL_OOD_DAMPENING_START else "normal",
+        # --- Triple Barrier — detalle de clasificación real (misión: -------
+        # "calculando la confianza de TP vs SL") ----------------------------
+        "tb_class_names": class_names,
+        "tb_probabilities": {"SL": p_sl, "TIMEOUT": p_timeout, "TP": p_tp},
+        "tb_mc_std": {"SL": float(std_probs[0]), "TIMEOUT": float(std_probs[1]), "TP": float(std_probs[2])},
+        "tb_predicted_class": predicted_class,
+        "tb_confidence": round(tb_confidence, 4),
+        "tb_actionable": tb_actionable,
+        "tb_min_signal_confidence": TB_MIN_SIGNAL_CONFIDENCE,
+        "tb_max_holding_days": max_holding_days,
+        "tb_pt_mult": pt_mult,
+        "tb_sl_mult": sl_mult,
+        "tb_vol_realized": round(vol_t, 6),
+        "tb_barrier_upper_price": round(barrier_upper_price, 2),
+        "tb_barrier_lower_price": round(barrier_lower_price, 2),
+    }
+
+
 def _forecast_asset(ticker: str, steps: int = DEFAULT_FORECAST_HORIZON_DAYS) -> dict:
     """
     Motor autoregresivo con Simulación Monte Carlo (sliding window, batcheado).
@@ -1959,9 +2958,30 @@ def _forecast_asset(ticker: str, steps: int = DEFAULT_FORECAST_HORIZON_DAYS) -> 
 
     asset_id = scalers["asset_to_id"][ticker]
     feature_scaler = scalers["feature_scalers"][ticker]
-    target_scaler = scalers["target_scalers"][ticker]
     lookback = scalers["lookback"]
     macro_tickers = scalers["macro_tickers"]
+
+    # V22 — despacho dinámico por target_mode (ver bloque "Inferencia
+    # target_mode=triple_barrier" arriba, _forecast_asset_triple_barrier).
+    # `target_scalers[ticker]` es `None` para target_mode="triple_barrier"
+    # (ver train_kodaquant_v5.py, run_regime_pipeline) — por eso el deref
+    # de `target_scaler` vive DESPUÉS de este branch, nunca antes: la rama
+    # triple_barrier no debe depender de una clave que su propio pipeline
+    # de entrenamiento nunca completó.
+    target_mode = scalers.get("target_mode", "regression")
+    if target_mode == "triple_barrier":
+        return _forecast_asset_triple_barrier(
+            ticker=ticker,
+            regime=regime,
+            scalers=scalers,
+            asset_id=asset_id,
+            feature_scaler=feature_scaler,
+            lookback=lookback,
+            macro_tickers=macro_tickers,
+            requested_steps=steps,
+        )
+
+    target_scaler = scalers["target_scalers"][ticker]
     n_sim = N_MONTE_CARLO_SIMULATIONS
 
     # --- SEMILLA DETERMINISTA (memoria diaria por activo) -------------------
@@ -2002,7 +3022,7 @@ def _forecast_asset(ticker: str, steps: int = DEFAULT_FORECAST_HORIZON_DAYS) -> 
     model, dropout_layers = _get_keras_model(regime)
     base_variance_source = "mc_dropout" if dropout_layers else "deterministic_native_keras"
 
-    close_df, raw_features = _fetch_feature_window(ticker, macro_tickers, lookback)
+    close_df, raw_features = _fetch_feature_window(ticker, macro_tickers, lookback, scalers=scalers)
 
     # sigma_hist: desviación estándar de los log-returns REALES de los
     # últimos VOLATILITY_LOOKBACK_DAYS del propio activo — no un número
@@ -2667,6 +3687,8 @@ def _forecast_asset(ticker: str, steps: int = DEFAULT_FORECAST_HORIZON_DAYS) -> 
 
     return {
         "ticker": ticker,
+        "regime": regime,
+        "target_mode": target_mode,
         "last_price": last_price_quote,
         "predicted_price": round(target_price, 2),
         "predicted_return_pct": round(total_return_pct, 2),
@@ -2694,6 +3716,12 @@ def _forecast_asset(ticker: str, steps: int = DEFAULT_FORECAST_HORIZON_DAYS) -> 
         "real_data_ood_frac": round(real_input_oob_frac, 4),
         "real_ood_dampening_applied": round(real_ood_dampening, 4),
         "forecast_reliability": "degraded" if real_input_oob_frac > REAL_OOD_DAMPENING_START else "normal",
+        # V27 -- gate de confianza por ticker (ver EQUITY_HISTORICAL_EDGE).
+        # Aditivo puro: NO modifica `tactical_signal` ni su cálculo -- el
+        # consumidor de esta respuesta decide qué hacer con un tier "low"
+        # (atenuar tamaño, no mostrar, o mostrar con advertencia). Ningún
+        # número se inventa ni se fuerza a cruzar 53%.
+        "historical_edge": _get_historical_edge(ticker),
     }
 
 

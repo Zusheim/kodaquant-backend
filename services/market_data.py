@@ -821,6 +821,9 @@ def fetch_feature_ohlcv(ticker: str, macro_tickers: list[str], min_sessions: int
     DataFrame indexado por fecha con EXACTAMENTE el mismo layout de
     columnas que consumía ese bloque:
         out[ticker]              -- Close diario del ticker objetivo
+        out[f"{ticker}_Open"]    -- V28: Open REAL (overnight/intraday de free_alpha).
+                                    Ausente si la fuente es degradada (Open=Close) o
+                                    tiene <90% de cobertura: nunca se sintetiza.
         out[f"{ticker}_High"]    -- High diario (requerido por ATR_14)
         out[f"{ticker}_Low"]     -- Low diario (requerido por ATR_14)
         out[f"{ticker}_Volume"]  -- Volume diario (requerido por OBV_ROC_20)
@@ -848,6 +851,26 @@ def fetch_feature_ohlcv(ticker: str, macro_tickers: list[str], min_sessions: int
 
     out = pd.DataFrame(index=target_df.index)
     out[ticker] = target_df["close"]
+
+    # V28 -- Open real para free_alpha.compute_equity_open_features. Stooq/FRED
+    # replican Open=Close (gap == retorno diario, intraday == 0): emitirlo
+    # fabricaría un feature distinto al de train -> se omite la columna y el
+    # motor degrada a 0.0 con error explícito. Los NaN sueltos de Open se
+    # rellenan con Close del mismo día (nunca ffill: no se inventa un gap).
+    _o_raw = target_df["open"] if "open" in target_df.columns else None
+    if _o_raw is not None:
+        _o = pd.to_numeric(_o_raw, errors="coerce")
+        _o = _o.where(_o > 0.0)
+        if _o.notna().mean() >= 0.9 and (_o == target_df["close"]).mean() < 0.98:
+            out[f"{ticker}_Open"] = _o.fillna(target_df["close"])
+        else:
+            logger.warning("'%s': Open degradado/ausente (cobertura=%.0f%%, Open==Close=%.0f%%) "
+                           "-> '%s_Open' NO se emite; features overnight/intraday V28 = 0.0.",
+                           ticker, 100.0 * _o.notna().mean(),
+                           100.0 * (_o == target_df["close"]).mean(), ticker)
+    else:
+        logger.warning("'%s': sin columna 'open' en la fuente -> '%s_Open' NO se emite.", ticker, ticker)
+
     out[f"{ticker}_High"] = target_df["high"]
     out[f"{ticker}_Low"] = target_df["low"]
     out[f"{ticker}_Volume"] = target_df["volume"]
