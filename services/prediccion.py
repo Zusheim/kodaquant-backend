@@ -50,18 +50,34 @@ _SCAN_CONCURRENCY = 4
 # quanti_engine.py). Tope de candidatos expuestos al motor de allocation.
 _ALPHA_SEEKER_MAX_CANDIDATES = 5
 
-# Umbrales de retorno proyectado (edge) -> acción operativa.
+# Umbrales de retorno proyectado (edge) -> acción operativa. Aplican tal
+# cual al régimen de regresión (equity_specialist); el régimen
+# target_mode="triple_barrier" (crypto_specialist, V22) usa su PROPIO
+# mapeo de acción basado en la clase predicha real (SL/TIMEOUT/TP) y el
+# filtro de confianza `tb_actionable` — ver `_action_for_forecast`.
 _STRONG_BUY_THRESHOLD_PCT = 4.0
 _LIGHT_BUY_THRESHOLD_PCT = 1.0
 _SELL_THRESHOLD_PCT = -1.0
+
+# V22 — Triple Barrier: confianza de clasificación (softmax MC-Dropout
+# promediado, ver quanti_engine._forecast_asset_triple_barrier) por encima
+# de la cual "TP" se traduce en COMPRA FUERTE en vez de COMPRA LIGERA. El
+# piso de actionability en sí (por debajo del cual la señal se degrada
+# directo a MANTENER) vive en quanti_engine.TB_MIN_SIGNAL_CONFIDENCE — este
+# umbral es estrictamente mayor a ese piso, nunca al revés.
+_TB_STRONG_CONFIDENCE_THRESHOLD = 0.60
 
 # Cotas de asignación de capital por pick, moduladas por confianza real.
 _MIN_ALLOCATION_PCT = 0.10
 _MAX_ALLOCATION_PCT = 0.45
 # Cripto: la misma razón señal/ruido implica menor confianza estructural
-# (mayor volatilidad realizada) -> se amortigua el allocation_pct.
+# (mayor volatilidad realizada) -> se amortigua el allocation_pct. Se
+# aplica IGUAL sobre ambos target_mode (regresión heredado / triple_barrier
+# V22) — es una propiedad del ACTIVO (cripto), no del mecanismo de forecast.
 _CRYPTO_CONFIDENCE_DAMPENING = 0.6
-_CONFIDENCE_SCORE_CAP = 1.5  # techo de normalización de la razón edge/banda
+_CONFIDENCE_SCORE_CAP = 1.5  # techo de normalización — SOLO régimen de regresión (razón edge/banda, no acotada a 1.0)
+_TB_CONFIDENCE_SCORE_CAP = 1.0  # techo de normalización — régimen triple_barrier (_tb_confidence_score ya vive en [0,1])
+_TB_BASELINE_CONFIDENCE = 1.0 / 3.0  # azar puro con 3 clases (SL/TIMEOUT/TP) — piso de "sin edge" para normalizar
 
 # Fallback SOLO si el universo entero falla en yfinance/Keras (degradación
 # total del radar) — nunca sustituye una predicción real disponible.
@@ -69,6 +85,7 @@ _FALLBACK_MAE_MARGIN = 4.55
 
 
 def _action_for_return(predicted_return_pct: float) -> str:
+    """Mapeo edge -> acción del régimen de regresión (equity_specialist). Ver `_action_for_forecast`."""
     if predicted_return_pct >= _STRONG_BUY_THRESHOLD_PCT:
         return "COMPRA FUERTE"
     if predicted_return_pct >= _LIGHT_BUY_THRESHOLD_PCT:
@@ -78,9 +95,59 @@ def _action_for_return(predicted_return_pct: float) -> str:
     return "MANTENER"
 
 
+def _action_for_forecast(forecast: Dict[str, Any]) -> str:
+    """
+    V22 — despacho por target_mode. `equity_specialist` (regresión) sigue
+    exactamente el mapeo edge->acción de siempre (`_action_for_return`).
+    `crypto_specialist` (target_mode="triple_barrier") NO tiene un edge
+    continuo del que derivar la acción — tiene una CLASE (SL/TIMEOUT/TP)
+    con una confianza de clasificación real, ya filtrada por el piso de
+    convicción mínima del motor (`tb_actionable`, ver
+    quanti_engine.TB_MIN_SIGNAL_CONFIDENCE): una clase accionable de baja
+    confianza ya viene degradada a "sin convicción operativa" ANTES de
+    llegar acá, así que esta función confía en `tb_actionable` en vez de
+    re-derivar el filtro desde `predicted_return_pct`.
+    """
+    if forecast.get("target_mode") == "triple_barrier":
+        if not forecast.get("tb_actionable", False):
+            return "MANTENER"
+        predicted_class = forecast.get("tb_predicted_class")
+        if predicted_class == "SL":
+            return "VENTA"
+        if predicted_class == "TP":
+            confidence = float(forecast.get("tb_confidence", 0.0))
+            return "COMPRA FUERTE" if confidence >= _TB_STRONG_CONFIDENCE_THRESHOLD else "COMPRA LIGERA"
+        return "MANTENER"  # TIMEOUT, o clase desconocida — nunca inventar convicción
+
+    return _action_for_return(forecast.get("predicted_return_pct", 0.0))
+
+
+def _tb_confidence_score(forecast: Dict[str, Any]) -> float:
+    """
+    Confianza real del régimen target_mode="triple_barrier": la confianza
+    de clasificación MC-Dropout-promediada (`tb_confidence`, ya calculada
+    por quanti_engine._forecast_asset_triple_barrier sobre la salida
+    softmax real del modelo) normalizada contra el azar de 3 clases
+    (33.3% = 0 confianza real, 100% = 1.0). Una señal descartada por el
+    piso de convicción del motor (`tb_actionable=False`) vale 0 acá
+    también — nunca debe recibir allocation de capital pese a tener un
+    `predicted_return_pct` nominal (ver quanti_engine, TIMEOUT/baja
+    confianza no se anulan ahí para preservar la esperanza estadística
+    honesta; el filtro operativo vive en esta capa).
+    """
+    if not forecast.get("tb_actionable", False):
+        return 0.0
+    raw_confidence = float(forecast.get("tb_confidence", 0.0))
+    return max(0.0, (raw_confidence - _TB_BASELINE_CONFIDENCE) / (1.0 - _TB_BASELINE_CONFIDENCE))
+
+
 def _confidence_score(forecast: Dict[str, Any]) -> float:
     """
-    Razón señal/ruido: |edge proyectado| / ancho medio de la banda P5-P95
+    V22 — despacho por target_mode (ver `_tb_confidence_score` para
+    target_mode="triple_barrier").
+
+    Régimen de regresión (equity_specialist, sin cambios): razón
+    señal/ruido = |edge proyectado| / ancho medio de la banda P5-P95
     (ambos ya calculados por _forecast_asset vía Monte Carlo real). Edge
     grande + banda angosta = alta confianza; edge chico + banda ancha =
     ruido. Se deriva 100% de la salida del modelo, cero cifras inventadas.
@@ -98,6 +165,9 @@ def _confidence_score(forecast: Dict[str, Any]) -> float:
     generados antes de este campo) esto es un no-op exacto — no cambia el
     comportamiento previo.
     """
+    if forecast.get("target_mode") == "triple_barrier":
+        return _tb_confidence_score(forecast)
+
     points = forecast.get("forecast") or []
     last_price = forecast.get("last_price") or 0.0
     if not points or last_price <= 0:
@@ -115,7 +185,15 @@ def _confidence_score(forecast: Dict[str, Any]) -> float:
 
 
 def _allocation_pct_for(ticker: str, forecast: Dict[str, Any]) -> float:
-    normalized = min(_confidence_score(forecast), _CONFIDENCE_SCORE_CAP) / _CONFIDENCE_SCORE_CAP
+    score = _confidence_score(forecast)
+    # V22: el techo de normalización depende de la ESCALA del propio score
+    # -- _tb_confidence_score ya vive en [0,1] por construcción (regla de
+    # 3 clases), mientras que la razón edge/banda de regresión no está
+    # acotada a 1.0 (de ahí _CONFIDENCE_SCORE_CAP=1.5 histórico). Usar el
+    # cap equivocado para cada régimen sub/sobre-comprimiría el rango real
+    # de confianza de ese régimen específico.
+    cap = _TB_CONFIDENCE_SCORE_CAP if forecast.get("target_mode") == "triple_barrier" else _CONFIDENCE_SCORE_CAP
+    normalized = min(score, cap) / cap
     allocation = _MIN_ALLOCATION_PCT + normalized * (_MAX_ALLOCATION_PCT - _MIN_ALLOCATION_PCT)
 
     if ticker in _CRYPTO_TICKERS:
@@ -194,16 +272,30 @@ def _rank_alpha_seeker_candidates(
     candidates = []
     for ticker, forecast in valid_forecasts:
         predicted_return_pct = forecast.get("predicted_return_pct", 0.0)
-        if predicted_return_pct < _LIGHT_BUY_THRESHOLD_PCT:
+        is_triple_barrier = forecast.get("target_mode") == "triple_barrier"
+
+        if is_triple_barrier:
+            # V22: "mejor oportunidad" exige una clase TP real Y accionable
+            # (ver quanti_engine.TB_MIN_SIGNAL_CONFIDENCE) -- un
+            # predicted_return_pct nominal por encima del umbral pero con
+            # confianza de clasificación por debajo del piso NO es edge de
+            # compra real, es una esperanza estadística sin convicción
+            # suficiente para operarla (ver _action_for_forecast).
+            if forecast.get("tb_predicted_class") != "TP" or not forecast.get("tb_actionable", False):
+                continue
+        elif predicted_return_pct < _LIGHT_BUY_THRESHOLD_PCT:
             continue  # sin edge de compra real -> nunca candidato a "mejor oportunidad"
+
         confidence = _confidence_score(forecast)
         candidates.append(
             {
                 "symbol": ticker,
-                "action": _action_for_return(predicted_return_pct),
+                "action": _action_for_forecast(forecast),
                 "predicted_return_pct": predicted_return_pct,
                 "confidence_score": round(confidence, 4),
                 "data_reliability": forecast.get("forecast_reliability", "normal"),
+                "target_mode": forecast.get("target_mode", "regression"),
+                "tb_probabilities": forecast.get("tb_probabilities"),
             }
         )
 
@@ -284,7 +376,7 @@ async def generate_predictions(usd_budget: float) -> Dict[str, Any]:
             recommendations.append(
                 {
                     "ticker": ticker,
-                    "action": _action_for_return(forecast["predicted_return_pct"]),
+                    "action": _action_for_forecast(forecast),
                     "current_price_usd": forecast["last_price"],
                     "projected_growth_pct": forecast["predicted_return_pct"],
                     "projected_price_usd": forecast["predicted_price"],
@@ -299,6 +391,15 @@ async def generate_predictions(usd_budget: float) -> Dict[str, Any]:
                     # antes de este campo (backward-compatible).
                     "data_reliability": forecast.get("forecast_reliability", "normal"),
                     "real_data_ood_frac": forecast.get("real_data_ood_frac", 0.0),
+                    # V22 — Triple Barrier: detalle de clasificación real
+                    # (None para equity_specialist/regresión, ver
+                    # quanti_engine._forecast_asset_triple_barrier). El
+                    # frontend puede mostrar P(TP) vs P(SL) directamente
+                    # cuando target_mode="triple_barrier".
+                    "target_mode": forecast.get("target_mode", "regression"),
+                    "tb_probabilities": forecast.get("tb_probabilities"),
+                    "tb_confidence": forecast.get("tb_confidence"),
+                    "tb_actionable": forecast.get("tb_actionable"),
                 }
             )
 

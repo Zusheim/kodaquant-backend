@@ -26,8 +26,10 @@ DISEÑO — DECISIONES CRÍTICAS
    `data_pipeline.get_daily_news_sentiment` internamente y
    `_fetch_all_symbols_flat` ya resuelve Twelve Data/FRED/Stooq con
    normalización tz-naive diaria (`market_data.py`, única fuente de verdad
-   de proveedores desde V11) — así que las 17 features (LOG_RETURN_1D +
-   11 técnicos incl. NEWS_SENTIMENT_SCORE/ADX_14/STOCH_K_14 + 5 macro)
+   de proveedores desde V11) — así que las `N_FEATURES` features (LOG_RETURN_1D
+   + TECH_COLS + MACRO_TICKERS, ver esas constantes en train_kodaquant_v5.py
+   -- NUNCA hardcodear el conteo acá, esa fue exactamente la causa raíz de
+   la desalineación auditada en services/quanti_engine.py en 2026-08)
    llegan sin reimplementar nada, sin riesgo de "training/fine-tuning
    skew" y sin una segunda ruta de descarga (yfinance) desincronizada de la
    que ya usa `train_kodaquant_v5.py` en producción.
@@ -199,11 +201,17 @@ except ImportError as exc:  # noqa: BLE001
 # ---------------------------------------------------------------------------
 # Ruteo dinámico de régimen (Requerimiento 3)
 # ---------------------------------------------------------------------------
-TICKER_TO_REGIME: dict[str, str] = {
-    ticker.upper(): regime_name
-    for regime_name, cfg in REGIMES.items()
-    for ticker in cfg["tickers"]
-}
+# AUDITORÍA RESCATE 2026-08 — BUG DE RUTEO ENCONTRADO: `REGIMES` (importado
+# de train_kodaquant_v5.py) trae los tickers cripto en notación con GUION
+# ("BTC-USD"/"ETH-USD", ver REGIMES en ese archivo), pero este diccionario
+# se construía SIN normalizar, mientras `_resolve_regime` sí normaliza el
+# ticker de INPUT a notación "/" antes de buscarlo acá -- "BTC-USD" nunca
+# hacía match contra una key sin normalizar. Hoy "funcionaba" por pura
+# casualidad (el fallback heurístico de `_resolve_regime`, más abajo,
+# también reconoce el patrón BASE/QUOTE), no por diseño -- normalizar AMBOS
+# lados con la MISMA función (`_normalize_ticker_symbol`, definida abajo)
+# lo vuelve determinista y correcto para cualquier notación futura.
+#
 # V14.1 — universo cripto real vive en notación "BASE/QUOTE" (`BTC/USD`, ver
 # V12 de train_kodaquant_v5.py: el guion `BTC-USD` era un artefacto propio
 # del ticker de yfinance, ya retirado). `_CRYPTO_QUOTE_SUFFIXES` alimenta
@@ -227,6 +235,18 @@ def _normalize_ticker_symbol(ticker: str) -> str:
         if quote in _CRYPTO_QUOTE_SUFFIXES:
             return f"{base}/{quote}"
     return t
+
+
+# Construido DESPUÉS de `_normalize_ticker_symbol` y normalizando cada
+# ticker de `REGIMES` con la MISMA función que usa `_resolve_regime` sobre
+# el input -- ver auditoría arriba. Antes: `REGIMES["crypto_specialist"]`
+# traía "BTC-USD" sin normalizar como key, mientras `_resolve_regime`
+# consultaba con "BTC/USD" (ya normalizado) -- cero coincidencia posible.
+TICKER_TO_REGIME: dict[str, str] = {
+    _normalize_ticker_symbol(ticker): regime_name
+    for regime_name, cfg in REGIMES.items()
+    for ticker in cfg["tickers"]
+}
 
 
 def _resolve_regime(ticker: str) -> str:

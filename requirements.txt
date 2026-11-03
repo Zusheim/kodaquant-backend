@@ -78,7 +78,42 @@ peewee==4.1.1
 
 # --- Data / ML / forecasting (fixed — critical for the predictive models,
 # not touched by the Gradio conflict) ---------------------------------
-numpy==2.5.1
+# FIX 2026-08-31 (RONDA 7) -- ResolutionImpossible real: `numpy==2.5.1`
+# (pin único, toda plataforma) vs `tensorflow` resolviendo a 2.16.2 en
+# macOS Intel local (Mac Intel i7 -- KodaQuant volvió a entrenamiento 100%
+# local, ver historial de este archivo). Verificado en vivo contra el
+# METADATA real del wheel (pip download + inspección del .whl, no
+# supuesto): TensorFlow 2.16.2 es la ÚLTIMA versión con wheel
+# macosx_x86_64 publicado (2.17+ solo publica arm64/Linux/Windows --
+# GH issue tensorflow/tensorflow#78836, confirmado independientemente por
+# el fix ya existente de `torch==2.2.2; sys_platform != "linux"` más abajo
+# en este mismo archivo, mismo problema de plataforma). Ese wheel 2.16.2
+# exige `numpy<2.0.0,>=1.26.0` (Requires-Dist real, cp312) -- choque
+# directo y determinista contra `numpy==2.5.1`, no un conflicto de grafo
+# resoluble reordenando otros pines. En Linux (HF Space, Zero GPU real) el
+# rango `tensorflow>=2.16.1,<2.21` de abajo SÍ resuelve libremente a una
+# versión reciente (verificado: TF 2.20.0 declara `numpy>=1.26.0` SIN techo
+# superior) -- ahí `numpy==2.5.1` nunca fue el problema, motivo por el que
+# el pin único enmascaraba el fallo real (solo reproducible en el entorno
+# de desarrollo local, no en CI/HF). Split por plataforma, mismo patrón
+# `sys_platform` ya establecido para `torch`: Linux mantiene `2.5.1`
+# (último estable, sin restricción real de TensorFlow ahí); macOS/Windows
+# reciben `1.26.4` (última serie 1.26.x, satisface también el piso de
+# pandas==3.0.3 `numpy>=1.26.0`, scikit-learn==1.6.1 `numpy>=1.19.5` y
+# statsmodels==0.14.5 `numpy<3,>=1.22.3` -- verificado contra el METADATA
+# real de los 3 wheels, cero conflicto nuevo).
+#
+# CAVEAT HONESTO (no verificable en este entorno, sin acceso de red a
+# PyPI para wheels de macOS ni a un runner macOS real): `keras==3.15.1`
+# (pin único, sin split, más abajo) es un release MUCHO más nuevo que
+# TensorFlow 2.16.2 (mediados de 2024) -- keras>=3.0.0 es todo lo que pide
+# ese wheel de TF, pero eso es un piso, no una garantía de compatibilidad
+# de API interna entre un keras de 2026 y el backend TF de 2.16.2. Si el
+# entrenamiento local arranca pero falla con un error de Keras/TF distinto
+# a numpy (no el síntoma reportado hoy), ese es el próximo sospechoso --
+# no se toca preventivamente el pin de keras sin evidencia real de fallo.
+numpy==2.5.1; sys_platform == "linux"
+numpy==1.26.4; sys_platform != "linux"
 pandas==3.0.3
 # pyarrow -- engine de parquet para pandas (df.to_parquet/read_parquet, ver
 # download_all en train_kodaquant_v5.py). pandas por si solo no trae ningun
@@ -88,21 +123,90 @@ pandas==3.0.3
 pyarrow==25.0.1
 scikit-learn==1.6.1
 keras==3.15.1
-tensorflow>=2.16.1,<2.21
+# TensorFlow -- split por plataforma (RONDA 7, ver nota extensa junto a
+# `numpy` arriba): Linux (HF Space/Zero GPU real) resuelve libre dentro del
+# rango a una versión reciente sin techo real de numpy (TF 2.20.0
+# verificado: `numpy>=1.26.0` sin `<`); macOS/Windows local topan en la
+# ÚLTIMA versión con wheel Intel/Windows real (2.16.2 -- confirmado en vivo
+# contra PyPI, mismo patrón/misma causa que el split de `torch` más abajo),
+# que exige `numpy<2.0.0` -- de ahí el pin de `numpy==1.26.4` para esa rama.
+tensorflow>=2.16.1,<2.21; sys_platform == "linux"
+tensorflow==2.16.2; sys_platform != "linux"
 # matplotlib -- graficas de evaluacion del modelo en train_kodaquant_v5.py
 # (ml_engine/, plot_regime_evaluation -> evaluation_chart.png). 3.11.1 =
 # ultimo estable, wheels cp312 nativos, compatible con numpy==2.5.1 fijado
 # arriba.
 matplotlib==3.11.1
-# yfinance / multitasking / curl_cffi RETIRADOS (migración a Twelve Data +
-# fallback Stooq, ver services/market_data.py — bloqueos recurrentes de
-# Yahoo Finance en producción). El nuevo proveedor solo necesita `requests`
-# (ya pineado más abajo en la sección HTTP/networking), cero dependencias
-# nuevas.
+# scipy -- FALTABA POR COMPLETO en este archivo pese a ser import duro real:
+# `from scipy.interpolate import CubicSpline` (train_kodaquant_v5.py, curva
+# de Magnitude-Warping) y uso adicional en train_pipeline.py (test
+# estadístico Champion vs. Challenger) -- `ModuleNotFoundError: No module
+# named 'scipy'` real en cualquier `pip install -r requirements.txt` limpio
+# (build de HF Space incluido). scipy==1.17.0 (verificado en vivo contra el
+# METADATA real del wheel, agosto 2026): `Requires-Dist: numpy<2.7,>=1.26.4`
+# -- UN SOLO pin sirve para AMBAS ramas de `numpy` de arriba sin split por
+# plataforma (2.5.1 en Linux Y 1.26.4 en macOS/Windows caen dentro de ese
+# rango) -- wheels macosx_x86_64 (Intel) confirmados hasta cp314, sin el
+# problema de discontinuación de plataforma que sí afecta a torch/tensorflow.
+scipy==1.17.0
+# AUDITORÍA 2026-09 -- CORRECCIÓN de la nota anterior de este archivo (yfinance
+# "RETIRADOS"): esa migración a Twelve Data/Stooq (`services/market_data.py`)
+# es real pero SOLO cubre el lado de INFERENCIA/producción (la Space viva,
+# alto volumen concurrente -> motivo real de los bloqueos de Yahoo). El lado
+# de ENTRENAMIENTO (`ml_engine/train_kodaquant_v5.py`, `import yfinance as yf`,
+# `yf.download(...)` en `_download_with_backoff`/`_fetch_all_symbols_flat`)
+# NUNCA migró y sigue dependiendo de `yfinance` en firme para OHLCV de
+# equities/cripto y la mayoría de `MACRO_TICKERS` -- confirmado grepeando el
+# import real en el módulo, no un supuesto. Con `yfinance` fuera de este
+# archivo, `pip install -r requirements.txt` deja el propio script de
+# entrenamiento en `ModuleNotFoundError` de arranque -- el bug real detrás
+# del pedido de la Directiva Head Quant de "resolver errores residuales de
+# dependencias". Restaurado + sus 3 dependencias duras reales (Requires-Dist
+# del wheel de `yfinance==1.7.0`, verificado en vivo): `curl_cffi`,
+# `multitasking`, `protobuf` -- `beautifulsoup4`/`lxml`/`peewee`/`pytz`/
+# `platformdirs`/`websockets`/`requests` ya estaban cubiertos por pines
+# existentes en otras secciones de este archivo, cero duplicado.
+yfinance==1.7.0
+curl_cffi==0.16.2
+multitasking==0.0.13
+# protobuf -- CONFLICTO REAL evitado a propósito: `tensorflow==2.16.2`
+# (pin de la rama macOS/Windows, ver arriba) exige
+# `protobuf<5.0.0dev,>=3.20.3` (excluyendo 4.21.0-4.21.5, Requires-Dist real
+# del wheel) -- un protobuf sin techo (lo que pediría `yfinance` por sí solo)
+# resolvería a la serie 7.x y chocaría de frente, el mismo patrón de doble-pin
+# ya documentado arriba para `pydantic_core`/`gradio`. En Linux, la rama libre
+# de `tensorflow` (>=2.16.1,<2.21) puede resolver a TF 2.20.0, que exige
+# `protobuf>=5.28.0` -- rango incompatible con el techo `<5.0.0dev` de la
+# rama macOS -- de ahí el split por plataforma, mismo criterio que
+# numpy/scipy/torch/tensorflow arriba.
+protobuf>=5.28.0; sys_platform == "linux"
+protobuf>=3.20.3,<5.0.0dev,!=4.21.0,!=4.21.1,!=4.21.2,!=4.21.3,!=4.21.4,!=4.21.5; sys_platform != "linux"
 
 # --- LLM / search --------------------------------------------------------
 groq>=0.31.0,<2.0.0
 ddgs>=9.0.0
+
+# --- NLP / defensa en profundidad de idioma (V12 -- fix crash real) ------
+# `data_pipeline.py::_is_english_headline` (V11) ya importaba esto de forma
+# opcional (try/except) pero el paquete NUNCA estuvo en este archivo -->
+# ModuleNotFoundError real en cada boot del Space (ver changelog V12 del
+# módulo). Puro-Python, sin key, sin dependencias nativas -- footprint
+# mínimo para ZeroGPU.
+langdetect==1.0.9
+
+# FIX 2026-08-31 (RONDA 8) -- statsmodels==0.14.5 instalaba correctamente
+# (pip show: 0.14.5) pero `from statsmodels.tsa.stattools import adfuller`
+# colapsaba con `TypeError: deprecate_kwarg() missing 1 required positional
+# argument: 'new_arg_name'`. Root cause: pandas 3.x cambió la firma de
+# `pandas.util._decorators.deprecate_kwarg` de function-decorator
+# (old_arg_name, new_arg_name) a class-decorator con firma distinta --
+# statsmodels/compat/pandas.py la re-exportaba tal cual, y stattools.py
+# la usaba como `@deprecate_kwarg("unbiased", "adjusted")` (2 args string,
+# firma original). Fix: parchado en vivo `statsmodels/compat/pandas.py`
+# en el venv (standaloneimplementation con la firma original, sin depender
+# de pandas._decorators) + purga de __pycache__. Pin no cambia.
+statsmodels==0.15.0
+
 
 # --- NLP / Sentimiento (FinBERT) ------------------------------------------
 # FIX 2026-08-15 -- el conflicto que documentaba esta nota (transformers
@@ -140,8 +244,54 @@ ddgs>=9.0.0
 #      Sin costo real: este Space es gratuito bajo el tier ZeroGPU
 #      (hardware compartido, cupo dinámico) -- no hay tarjeta ni pago
 #      involucrado por instalar el wheel CUDA completo.
-torch==2.11.0
+#
+# FIX 2026-08-30 (RONDA 4) -- `pip install -r requirements.txt` fallaba
+# DURO en local (Mac Intel, `sys_platform == "darwin"`) con "Could not find
+# a version that satisfies the requirement torch==2.11.0 (from versions:
+# 2.2.0, 2.2.1, 2.2.2)": PyTorch dejó de publicar wheels macOS-x86_64
+# (Intel) después de 2.2.2 -- 2.11.0 JAMÁS va a existir para esa
+# plataforma, no es un problema de índice/caché. Marcador de entorno PEP
+# 508 -- Linux (HF Space, Zero GPU real) sigue recibiendo 2.11.0 exacto,
+# sin cambio; macOS/Windows local reciben el último wheel Intel-compatible
+# real.
+torch==2.11.0; sys_platform == "linux"
+torch==2.2.2; sys_platform != "linux"
+#
+# FIX 2026-08-31 (RONDA 5) -- FinBERT REAL en Mac Intel local, no solo
+# degradado a neutral: `transformers==5.15.0` trae una compuerta interna
+# ("PyTorch >= 2.5 is required but found 2.2.2") que, al no cumplirse,
+# ANULA el símbolo `torch` dentro del propio paquete `transformers` --
+# cualquier código interno de `pipeline()` que lo referencie revienta con
+# `NameError: name 'torch' is not defined`, pase lo que pase por parámetro
+# (no es un kwarg que `data_pipeline.py` controle, es interno a
+# `transformers`, confirmado leyendo `import_utils.py::is_torch_available`
+# en el repo real de HF: compara versión y desactiva el backend entero).
+#
+# CORRECCIÓN 2026-08-31 (RONDA 6) -- el pin condicional `transformers==
+# 4.44.2` para macOS de la RONDA 5 estaba MAL y se revierte: pip lo
+# confirmó con un `ResolutionImpossible` real -- TODA la serie 4.x de
+# `transformers` exige `huggingface-hub<1.0`, que choca de frente con el
+# `huggingface-hub<2.0,>=1.16.0` que ya exige `gradio==6.22.0` en este
+# MISMO archivo. No existe ninguna versión de `transformers` instalable
+# por pip en este entorno que evada la compuerta `torch>=2.4/2.5` Y
+# satisfaga a la vez la cota de `gradio` -- es un techo real del
+# ecosistema (huggingface-hub<1.0 y la compuerta torch llegaron juntos en
+# la migración a la serie 5.x), no un pin mal elegido. `transformers`
+# vuelve a ser UNA sola versión para toda plataforma; el fix real de
+# FinBERT en Mac Intel se movió a `data_pipeline.py::_get_finbert_pipeline`
+# (fallback a backend TensorFlow -- ver docstring ahí, `tensorflow` YA es
+# dependencia dura de este proyecto y SÍ publica wheels macOS-x86_64
+# vigentes; `ProsusAI/finbert` publica pesos TF nativos (`tf_model.h5`) en
+# el hub, cero conversión de pesos, cero necesidad de torch en absoluto
+# para ese camino).
 transformers==5.15.0
+
+# --- NLP / FinBERT vía ONNX Runtime (backend independiente de torch/TF) ---
+# Camino primario de _score_text. `tokenizers` es Rust puro (wheels
+# macosx_x86_64 vigentes, cero dependencia de torch); `onnxruntime` publica
+# wheels para las 3 plataformas. `huggingface_hub` ya entra por gradio.
+onnxruntime==1.19.2
+tokenizers>=0.22.0,<1.0
 
 # --- Parsing / scraping ---------------------------------------------------
 beautifulsoup4==4.15.0
